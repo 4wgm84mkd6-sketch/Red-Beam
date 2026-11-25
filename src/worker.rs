@@ -84,7 +84,8 @@ pub enum Msg {
     Opened { doc_id: u64, path: PathBuf, pages: Vec<(f32, f32)> },
     OpenFailed { doc_id: u64, path: PathBuf, error: String },
     /// `texture` keeps the shared resource alive until the UI has opened it.
-    Rendered { job: Job, handle: isize, texture: Sendable<ID3D11Texture2D>, ms: f32 },
+    /// `parallel` = renders running at the moment this one started (incl. itself).
+    Rendered { job: Job, handle: isize, texture: Sendable<ID3D11Texture2D>, ms: f32, parallel: usize },
     RenderFailed { job: Job, error: String },
 }
 
@@ -101,6 +102,7 @@ struct State {
     /// that keeps at least one worker free for the view on screen.
     bg_running: usize,
     bg_limit: usize,
+    fg_running: usize,
     quit: bool,
 }
 
@@ -176,7 +178,7 @@ impl Drop for Pool {
 
 enum Task {
     Open(PathBuf, u64),
-    Render(Job),
+    Render(Job, usize),
 }
 
 /// `have` = id of the document this worker has loaded (or tried to load).
@@ -192,19 +194,25 @@ fn next_task(shared: &Shared, have: u64, loaded: bool) -> Option<Task> {
             }
         }
         if loaded && s.doc_id == have {
-            let pick = s.jobs.iter().position(|j| {
-                j.doc_id == s.doc_id
-                    && !s.delivered.contains(&j.key())
-                    && !s.in_progress.contains(&j.key())
-                    && (!j.is_background() || s.bg_running < s.bg_limit)
-            });
+            let eligible = |j: &Job| {
+                j.doc_id == s.doc_id && !s.delivered.contains(&j.key()) && !s.in_progress.contains(&j.key())
+            };
+            // Foreground first: background work never starts while a sharp
+            // render of the on-screen view is queued or running, so it can't
+            // compete with it inside the PDF engine.
+            let fg_waiting = s.jobs.iter().any(|j| !j.is_background() && eligible(j));
+            let bg_ok = s.bg_running < s.bg_limit && s.fg_running == 0 && !fg_waiting;
+            let pick = s.jobs.iter().position(|j| eligible(j) && (!j.is_background() || bg_ok));
             if let Some(ix) = pick {
                 let j = s.jobs.remove(ix);
                 s.in_progress.insert(j.key());
                 if j.is_background() {
                     s.bg_running += 1;
+                } else {
+                    s.fg_running += 1;
                 }
-                return Some(Task::Render(j));
+                let parallel = s.in_progress.len();
+                return Some(Task::Render(j, parallel));
             }
         }
         s = shared.cv.wait(s).unwrap();
@@ -366,7 +374,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                 // Wake others: this worker may now take jobs.
                 shared.cv.notify_all();
             }
-            Task::Render(job) => {
+            Task::Render(job, parallel) => {
                 let t0 = Instant::now();
                 let page = match pages.iter().position(|(i, _)| *i == job.page) {
                     Some(ix) => {
@@ -399,11 +407,13 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                     s.delivered.insert(job.key());
                     if job.is_background() {
                         s.bg_running -= 1;
+                    } else {
+                        s.fg_running -= 1;
                     }
                     shared.cv.notify_all();
                 }
                 let msg = match result {
-                    Ok((tex, handle)) => Msg::Rendered { job, handle, texture: Sendable(tex), ms },
+                    Ok((tex, handle)) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel },
                     Err(e) => Msg::RenderFailed { job, error: e.message().to_string() },
                 };
                 let _ = tx.send(msg);

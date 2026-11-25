@@ -29,8 +29,9 @@ const SETTLE_MS: u32 = 140;
 fn base_max_px(vram_mb: u64, warp: bool) -> f32 {
     match (warp, vram_mb) {
         (true, _) | (_, 0..=1023) => 2048.0,
-        (_, 1024..=7999) => 4096.0,
-        _ => 8192.0,
+        // Larger base images made each one slow enough to hold up the sharp
+        // render of the current view inside the PDF engine.
+        _ => 4096.0,
     }
 }
 /// Time constant of the animated zoom (seconds).
@@ -71,7 +72,7 @@ W\tFit width\n\
 Ctrl+1\tActual size (100%)\n\
 + / \u{2212}\tZoom in / out\n\
 Arrow keys\tPan\n\
-F2\tPerformance readout\n\
+F2 / F3\tPerformance readout / change worker count\n\
 F1  or  ?\tToggle this help";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -159,6 +160,8 @@ pub struct App {
     frames: VecDeque<Instant>,
     paint_ms: f32,
     last_render: Option<(f32, u32, u32)>,
+    /// Recent renders for the F2 readout.
+    render_log: VecDeque<String>,
     status: Option<String>,
 
     pub pending_error: Option<String>,
@@ -232,7 +235,7 @@ impl App {
     pub fn new(hwnd: HWND) -> Result<App> {
         let gfx = Gfx::new(hwnd)?;
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let workers = if cores >= 8 { 3 } else { 2 };
+        let workers = if cores >= 4 { 2 } else { 1 };
         let worker = Pool::start(&gfx.gpu, hwnd, workers);
         let detail_budget = ((gfx.dedicated_vram_mb / 6).clamp(256, 4096)) << 20;
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
@@ -273,6 +276,7 @@ impl App {
             frames: VecDeque::new(),
             paint_ms: 0.0,
             last_render: None,
+            render_log: VecDeque::new(),
             status: None,
             pending_error: None,
             device_lost: false,
@@ -641,8 +645,24 @@ impl App {
                         ));
                     }
                 }
-                Msg::Rendered { job, handle, texture, ms } => {
+                Msg::Rendered { job, handle, texture, ms, parallel } => {
                     self.worker.ack(&job.key());
+                    let what = match (job.kind, job.prefetch) {
+                        (JobKind::Detail, false) => "sharp view",
+                        (JobKind::Detail, true) => "sharp view (next sheet)",
+                        (JobKind::Base, _) => "whole sheet",
+                    };
+                    let others = match parallel.saturating_sub(1) {
+                        0 => "alone".to_string(),
+                        n => format!("{n} other{} running", if n == 1 { "" } else { "s" }),
+                    };
+                    self.render_log.push_front(format!(
+                        "sheet {}\t{what}  {}\u{00D7}{}  {ms:.0} ms  ({others})",
+                        job.page + 1,
+                        job.w,
+                        job.h
+                    ));
+                    self.render_log.truncate(8);
                     let Some(doc) = &self.doc else { continue };
                     if job.doc_id != doc.id {
                         continue;
@@ -893,15 +913,16 @@ impl App {
             None => "\u{2014}".into(),
         };
         let txt = format!(
-            "Frame rate\t{fps}\nFrame CPU time\t{:.1} ms\nGPU\t{}\nVideo memory\t{vram}\nRender workers\t{} ({} busy)\nCached on GPU\t{} sheets + {} sharp views ({cache_mb} MB)\nLast sharp render\t{last}",
+"Frame rate\t{fps}\nFrame CPU time\t{:.1} ms\nGPU\t{}\nVideo memory\t{vram}\nRender workers\t{} ({} busy)   \u{2014} F3 to change\nCached on GPU\t{} sheets + {} sharp views ({cache_mb} MB)\nLast sharp render\t{last}\n\nRecent renders (newest first):\n{}",
             self.paint_ms,
             self.gfx.adapter_name,
             self.worker.size,
             self.worker.busy(),
             self.bases.len(),
             self.details.len(),
+            self.render_log.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"),
         );
-        let panel = RectF::new(12.0 * s, 12.0 * s, 12.0 * s + 620.0 * s, 12.0 * s + 178.0 * s);
+        let panel = RectF::new(12.0 * s, 12.0 * s, 12.0 * s + 640.0 * s, 12.0 * s + 360.0 * s);
         self.fill(&panel, 0x141518, 0.88);
         self.fill(&RectF::new(panel.l, panel.t, panel.l + 3.0 * s, panel.b), ACCENT, 1.0);
         let inner = RectF::new(panel.l + 16.0 * s, panel.t + 10.0 * s, panel.r - 10.0 * s, panel.b - 6.0 * s);
@@ -991,6 +1012,8 @@ impl App {
             self.pan_by(0.0, (ch / 8.0).round());
         } else if k == VK_DOWN {
             self.pan_by(0.0, -(ch / 8.0).round());
+        } else if k == VK_F3 {
+            self.cycle_workers();
         } else if k == VK_F2 {
             self.show_perf = !self.show_perf;
             self.invalidate();
@@ -1014,6 +1037,26 @@ impl App {
             return false;
         }
         true
+    }
+
+    /// F3: switch between 1, 2 and 3 render workers (for A/B testing on a
+    /// given machine). Cached images stay; the document is reloaded by the
+    /// new workers in the background.
+    fn cycle_workers(&mut self) {
+        let n = self.worker.size % 3 + 1;
+        let new = Pool::start(&self.gfx.gpu, self.hwnd, n);
+        let old = std::mem::replace(&mut self.worker, new);
+        // Joining waits for any render in flight; don't block the UI on it.
+        std::thread::spawn(move || drop(old));
+        self.posted_detail = None;
+        self.render_log.clear();
+        self.render_log.push_front(format!("switched to {n} worker{}", if n == 1 { "" } else { "s" }));
+        if let Some(doc) = &self.doc {
+            self.worker.open(doc.path.clone(), doc.id);
+        }
+        self.show_perf = true;
+        self.update_jobs(true);
+        self.invalidate();
     }
 
     fn on_char(&mut self, c: u32) {

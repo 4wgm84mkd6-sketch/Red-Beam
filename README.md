@@ -25,6 +25,7 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Actual size (100%) | `Ctrl+1` |
 | Zoom in / out | `+` / `−` |
 | Performance readout | `F2` |
+| Change the number of render workers (1, 2 or 3) | `F3` |
 | Help | `F1` or `?` |
 
 When you flip between sheets of the same size, Red-Beam keeps your zoom and position. You can compare the same detail across a drawing set by holding `PgDn`.
@@ -32,7 +33,7 @@ When you flip between sheets of the same size, Red-Beam keeps your zoom and posi
 ## How it works
 
 ```
- UI thread (its own D3D11 device)          Render workers ×2–3 (each: own D3D11 device,
+ UI thread (its own D3D11 device)          Render workers ×1–3 (each: own D3D11 device,
  ────────────────────────────────           own Direct2D context, own copy of the PDF)
  DXGI flip swap chain, vsync-paced          ──────────────────────────────────────────
  composition of cached GPU bitmaps  ◀────── Windows.Data.Pdf → IPdfRendererNative →
@@ -41,15 +42,15 @@ When you flip between sheets of the same size, Red-Beam keeps your zoom and posi
 ```
 
 * **The screen never waits on rendering.** Each render worker has its own GPU device and its own copy of the document. Finished pages are handed to the UI as shared GPU textures, which are never copied through system memory. Panning and zooming are vsync-paced GPU composition of what's already cached.
-* **Parallel rendering.** Two or three workers rasterise in parallel, depending on CPU cores. Background work (whole-sheet images, neighbouring sheets) can never take every worker, so the sharp render for the current view starts immediately.
-* **Whole-sheet images.** Nearby sheets keep a whole-page image in GPU memory, sized to the card: 2048, 4096 or 8192 px on the long edge. Flipping sheets and fast zooms show those instantly.
+* **Foreground first.** There are two render workers by default; press `F3` to switch between 1, 2 and 3. Background work (whole-sheet images, neighbouring sheets) never starts while a sharp render of the on-screen view is queued or running, so it can't compete with it.
+* **Whole-sheet images.** Nearby sheets keep a whole-page image in GPU memory, sized to the card: 2048 or 4096 px on the long edge. Flipping sheets and fast zooms show those instantly.
 * **Sharp views.** About 140 ms after the view stops moving, the visible area is rendered at exact screen resolution and drawn 1:1. Sharp views are cached, up to about 1/6 of GPU memory, so returning to a view is instant.
 * **Rendering beyond the screen.** Each render costs about the same however much area it covers, because the PDF engine processes the whole sheet's content every time. So on cards with plenty of memory, each sharp render covers well beyond the screen edges and pans reuse it.
 * **Neighbouring sheets.** Once a view is sharp, the same view on the next and previous same-size sheets is rendered too, so flipping between sheets stays sharp.
 * **Animated zoom.** Wheel notches accumulate into one smooth zoom.
 * **GPU choice.** It picks the high-performance GPU on multi-GPU systems, rebuilds after a GPU reset, and falls back to WARP if no hardware GPU is present.
 
-Press **F2** for a performance readout: frame rate, video memory, busy workers, cache contents and the last render time.
+Press **F2** for a performance readout: frame rate, video memory, busy workers, cache contents, and a log of recent renders showing how long each took and how many were running alongside it.
 
 ## Building from source
 
