@@ -62,6 +62,7 @@ const HELP: &str = "Ctrl+O  /  drag & drop\tOpen a PDF\n\
 Mouse wheel\tZoom at cursor\n\
 Left or middle drag\tPan\n\
 Shift+wheel / Ctrl+wheel\tPan horizontally / vertically\n\
+Ctrl+\u{2192} / Ctrl+\u{2190}\tNext / previous sheet\n\
 PgDn / PgUp  or  N / P\tNext / previous sheet\n\
 Home / End\tFirst / last sheet\n\
 Type a number, Enter\tGo to sheet\n\
@@ -862,7 +863,7 @@ impl App {
     fn paint_help(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
-        let (pw, ph) = (560.0 * s, 400.0 * s);
+        let (pw, ph) = (560.0 * s, 440.0 * s);
         let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round(), 0.0, 0.0);
         let panel = RectF::new(panel.l, panel.t, panel.l + pw, panel.t + ph);
         self.fill(&panel, 0x141518, 0.94);
@@ -970,9 +971,9 @@ impl App {
             self.zoom_center(self.s() / from);
         } else if !ctrl && ch_(b'W') {
             self.apply_fit(FitMode::Width);
-        } else if k == VK_NEXT || (!ctrl && ch_(b'N')) {
+        } else if k == VK_NEXT || (ctrl && k == VK_RIGHT) || (!ctrl && ch_(b'N')) {
             self.go_to_page(cur + 1);
-        } else if k == VK_PRIOR || (!ctrl && ch_(b'P')) {
+        } else if k == VK_PRIOR || (ctrl && k == VK_LEFT) || (!ctrl && ch_(b'P')) {
             self.go_to_page(cur - 1);
         } else if k == VK_HOME {
             self.go_to_page(0);

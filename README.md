@@ -18,7 +18,7 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Open a PDF | `Ctrl+O`, the **Open** button, drag and drop, or `RedBeam.exe file.pdf` |
 | Zoom at the cursor | Mouse wheel |
 | Pan | Left- or middle-drag, the arrow keys, `Shift+wheel` (horizontal), `Ctrl+wheel` (vertical) |
-| Next or previous sheet | `PgDn` / `PgUp`, `N` / `P`, ◀ ▶ |
+| Next or previous sheet | `Ctrl+→` / `Ctrl+←`, `PgDn` / `PgUp`, `N` / `P`, ◀ ▶ |
 | First or last sheet | `Home` / `End` |
 | Go to a sheet | Type the number, then `Enter` |
 | Fit page / fit width | `F` or `Ctrl+0` / `W` |
