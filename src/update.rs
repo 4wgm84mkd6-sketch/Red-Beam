@@ -3,8 +3,13 @@
 //! CI publishes every build of `main` as a release tagged `build-<n>` with
 //! `RedBeam.exe` attached, and bakes `<n>` into the executable
 //! (`REDBEAM_BUILD`). The app compares its own number with the latest
-//! release, downloads the new exe next to itself, swaps the files (Windows
-//! allows renaming a running exe) and restarts.
+//! release and downloads the new exe to %LOCALAPPDATA%\Red-Beam\update.
+//!
+//! Installing never renames or overwrites a running program (antivirus or
+//! Windows can refuse that with "Access is denied"): the downloaded copy is
+//! started with `--finish-update <target> <pid> [args…]`, the old app exits,
+//! and the new copy waits for it, copies itself over the target (retrying
+//! while antivirus holds the file) and relaunches it.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -66,9 +71,27 @@ fn notify(hwnd: isize) {
     }
 }
 
-fn exe_paths() -> std::io::Result<(PathBuf, PathBuf, PathBuf)> {
-    let cur = std::env::current_exe()?;
-    Ok((cur.clone(), cur.with_extension("exe.download"), cur.with_extension("exe.old")))
+/// %LOCALAPPDATA%\Red-Beam\update
+fn update_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Red-Beam").join("update")
+}
+
+/// Delete leftovers: downloaded installers and files from the old
+/// rename-based updater. Files still in use are skipped and retried later.
+fn cleanup() {
+    let me = std::env::current_exe().ok();
+    if let Ok(dir) = std::fs::read_dir(update_dir()) {
+        for e in dir.flatten() {
+            if Some(e.path()) != me {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    if let Some(cur) = &me {
+        for ext in ["exe.old", "exe.download"] {
+            let _ = std::fs::remove_file(cur.with_extension(ext));
+        }
+    }
 }
 
 /// Check the latest release in the background. `manual` = user clicked.
@@ -78,14 +101,13 @@ pub fn spawn_check(hwnd: HWND, tx: Sender<UpdateMsg>, manual: bool) {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
-        // Remove the previous version left behind by the last update.
-        if let Ok((_, _, old)) = exe_paths() {
-            if old.exists() && std::fs::remove_file(&old).is_err() {
-                // The previous process may still be shutting down.
-                std::thread::sleep(std::time::Duration::from_secs(4));
-                let _ = std::fs::remove_file(&old);
-            }
-        }
+        // Remove the installer left by the last update. The helper process
+        // may still be exiting, so try again a little later.
+        cleanup();
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            cleanup();
+        });
         let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
         let msg = match http_get(&url) {
             Ok(body) => {
@@ -110,12 +132,14 @@ pub fn spawn_download(hwnd: HWND, tx: Sender<UpdateMsg>, build: u32) {
         }
         let url = format!("https://github.com/{REPO}/releases/download/build-{build}/RedBeam.exe");
         let msg = (|| -> std::result::Result<PathBuf, String> {
-            let (_, dl, _) = exe_paths().map_err(|e| e.to_string())?;
+            let dir = update_dir();
+            std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            let dl = dir.join(format!("RedBeam-build-{build}.exe"));
             let bytes = http_get(&url).map_err(|e| e.message().to_string())?;
             if bytes.len() < 64 * 1024 || !bytes.starts_with(b"MZ") {
                 return Err("the downloaded file is not a valid program".into());
             }
-            std::fs::write(&dl, &bytes).map_err(|e| format!("could not save next to the app ({}): {e}", dl.display()))?;
+            std::fs::write(&dl, &bytes).map_err(|e| format!("could not save {}: {e}", dl.display()))?;
             Ok(dl)
         })();
         let _ = tx.send(match msg {
@@ -127,20 +151,70 @@ pub fn spawn_download(hwnd: HWND, tx: Sender<UpdateMsg>, build: u32) {
     });
 }
 
-/// Swap the downloaded exe into place and launch it with `args`.
+/// Hand over to the downloaded copy, which finishes the install after this
+/// process exits. The caller should close the app on success.
 pub fn install_and_restart(downloaded: &Path, args: &[String]) -> std::result::Result<(), String> {
-    let (cur, _, old) = exe_paths().map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(&cur, &old).map_err(|e| format!("could not replace {}: {e}", cur.display()))?;
-    if let Err(e) = std::fs::rename(downloaded, &cur) {
-        let _ = std::fs::rename(&old, &cur);
-        return Err(format!("could not install the new version: {e}"));
-    }
-    std::process::Command::new(&cur)
+    let cur = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::process::Command::new(downloaded)
+        .arg("--finish-update")
+        .arg(&cur)
+        .arg(std::process::id().to_string())
         .args(args)
         .spawn()
-        .map_err(|e| format!("installed, but could not restart: {e}"))?;
+        .map_err(|e| format!("could not start the new version: {e}"))?;
     Ok(())
+}
+
+/// Runs in the downloaded copy: `--finish-update <target> <pid> [args…]`.
+/// Waits for the old app to exit, copies itself over `target` and starts it.
+pub fn finish_update(args: &[std::ffi::OsString]) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let (Some(target), Some(pid)) = (args.first(), args.get(1).and_then(|p| p.to_str()?.parse::<u32>().ok())) else {
+        return;
+    };
+    let target = PathBuf::from(target);
+    let rest = &args[2..];
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            WaitForSingleObject(h, 30_000);
+            let _ = CloseHandle(h);
+        }
+    }
+    let me = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    // Antivirus often scans the old file for a moment after it closes.
+    let mut last_err = None;
+    for _ in 0..60 {
+        match std::fs::copy(&me, &target) {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        let text = format!(
+            "Red-Beam could not replace\n{}\n\n{e}\n\nThe new version will run from\n{}\nfor now. Moving RedBeam.exe to a folder such as Documents\\Red-Beam usually fixes this.",
+            target.display(),
+            me.display()
+        );
+        unsafe {
+            MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("Red-Beam update"), MB_OK | MB_ICONERROR);
+        }
+        // Run the new version from here so the update still takes effect.
+        let _ = std::process::Command::new(&me).args(rest).spawn();
+        return;
+    }
+    let _ = std::process::Command::new(&target).args(rest).spawn();
 }
 
 #[cfg(test)]

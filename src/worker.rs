@@ -216,6 +216,9 @@ impl Drop for Pool {
         {
             let mut s = self.shared.m.lock().unwrap();
             s.quit = true;
+            for (flag, _) in s.running.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
             self.shared.cv.notify_all();
         }
         for t in self.threads.drain(..) {
