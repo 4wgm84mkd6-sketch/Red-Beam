@@ -1,8 +1,9 @@
 //! Application state: document/view state, render-request scheduling, input
 //! handling and GPU composition of the cached page bitmaps.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -17,20 +18,36 @@ use windows_numerics::Matrix3x2;
 
 use crate::gfx::{self, Gfx};
 use crate::view::{FitMode, RectF, View};
-use crate::worker::{Job, JobKey, JobKind, Msg, Worker, WM_APP_RESULT};
+use crate::worker::{Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
 
 pub const WM_APP_OPEN: u32 = WM_APP + 2;
 const TIMER_SETTLE: usize = 1;
 /// How long the view must be still before a pixel-exact detail render is requested.
 const SETTLE_MS: u32 = 140;
-/// Longest edge (px) of the whole-page "base" bitmap kept on the GPU per page.
-const BASE_MAX_PX: f32 = 4096.0;
-const BASE_MAX_PX_LOW_VRAM: f32 = 2048.0;
-/// Cap on detail-bitmap size (pixels); beyond this the off-screen padding is dropped.
-const MAX_DETAIL_PIXELS: u64 = 24_000_000;
-/// Fraction of the viewport rendered beyond each edge so short pans stay sharp.
-const DETAIL_PAD: f32 = 0.25;
+/// Longest edge (px) of the whole-page "base" bitmap kept on the GPU per page,
+/// chosen from the card's dedicated memory.
+fn base_max_px(vram_mb: u64, warp: bool) -> f32 {
+    match (warp, vram_mb) {
+        (true, _) | (_, 0..=1023) => 2048.0,
+        (_, 1024..=7999) => 4096.0,
+        _ => 8192.0,
+    }
+}
+/// Time constant of the animated zoom (seconds).
+const ZOOM_TAU: f32 = 0.045;
+/// Each sharp render costs about the same regardless of area (the whole page's
+/// content is processed every time), so on cards with plenty of memory we
+/// render well beyond the screen edges and let pans reuse it.
+/// Returns (fraction of viewport added on each side, pixel cap).
+fn detail_padding(vram_mb: u64) -> (f32, u64) {
+    match vram_mb {
+        0..=1023 => (0.2, 16_000_000),
+        1024..=7999 => (0.35, 32_000_000),
+        _ => (0.6, 64_000_000),
+    }
+}
 const PREFETCH: [i64; 4] = [1, -1, 2, -2];
+const MAX_DETAILS: usize = 24;
 const KEEP_RADIUS: i64 = 3;
 
 // Palette (0xRRGGBB)
@@ -53,6 +70,7 @@ W\tFit width\n\
 Ctrl+1\tActual size (100%)\n\
 + / \u{2212}\tZoom in / out\n\
 Arrow keys\tPan\n\
+F2\tPerformance readout\n\
 F1  or  ?\tToggle this help";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,6 +90,13 @@ struct Cached {
     bmp: ID2D1Bitmap1,
 }
 
+struct ZoomAnim {
+    target: f32,
+    ax: f32,
+    ay: f32,
+    last: Instant,
+}
+
 struct Doc {
     id: u64,
     path: PathBuf,
@@ -81,6 +106,7 @@ struct Doc {
 }
 
 struct Fonts {
+    perf: IDWriteTextFormat,
     ui: IDWriteTextFormat,
     ui_center: IDWriteTextFormat,
     ui_right: IDWriteTextFormat,
@@ -98,7 +124,7 @@ pub struct Restore {
 
 pub struct App {
     // `worker` is declared first so it is stopped before the device is released.
-    worker: Worker,
+    worker: Pool,
     gfx: Gfx,
     hwnd: HWND,
     brush: ID2D1SolidColorBrush,
@@ -113,17 +139,24 @@ pub struct App {
     restore: Option<Restore>,
 
     bases: HashMap<u32, Cached>,
-    detail: Option<Cached>,
+    /// Sharp renders of recently seen views (any sheet near the current one),
+    /// least recently added first.
+    details: Vec<Cached>,
+    detail_budget: u64,
     posted_detail: Option<Job>,
     failed: HashSet<JobKey>,
 
     view: View,
     fit: FitMode,
+    anim: Option<ZoomAnim>,
     drag: Option<(i32, i32)>,
     mouse: (i32, i32),
     hover: Option<Btn>,
     goto_buf: String,
     show_help: bool,
+    show_perf: bool,
+    frames: VecDeque<Instant>,
+    paint_ms: f32,
     last_render: Option<(f32, u32, u32)>,
     status: Option<String>,
 
@@ -188,14 +221,19 @@ fn make_fonts(dw: &IDWriteFactory, s: f32) -> Result<Fonts> {
         title.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         let body = mk(14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
         body.SetIncrementalTabStop(230.0 * s)?;
-        Ok(Fonts { ui, ui_center, ui_right, title, body })
+        let perf = mk(13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+        perf.SetIncrementalTabStop(150.0 * s)?;
+        Ok(Fonts { perf, ui, ui_center, ui_right, title, body })
     }
 }
 
 impl App {
     pub fn new(hwnd: HWND) -> Result<App> {
         let gfx = Gfx::new(hwnd)?;
-        let worker = Worker::start(&gfx.d2d_device, &gfx.dxgi_device, hwnd);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let workers = if cores >= 8 { 3 } else { 2 };
+        let worker = Pool::start(&gfx.gpu, hwnd, workers);
+        let detail_budget = ((gfx.dedicated_vram_mb / 6).clamp(256, 4096)) << 20;
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         let fonts = make_fonts(&dwrite, dpi as f32 / 96.0)?;
@@ -218,16 +256,21 @@ impl App {
             opening: None,
             restore: None,
             bases: HashMap::new(),
-            detail: None,
+            details: Vec::new(),
+            detail_budget,
             posted_detail: None,
             failed: HashSet::new(),
             view: View::default(),
             fit: FitMode::Page,
+            anim: None,
             drag: None,
             mouse: (0, 0),
             hover: None,
             goto_buf: String::new(),
             show_help: false,
+            show_perf: false,
+            frames: VecDeque::new(),
+            paint_ms: 0.0,
             last_render: None,
             status: None,
             pending_error: None,
@@ -285,6 +328,7 @@ impl App {
 
     fn apply_fit(&mut self, mode: FitMode) {
         self.fit = mode;
+        self.anim = None;
         let Some((pw, ph)) = self.page_size() else { return };
         let (cw, ch) = self.canvas();
         match mode {
@@ -300,14 +344,45 @@ impl App {
         self.zoom_at(cw * 0.5, ch * 0.5, factor);
     }
 
+    /// Start (or extend) an animated zoom about a screen point. Repeated wheel
+    /// notches accumulate into the target so the motion stays continuous.
     fn zoom_at(&mut self, x: f32, y: f32, factor: f32) {
         if self.doc.is_none() {
             return;
         }
         let (mn, mx) = self.zoom_limits();
-        self.view.zoom_at(x, y, factor, mn, mx);
+        let from = self.anim.as_ref().map(|a| a.target).unwrap_or(self.view.zoom);
+        let target = (from * factor).clamp(mn, mx);
+        let last = self.anim.as_ref().map(|a| a.last).unwrap_or_else(|| Instant::now() - Duration::from_millis(8));
+        self.anim = Some(ZoomAnim { target, ax: x, ay: y, last });
         self.fit = FitMode::None;
-        self.view_changed();
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_SETTLE);
+        }
+        self.invalidate();
+    }
+
+    /// Advance the zoom animation by one frame (frames are paced by vsync).
+    fn step_anim(&mut self) {
+        let Some(a) = self.anim.as_mut() else { return };
+        let now = Instant::now();
+        let dt = (now - a.last).as_secs_f32().clamp(0.001, 0.05);
+        a.last = now;
+        let (ax, ay, target) = (a.ax, a.ay, a.target);
+        let (lz, lt) = (self.view.zoom.ln(), target.ln());
+        let done = (lt - lz).abs() < 0.002;
+        let nz = if done { target } else { (lz + (lt - lz) * (1.0 - (-dt / ZOOM_TAU).exp())).exp() };
+        self.view.zoom_at(ax, ay, nz / self.view.zoom, 1e-6, 1e6);
+        if done {
+            self.anim = None;
+            self.view_changed();
+        } else {
+            if let Some((pw, ph)) = self.page_size() {
+                let (cw, ch) = self.canvas();
+                self.view.clamp_pan(cw, ch, pw, ph, 48.0 * self.s());
+            }
+            self.invalidate();
+        }
     }
 
     fn pan_by(&mut self, dx: f32, dy: f32) {
@@ -358,8 +433,8 @@ impl App {
         let old = doc.pages[doc.current as usize];
         let new = doc.pages[p as usize];
         doc.current = p;
-        self.detail = None;
         self.posted_detail = None;
+        self.anim = None;
         let same_size = (old.0 - new.0).abs() < 0.5 && (old.1 - new.1).abs() < 0.5;
         if !same_size || self.fit != FitMode::None {
             // Same-size sheets keep the zoomed location, so flipping between
@@ -373,19 +448,16 @@ impl App {
 
     fn base_job(&self, doc: &Doc, page: u32) -> Job {
         let (pw, ph) = doc.pages[page as usize];
-        let cap = if self.gfx.is_warp || self.gfx.dedicated_vram_mb < 1024 {
-            BASE_MAX_PX_LOW_VRAM
-        } else {
-            BASE_MAX_PX
-        };
+        let cap = base_max_px(self.gfx.dedicated_vram_mb, self.gfx.gpu.warp);
         let max_px = cap.min(self.gfx.max_bitmap as f32 - 2.0);
-        let scale = (max_px / pw.max(ph)).min(2.0);
+        let scale = (max_px / pw.max(ph)).min(4.0);
         let w = (pw * scale).ceil().max(1.0) as u32;
         let h = (ph * scale).ceil().max(1.0) as u32;
         Job {
             doc_id: doc.id,
             page,
             kind: JobKind::Base,
+            prefetch: page != doc.current,
             src: RectF::new(0.0, 0.0, w as f32 / scale, h as f32 / scale),
             w,
             h,
@@ -393,11 +465,11 @@ impl App {
         }
     }
 
-    /// The pixel-exact render the current view needs, or `None` if the cached
-    /// detail bitmap already covers it at the current zoom.
-    fn desired_detail(&self) -> Option<Job> {
+    /// The pixel-exact render that `page` needs for the current view, or
+    /// `None` if a cached sharp view already covers it at this zoom.
+    fn desired_detail(&self, page: u32) -> Option<Job> {
         let doc = self.doc.as_ref()?;
-        let (pw, ph) = doc.pages[doc.current as usize];
+        let (pw, ph) = doc.pages[page as usize];
         let (cw, ch) = self.canvas();
         let page_scr = self.view.page_to_screen(&RectF::new(0.0, 0.0, pw, ph));
         let visible = page_scr.intersect(&RectF::new(0.0, 0.0, cw, ch));
@@ -407,23 +479,24 @@ impl App {
         let visible_page = self.view.screen_to_page(&visible);
         let eps = 0.5 / self.view.zoom;
         let covers = |j: &Job| {
-            j.page == doc.current
+            j.page == page
                 && j.doc_id == doc.id
                 && ((j.scale - self.view.zoom) / self.view.zoom).abs() < 1e-4
                 && j.src.contains_rect(&visible_page, eps)
         };
-        if let Some(d) = &self.detail {
-            if covers(&d.job) {
-                return None;
-            }
+        if self.details.iter().any(|d| covers(&d.job)) {
+            return None;
         }
-        if let Some(d) = &self.posted_detail {
-            if covers(d) && !self.failed.contains(&d.key()) {
-                return Some(d.clone());
+        if page == doc.current {
+            if let Some(d) = &self.posted_detail {
+                if covers(d) && !self.failed.contains(&d.key()) {
+                    return Some(d.clone());
+                }
             }
         }
         let max = self.gfx.max_bitmap as f32;
-        for pad in [DETAIL_PAD, 0.0] {
+        let (pad_max, max_pixels) = detail_padding(self.gfx.dedicated_vram_mb);
+        for pad in [pad_max, pad_max * 0.5, 0.0] {
             let want = RectF::new(-cw * pad, -ch * pad, cw * (1.0 + pad), ch * (1.0 + pad))
                 .intersect(&page_scr)
                 .snap_out();
@@ -431,11 +504,12 @@ impl App {
                 return None;
             }
             let (w, h) = (want.w(), want.h());
-            if (w <= max && h <= max && (w as u64) * (h as u64) <= MAX_DETAIL_PIXELS) || pad == 0.0 {
+            if (w <= max && h <= max && (w as u64) * (h as u64) <= max_pixels) || pad == 0.0 {
                 return Some(Job {
                     doc_id: doc.id,
-                    page: doc.current,
+                    page,
                     kind: JobKind::Detail,
+                    prefetch: page != doc.current,
                     src: self.view.screen_to_page(&want),
                     w: (w as u32).clamp(1, max as u32),
                     h: (h as u32).clamp(1, max as u32),
@@ -446,7 +520,7 @@ impl App {
         None
     }
 
-    /// Re-post the worker's priority-ordered wish list.
+    /// Re-post the workers' priority-ordered wish list.
     fn update_jobs(&mut self, with_detail: bool) {
         let Some(doc) = self.doc.as_ref() else {
             self.worker.set_jobs(Vec::new());
@@ -455,19 +529,39 @@ impl App {
         let cur = doc.current as i64;
         let n = doc.pages.len() as i64;
         self.bases.retain(|&p, _| (p as i64 - cur).abs() <= KEEP_RADIUS);
-        if with_detail {
-            self.posted_detail = self.desired_detail();
+        self.details.retain(|d| (d.job.page as i64 - cur).abs() <= KEEP_RADIUS);
+        if with_detail && self.anim.is_none() {
+            self.posted_detail = self.desired_detail(cur as u32);
         }
         let doc = self.doc.as_ref().unwrap();
         let mut jobs = Vec::new();
+        // 1. Sharp render of what is on screen.
         if let Some(d) = &self.posted_detail {
             if d.page as i64 == cur && d.doc_id == doc.id {
                 jobs.push(d.clone());
             }
         }
+        // 2. Whole-page image of this sheet.
         if !self.bases.contains_key(&(cur as u32)) {
             jobs.push(self.base_job(doc, cur as u32));
         }
+        // 3. Once settled: same view on neighbouring same-size sheets, so
+        //    flipping sheets is sharp immediately.
+        if self.posted_detail.is_none() && self.anim.is_none() && self.desired_detail(cur as u32).is_none() {
+            let size = doc.pages[cur as usize];
+            for off in [1i64, -1] {
+                let p = cur + off;
+                if p >= 0 && p < n {
+                    let ps = doc.pages[p as usize];
+                    if (ps.0 - size.0).abs() < 0.5 && (ps.1 - size.1).abs() < 0.5 {
+                        if let Some(j) = self.desired_detail(p as u32) {
+                            jobs.push(j);
+                        }
+                    }
+                }
+            }
+        }
+        // 4. Whole-page images of nearby sheets.
         for off in PREFETCH {
             let p = cur + off;
             if p >= 0 && p < n && !self.bases.contains_key(&(p as u32)) {
@@ -486,6 +580,14 @@ impl App {
         self.posted_detail.is_some() || !self.bases.contains_key(&doc.current)
     }
 
+    fn insert_detail(&mut self, c: Cached) {
+        self.details.push(c);
+        let mut total: u64 = self.details.iter().map(|d| d.job.bytes()).sum();
+        while (total > self.detail_budget || self.details.len() > MAX_DETAILS) && self.details.len() > 1 {
+            total -= self.details.remove(0).job.bytes();
+        }
+    }
+
     fn on_results(&mut self) {
         while let Ok(msg) = self.worker.rx.try_recv() {
             match msg {
@@ -497,7 +599,8 @@ impl App {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let n = pages.len() as u32;
                     self.bases.clear();
-                    self.detail = None;
+                    self.details.clear();
+                    self.anim = None;
                     self.posted_detail = None;
                     self.failed.clear();
                     self.goto_buf.clear();
@@ -537,28 +640,37 @@ impl App {
                         ));
                     }
                 }
-                Msg::Rendered { job, bitmap, ms } => {
+                Msg::Rendered { job, handle, texture, ms } => {
                     self.worker.ack(&job.key());
                     let Some(doc) = &self.doc else { continue };
                     if job.doc_id != doc.id {
                         continue;
                     }
-                    if job.kind == JobKind::Detail {
+                    let bmp = match self.gfx.open_shared(handle) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            if gfx::is_device_lost(&e) {
+                                self.device_lost = true;
+                            }
+                            self.status = Some(format!("Could not use rendered page: {}", e.message()));
+                            continue;
+                        }
+                    };
+                    drop(texture);
+                    if job.kind == JobKind::Detail && !job.prefetch {
                         self.last_render = Some((ms, job.w, job.h));
                     }
-                    let is_posted = self.posted_detail.as_ref().map(|d| d.key()) == Some(job.key());
-                    match job.kind {
-                        JobKind::Base => {
-                            self.bases.insert(job.page, Cached { job, bmp: bitmap.0 });
-                        }
-                        JobKind::Detail if job.page == doc.current => {
-                            self.detail = Some(Cached { job, bmp: bitmap.0 });
-                        }
-                        JobKind::Detail => {}
-                    }
-                    if is_posted {
+                    if self.posted_detail.as_ref().map(|d| d.key()) == Some(job.key()) {
                         self.posted_detail = None;
                     }
+                    match job.kind {
+                        JobKind::Base => {
+                            self.bases.insert(job.page, Cached { job, bmp });
+                        }
+                        JobKind::Detail => self.insert_detail(Cached { job, bmp }),
+                    }
+                    // A finished sharp view may unlock neighbour prefetch.
+                    self.update_jobs(false);
                     self.invalidate();
                 }
                 Msg::RenderFailed { job, error } => {
@@ -635,10 +747,19 @@ impl App {
         if let Some(b) = self.bases.get(&doc.current) {
             self.draw_cached(b);
         }
-        if let Some(d) = &self.detail {
-            if d.job.page == doc.current && d.job.doc_id == doc.id {
-                self.draw_cached(d);
-            }
+        // Sharp views of this sheet: least suitable first, best match on top.
+        let (cw, ch) = self.canvas();
+        let screen = RectF::new(0.0, 0.0, cw, ch);
+        let mut ds: Vec<&Cached> = self
+            .details
+            .iter()
+            .filter(|d| d.job.page == doc.current && d.job.doc_id == doc.id)
+            .filter(|d| !self.view.page_to_screen(&d.job.src).intersect(&screen).is_empty())
+            .collect();
+        let badness = |d: &&Cached| (d.job.scale / self.view.zoom).ln().abs();
+        ds.sort_by(|a, b| badness(b).total_cmp(&badness(a)));
+        for d in ds {
+            self.draw_cached(d);
         }
         unsafe {
             self.gfx.ctx.PopAxisAlignedClip();
@@ -658,7 +779,7 @@ impl App {
         let gpu = format!(
             "GPU: {}{}",
             self.gfx.adapter_name,
-            if self.gfx.is_warp { "  (software fallback \u{2014} no hardware GPU found)" } else { "" }
+            if self.gfx.gpu.warp { "  (software fallback \u{2014} no hardware GPU found)" } else { "" }
         );
         self.text(&gpu, &self.fonts.ui_center, &RectF::new(0.0, cy + 54.0 * s, cw, cy + 78.0 * s), TEXT_DIM);
     }
@@ -750,10 +871,48 @@ impl App {
         self.text(&format!("Keyboard & mouse\n\n{HELP}"), &self.fonts.body, &inner, TEXT);
     }
 
+    fn paint_perf(&self) {
+        let s = self.s();
+        let now = Instant::now();
+        let recent: Vec<&Instant> = self.frames.iter().filter(|t| now - **t < Duration::from_secs(1)).collect();
+        let fps = if self.frames.back().is_some_and(|t| now - *t < Duration::from_millis(300)) && recent.len() > 1 {
+            format!("{} fps", recent.len())
+        } else {
+            "idle (redraws only when something changes)".to_string()
+        };
+        let vram = match self.gfx.vram_usage_mb() {
+            Some((u, b)) => format!("{u} MB used of {b} MB budget"),
+            None => "n/a".into(),
+        };
+        let cache_mb: u64 = (self.bases.values().map(|c| c.job.bytes()).sum::<u64>()
+            + self.details.iter().map(|c| c.job.bytes()).sum::<u64>())
+            >> 20;
+        let last = match self.last_render {
+            Some((ms, w, h)) => format!("{ms:.0} ms  ({w}\u{00D7}{h} px)"),
+            None => "\u{2014}".into(),
+        };
+        let txt = format!(
+            "Frame rate\t{fps}\nFrame CPU time\t{:.1} ms\nGPU\t{}\nVideo memory\t{vram}\nRender workers\t{} ({} busy)\nCached on GPU\t{} sheets + {} sharp views ({cache_mb} MB)\nLast sharp render\t{last}",
+            self.paint_ms,
+            self.gfx.adapter_name,
+            self.worker.size,
+            self.worker.busy(),
+            self.bases.len(),
+            self.details.len(),
+        );
+        let panel = RectF::new(12.0 * s, 12.0 * s, 12.0 * s + 620.0 * s, 12.0 * s + 178.0 * s);
+        self.fill(&panel, 0x141518, 0.88);
+        self.fill(&RectF::new(panel.l, panel.t, panel.l + 3.0 * s, panel.b), ACCENT, 1.0);
+        let inner = RectF::new(panel.l + 16.0 * s, panel.t + 10.0 * s, panel.r - 10.0 * s, panel.b - 6.0 * s);
+        self.text(&txt, &self.fonts.perf, &inner, TEXT);
+    }
+
     pub fn paint(&mut self) {
         if self.gfx.size.0 == 0 || self.gfx.size.1 == 0 {
             return;
         }
+        let t0 = Instant::now();
+        self.step_anim();
         let ctx = self.gfx.ctx.clone();
         let (cw, ch) = self.canvas();
         unsafe {
@@ -770,7 +929,16 @@ impl App {
             if self.show_help {
                 self.paint_help();
             }
-            let r = ctx.EndDraw(None, None).and_then(|_| self.gfx.present());
+            if self.show_perf {
+                self.paint_perf();
+            }
+            let r = ctx.EndDraw(None, None);
+            self.paint_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            let r = r.and_then(|_| self.gfx.present());
+            self.frames.push_back(Instant::now());
+            while self.frames.len() > 240 {
+                self.frames.pop_front();
+            }
             if let Err(e) = r {
                 if gfx::is_device_lost(&e) {
                     self.device_lost = true;
@@ -798,8 +966,8 @@ impl App {
         } else if ctrl && ch_(b'0') || (!ctrl && ch_(b'F')) {
             self.apply_fit(FitMode::Page);
         } else if ctrl && ch_(b'1') {
-            let f = self.s() / self.view.zoom;
-            self.zoom_center(f);
+            let from = self.anim.as_ref().map(|a| a.target).unwrap_or(self.view.zoom);
+            self.zoom_center(self.s() / from);
         } else if !ctrl && ch_(b'W') {
             self.apply_fit(FitMode::Width);
         } else if k == VK_NEXT || (!ctrl && ch_(b'N')) {
@@ -822,6 +990,9 @@ impl App {
             self.pan_by(0.0, (ch / 8.0).round());
         } else if k == VK_DOWN {
             self.pan_by(0.0, -(ch / 8.0).round());
+        } else if k == VK_F2 {
+            self.show_perf = !self.show_perf;
+            self.invalidate();
         } else if k == VK_F1 {
             self.show_help = !self.show_help;
             self.invalidate();
@@ -927,8 +1098,8 @@ impl App {
         unsafe {
             match msg {
                 WM_PAINT => {
-                    self.paint();
                     let _ = ValidateRect(Some(hwnd), None);
+                    self.paint();
                     Some(0)
                 }
                 WM_SIZE => {
@@ -1006,6 +1177,9 @@ impl App {
                 }
                 WM_TIMER if wp.0 == TIMER_SETTLE => {
                     let _ = KillTimer(Some(hwnd), TIMER_SETTLE);
+                    if self.anim.is_some() {
+                        return Some(0);
+                    }
                     self.update_jobs(true);
                     self.invalidate();
                     Some(0)

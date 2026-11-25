@@ -1,8 +1,9 @@
-//! Direct3D 11 / Direct2D / DXGI setup. One D3D device is shared by the UI
-//! thread (composition + HUD) and the render worker (PDF rasterisation). The
-//! Direct2D factory is created multi-threaded, so D2D serialises access to the
-//! device; raw DXGI calls (Present / ResizeBuffers) are bracketed with
-//! `ID2D1Multithread::Enter/Leave`.
+//! Direct3D 11 / Direct2D / DXGI setup.
+//!
+//! The UI thread owns one D3D device used only for composition. Every render
+//! worker creates its *own* device on the same physical GPU, so a long PDF
+//! rasterisation never blocks a UI frame. Finished pages are handed over as
+//! shared GPU textures (no copy through system memory).
 
 use std::mem::ManuallyDrop;
 
@@ -15,64 +16,101 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-pub struct Gfx {
-    pub dxgi_device: IDXGIDevice,
-    pub d2d_device: ID2D1Device,
-    pub ctx: ID2D1DeviceContext,
-    pub mt: ID2D1Multithread,
-    pub swap: IDXGISwapChain1,
-    pub adapter_name: String,
-    pub dedicated_vram_mb: u64,
-    pub is_warp: bool,
-    pub max_bitmap: u32,
-    pub size: (u32, u32),
-    _d3d: ID3D11Device,
+/// Which GPU to use. Workers must use the same one as the UI so shared
+/// textures can be opened.
+#[derive(Clone)]
+pub struct GpuChoice {
+    pub adapter: Option<IDXGIAdapter>,
+    pub warp: bool,
+}
+unsafe impl Send for GpuChoice {}
+
+/// Prefer the high-performance GPU (discrete card on hybrid laptops).
+fn pick_adapter() -> Option<IDXGIAdapter> {
+    unsafe {
+        let f6: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let a: IDXGIAdapter1 = f6.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE).ok()?;
+        let d = a.GetDesc1().ok()?;
+        // Skip the "Microsoft Basic Render Driver" software adapter here.
+        if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+            return None;
+        }
+        a.cast().ok()
+    }
 }
 
-fn create_d3d() -> Result<(ID3D11Device, bool)> {
+pub fn create_device(choice: &GpuChoice) -> Result<ID3D11Device> {
     let levels = [
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
         D3D_FEATURE_LEVEL_10_0,
     ];
-    let mut last_err = Error::from(E_FAIL);
-    for (driver, warp) in [(D3D_DRIVER_TYPE_HARDWARE, false), (D3D_DRIVER_TYPE_WARP, true)] {
-        // Try with 11_1 first; very old runtimes reject it, so retry without.
-        for lv in [&levels[..], &levels[1..]] {
-            let mut dev: Option<ID3D11Device> = None;
-            let r = unsafe {
-                D3D11CreateDevice(
-                    None,
-                    driver,
-                    HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    Some(lv),
-                    D3D11_SDK_VERSION,
-                    Some(&mut dev),
-                    None,
-                    None,
-                )
-            };
-            match (r, dev) {
-                (Ok(()), Some(d)) => return Ok((d, warp)),
-                (Err(e), _) => last_err = e,
-                _ => {}
-            }
+    let driver = match (&choice.adapter, choice.warp) {
+        (_, true) => D3D_DRIVER_TYPE_WARP,
+        (Some(_), false) => D3D_DRIVER_TYPE_UNKNOWN,
+        (None, false) => D3D_DRIVER_TYPE_HARDWARE,
+    };
+    let adapter = if choice.warp { None } else { choice.adapter.as_ref() };
+    let mut last = Error::from(E_FAIL);
+    for lv in [&levels[..], &levels[1..]] {
+        let mut dev: Option<ID3D11Device> = None;
+        let r = unsafe {
+            D3D11CreateDevice(
+                adapter,
+                driver,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(lv),
+                D3D11_SDK_VERSION,
+                Some(&mut dev),
+                None,
+                None,
+            )
+        };
+        match (r, dev) {
+            (Ok(()), Some(d)) => return Ok(d),
+            (Err(e), _) => last = e,
+            _ => {}
         }
     }
-    Err(last_err)
+    Err(last)
+}
+
+pub struct Gfx {
+    pub d3d: ID3D11Device,
+    pub ctx: ID2D1DeviceContext,
+    pub swap: IDXGISwapChain1,
+    pub gpu: GpuChoice,
+    pub adapter_name: String,
+    pub dedicated_vram_mb: u64,
+    adapter3: Option<IDXGIAdapter3>,
+    pub max_bitmap: u32,
+    pub size: (u32, u32),
 }
 
 impl Gfx {
     pub fn new(hwnd: HWND) -> Result<Self> {
         unsafe {
-            let (d3d, is_warp) = create_d3d()?;
-            if let Ok(mt) = d3d.cast::<ID3D11Multithread>() {
-                let _ = mt.SetMultithreadProtected(true);
-            }
+            let mut gpu = GpuChoice { adapter: pick_adapter(), warp: false };
+            let d3d = match create_device(&gpu) {
+                Ok(d) => d,
+                Err(_) => {
+                    gpu = GpuChoice { adapter: None, warp: false };
+                    match create_device(&gpu) {
+                        Ok(d) => d,
+                        Err(_) => {
+                            gpu.warp = true;
+                            create_device(&gpu)?
+                        }
+                    }
+                }
+            };
             let dxgi_device: IDXGIDevice = d3d.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
+            if !gpu.warp {
+                gpu.adapter = Some(adapter.clone());
+            }
             let desc = adapter.GetDesc()?;
             let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
             let adapter_name = String::from_utf16_lossy(&desc.Description[..end]).trim().to_string();
@@ -80,9 +118,7 @@ impl Gfx {
             let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
 
             let opts = D2D1_FACTORY_OPTIONS { debugLevel: D2D1_DEBUG_LEVEL_NONE };
-            let d2d_factory: ID2D1Factory1 =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, Some(&opts))?;
-            let mt: ID2D1Multithread = d2d_factory.cast()?;
+            let d2d_factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, Some(&opts))?;
             let d2d_device = d2d_factory.CreateDevice(&dxgi_device)?;
             let ctx = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             ctx.SetDpi(96.0, 96.0);
@@ -107,17 +143,15 @@ impl Gfx {
             let d = swap.GetDesc1()?;
 
             let mut g = Gfx {
-                dxgi_device,
-                d2d_device,
+                adapter3: adapter.cast().ok(),
+                d3d,
                 ctx,
-                mt,
                 swap,
+                gpu,
                 adapter_name,
                 dedicated_vram_mb,
-                is_warp,
                 max_bitmap,
                 size: (d.Width, d.Height),
-                _d3d: d3d,
             };
             g.create_target()?;
             Ok(g)
@@ -127,16 +161,7 @@ impl Gfx {
     fn create_target(&mut self) -> Result<()> {
         unsafe {
             let surface: IDXGISurface = self.swap.GetBuffer(0)?;
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                colorContext: ManuallyDrop::new(None),
-            };
+            let props = bitmap_props(D2D1_ALPHA_MODE_IGNORE, D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW);
             let bmp = self.ctx.CreateBitmapFromDxgiSurface(&surface, Some(&props))?;
             self.ctx.SetTarget(&bmp);
         }
@@ -149,22 +174,43 @@ impl Gfx {
         }
         unsafe {
             self.ctx.SetTarget(None);
-            self.mt.Enter();
-            let r = self.swap.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0));
-            self.mt.Leave();
-            r?;
+            self.swap.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
         }
         self.size = (w, h);
         self.create_target()
     }
 
     pub fn present(&self) -> Result<()> {
+        unsafe { self.swap.Present(1, DXGI_PRESENT(0)).ok() }
+    }
+
+    /// Open a texture a render worker shared with us and wrap it for drawing.
+    pub fn open_shared(&self, handle: isize) -> Result<ID2D1Bitmap1> {
         unsafe {
-            self.mt.Enter();
-            let hr = self.swap.Present(1, DXGI_PRESENT(0));
-            self.mt.Leave();
-            hr.ok()
+            let mut tex: Option<ID3D11Texture2D> = None;
+            self.d3d.OpenSharedResource(HANDLE(handle as *mut _), &mut tex)?;
+            let surf: IDXGISurface = tex.ok_or_else(|| Error::from(E_POINTER))?.cast()?;
+            let props = bitmap_props(D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BITMAP_OPTIONS_NONE);
+            self.ctx.CreateBitmapFromDxgiSurface(&surf, Some(&props))
         }
+    }
+
+    /// (used MB, budget MB) of local video memory for this process.
+    pub fn vram_usage_mb(&self) -> Option<(u64, u64)> {
+        let a = self.adapter3.as_ref()?;
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()? };
+        Some((info.CurrentUsage / (1 << 20), info.Budget / (1 << 20)))
+    }
+}
+
+pub fn bitmap_props(alpha: D2D1_ALPHA_MODE, opts: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
+    D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: alpha },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: opts,
+        colorContext: ManuallyDrop::new(None),
     }
 }
 
