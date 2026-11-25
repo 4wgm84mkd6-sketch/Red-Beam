@@ -22,6 +22,12 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Fit page / fit width | `F` or `Ctrl+0` / `W` |
 | Actual size (100%) | `Ctrl+1` |
 | Zoom in / out | `+` / `−` |
+| Takeoff tools: length / polyline / area / count | `L` / `Y` / `A` / `C` |
+| Select tool, cancel | `V`, `Esc` |
+| Finish polyline / area / count | `Enter`, double-click or right-click |
+| Straight lines while measuring | hold `Shift` |
+| Undo / delete selected | `Ctrl+Z` / `Del` |
+| Quantities panel | `Q` |
 | Compare with an earlier revision | `Ctrl+K` or **Compare** |
 | Compare: overlay → old → new | `Tab` (or the **Overlay / Old / New** buttons) |
 | Compare: shift which old sheet is paired | `[` / `]` |
@@ -30,6 +36,25 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Help | `F1` or `?` |
 
 When you flip between sheets of the same size, Red-Beam keeps your zoom and position. You can compare the same detail across a drawing set by holding `PgDn`.
+
+### Takeoffs
+
+The takeoff toolbar sits at the top-left of the drawing.
+
+1. **Scale ▾:** pick the sheet's scale (1/8" = 1'-0", 1" = 20', …), or choose **Calibrate by two points…**, click both ends of a known dimension and type its length (`24'-6"`, `24.5'`, `294"`, `7.5m`). **Apply this sheet's scale to all sheets** sets the whole set at once.
+2. **Group ▾:** choose or create the group you're measuring, such as *Drywall* or *Flooring*. Each group has its own colour. Selecting a measurement and then picking a group moves it to that group.
+3. Measure:
+   * **Length** (`L`): two clicks.
+   * **Polyline** (`Y`): click each point, then press Enter, double-click or right-click to finish.
+   * **Area** (`A`): click the corners, then finish. Shows the area in SF and its perimeter.
+   * **Count** (`C`): click each item, then finish.
+   * Hold **Shift** for straight 0°/45°/90° lines. **Ctrl+Z** undoes the last point or measurement. **Esc** cancels.
+4. **Select** (`V`): click a measurement to highlight it, then press **Del** to delete it.
+5. **Quantities** (`Q`): totals per group (length, area, perimeter, count) across all sheets, with warnings for sheets that have no scale.
+6. **Export CSV:** one row per measurement plus group totals. It opens directly in Excel.
+7. **Units ▾:** feet-inches (default), decimal feet, or metric.
+
+Takeoffs save automatically to `<drawing name>.redbeam.json` next to the PDF. If that folder is read-only, they go to `%LOCALAPPDATA%\Red-Beam\takeoffs`. **The PDF itself is never modified.** Quantities are computed from each sheet's current scale, so correcting a calibration updates every measurement on that sheet.
 
 ### Comparing revisions
 
@@ -98,6 +123,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/worker.rs` | Render worker: private GPU device, PDFium or Windows engine, priority queue with cancellation, shared textures to the UI |
 | `src/update.rs` | Checks GitHub Releases for a newer build, downloads it, swaps the exe and restarts |
 | `src/pdfium.rs` | Loads the embedded PDFium DLL; parses sheets once and renders regions progressively (cancellable) |
+| `src/takeoff.rs` | Takeoff model: scales, units, length parsing and formatting, geometry, autosave and CSV (unit-tested) |
+| `src/app/tools.rs` | Takeoff UI: tool palette, measuring tools, selection and undo, quantities panel, menus, prompt |
 | `src/gfx.rs` | Direct3D 11, Direct2D and DXGI swap-chain setup |
 | `src/view.rs` | Camera math: zoom about a point, fit page or width, pan clamping |
 
@@ -110,7 +137,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 ## Roadmap (goal: replace Bluebeam)
 
 1. **Revision compare:** overlay, old/new toggle and sheet pairing are done. Next: point-based alignment, sheet-number matching, and a list of changed areas.
-2. **Takeoffs:** scale calibration, length, polyline, area (with deductions), perimeter and count tools; a quantities panel; CSV and Excel export.
+2. **Takeoffs:** scales and calibration, length, polyline, area, perimeter, count, groups, a quantities panel and CSV export are done. Next: area deductions (cut-outs), editing points, volume (area × depth), per-viewport scales, snapping to drawing geometry, and a native Excel export.
 3. **Markups:** cloud, callout, text, arrow, shapes, highlight and stamps, saved as standard PDF annotations that Bluebeam and Acrobat can read; a markups list; undo.
 4. **Navigation:** sheet sidebar with thumbnails, text search, clickable sheet callouts, tabs.
 5. **Rollout:** installer, "Open with Red-Beam", shared tool sets.

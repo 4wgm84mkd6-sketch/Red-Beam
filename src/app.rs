@@ -17,7 +17,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
 
+mod tools;
+
+pub use tools::{MenuItem, MenuKind};
+use tools::{Prompt, TBtn, Tool, Undo};
+
 use crate::gfx::{self, Gfx};
+use crate::takeoff::Takeoff;
 use crate::update::{self, UpdateMsg, WM_APP_UPDATE};
 use crate::view::{FitMode, RectF, View};
 use crate::worker::{Engine, Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
@@ -75,6 +81,11 @@ W\tFit width\n\
 Ctrl+1\tActual size (100%)\n\
 + / \u{2212}\tZoom in / out\n\
 Arrow keys\tPan\n\
+L / Y / A / C\tTakeoff: length / polyline / area / count\n\
+V  or  Esc\tSelect tool (click a measurement; Del deletes)\n\
+Enter / dbl-click\tFinish polyline, area or count\n\
+Shift (while measuring)\tStraight lines (0\u{00B0}/45\u{00B0}/90\u{00B0})\n\
+Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
 Ctrl+K\tCompare with an earlier revision\n\
 Tab\tCompare: overlay \u{2192} old \u{2192} new\n\
 [  /  ]\tCompare: shift the old sheet pairing\n\
@@ -155,6 +166,8 @@ struct Doc {
 
 struct Fonts {
     perf: IDWriteTextFormat,
+    /// Measurement labels.
+    label: IDWriteTextFormat,
     ui: IDWriteTextFormat,
     ui_center: IDWriteTextFormat,
     ui_right: IDWriteTextFormat,
@@ -217,6 +230,24 @@ pub struct App {
     /// Recent renders for the F2 readout.
     render_log: VecDeque<String>,
     status: Option<String>,
+
+    // Takeoffs (see app/tools.rs)
+    takeoff: Takeoff,
+    takeoff_path: Option<PathBuf>,
+    tool: Tool,
+    /// Points of the measurement being drawn (page DIPs).
+    pending_pts: Vec<[f32; 2]>,
+    /// Active group (Bluebeam "subject") for new measurements.
+    group: String,
+    selected: Option<u64>,
+    undo: Vec<Undo>,
+    prompt: Option<Prompt>,
+    show_qty: bool,
+    tool_hover: Option<TBtn>,
+    /// Where the left button went down (click vs drag).
+    down_at: Option<(i32, i32)>,
+    pub pending_menu: Option<MenuKind>,
+    pub pending_export: bool,
 
     update: UpdState,
     upd_tx: Sender<UpdateMsg>,
@@ -326,7 +357,9 @@ fn make_fonts(dw: &IDWriteFactory, s: f32) -> Result<Fonts> {
         body.SetIncrementalTabStop(230.0 * s)?;
         let perf = mk(13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
         perf.SetIncrementalTabStop(150.0 * s)?;
-        Ok(Fonts { perf, ui, ui_center, ui_right, title, body })
+        let label = mk(12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+        one_line(&label, DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        Ok(Fonts { perf, label, ui, ui_center, ui_right, title, body })
     }
 }
 
@@ -392,6 +425,19 @@ impl App {
             last_render: None,
             render_log: VecDeque::new(),
             status: None,
+            takeoff: Takeoff::default(),
+            takeoff_path: None,
+            tool: Tool::Select,
+            pending_pts: Vec::new(),
+            group: "General".into(),
+            selected: None,
+            undo: Vec::new(),
+            prompt: None,
+            show_qty: false,
+            tool_hover: None,
+            down_at: None,
+            pending_menu: None,
+            pending_export: false,
             update: UpdState::Checking,
             upd_tx,
             upd_rx,
@@ -425,10 +471,15 @@ impl App {
     fn margin(&self) -> f32 {
         16.0 * self.s()
     }
+    /// Space reserved at the top of the canvas for the takeoff toolbar.
+    fn top_inset(&self) -> f32 {
+        if self.doc.is_some() { (44.0 * self.s()).round() } else { 0.0 }
+    }
+
     fn fit_zoom(&self) -> f32 {
         let (cw, ch) = self.canvas();
         match self.page_size() {
-            Some((pw, ph)) => View::fit_page(cw, ch, pw, ph, self.margin()).zoom,
+            Some((pw, ph)) => View::fit_page(cw, ch - self.top_inset(), pw, ph, self.margin()).zoom,
             None => 1.0,
         }
     }
@@ -459,10 +510,14 @@ impl App {
         self.anim = None;
         let Some((pw, ph)) = self.page_size() else { return };
         let (cw, ch) = self.canvas();
+        let top = self.top_inset();
         match mode {
-            FitMode::Page => self.view = View::fit_page(cw, ch, pw, ph, self.margin()),
-            FitMode::Width => self.view = View::fit_width(cw, ch, pw, ph, self.margin()),
+            FitMode::Page => self.view = View::fit_page(cw, ch - top, pw, ph, self.margin()),
+            FitMode::Width => self.view = View::fit_width(cw, ch - top, pw, ph, self.margin()),
             FitMode::None => {}
+        }
+        if mode != FitMode::None {
+            self.view.oy += top;
         }
         self.view_changed();
     }
@@ -718,6 +773,8 @@ impl App {
         doc.current = p;
         self.posted.clear();
         self.anim = None;
+        self.pending_pts.clear();
+        self.selected = None;
         let same_size = (old.0 - new.0).abs() < 0.5 && (old.1 - new.1).abs() < 0.5;
         if !same_size || self.fit != FitMode::None {
             // Same-size sheets keep the zoomed location, so flipping between
@@ -926,6 +983,7 @@ impl App {
                     if n == 0 {
                         self.status = Some("Document has no pages".into());
                     }
+                    self.load_takeoff();
                     self.sync_docs();
                     self.update_jobs(true);
                 }
@@ -1310,7 +1368,7 @@ impl App {
     fn paint_help(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
-        let (pw, ph) = (600.0 * s, 560.0 * s);
+        let (pw, ph) = (640.0 * s, 680.0 * s);
         let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round(), 0.0, 0.0);
         let panel = RectF::new(panel.l, panel.t, panel.l + pw, panel.t + ph);
         self.fill(&panel, 0x141518, 0.94);
@@ -1389,7 +1447,9 @@ impl App {
                 (Some(doc), _, _) => self.paint_page(doc, doc.current),
                 (None, _, _) => self.paint_empty(),
             }
+            self.paint_takeoff();
             ctx.PopAxisAlignedClip();
+            self.paint_tools_ui();
             self.paint_bar();
             if self.show_help {
                 self.paint_help();
@@ -1424,6 +1484,9 @@ impl App {
         let (cw, ch) = self.canvas();
         let k = VIRTUAL_KEY(vk);
         let ch_ = |c: u8| vk == c as u16;
+        if self.tools_key(k, ctrl) {
+            return true;
+        }
         if ctrl && ch_(b'O') {
             unsafe {
                 let _ = PostMessageW(Some(self.hwnd), WM_APP_OPEN, WPARAM(0), LPARAM(0));
@@ -1546,6 +1609,9 @@ impl App {
     }
 
     fn on_char(&mut self, c: u32) {
+        if char::from_u32(c).is_some_and(|ch| self.tools_char(ch)) {
+            return;
+        }
         match char::from_u32(c) {
             Some(d @ '0'..='9') if self.doc.is_some() && self.goto_buf.len() < 6 => {
                 self.goto_buf.push(d);
@@ -1609,6 +1675,12 @@ impl App {
             if self.hit_button(x, y).is_some() { IDC_HAND } else { IDC_ARROW }
         } else if self.drag.is_some() {
             IDC_SIZEALL
+        } else if self.toolbar_hit(x, y).is_some() {
+            IDC_HAND
+        } else if self.over_tool_ui(x, y) {
+            IDC_ARROW
+        } else if self.doc.is_some() && self.tool != Tool::Select && self.takeoff_sheet().is_some() {
+            IDC_CROSS
         } else if self.doc.is_some() {
             IDC_HAND
         } else {
@@ -1682,17 +1754,43 @@ impl App {
                 }
                 WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
                     let (x, y) = (lo(lp), hi(lp));
+                    let (fx, fy) = (x as f32, y as f32);
                     self.mouse = (x, y);
-                    if self.in_bar(y as f32) {
-                        if msg == WM_LBUTTONDOWN {
-                            if let Some(b) = self.hit_button(x as f32, y as f32) {
+                    let left = msg == WM_LBUTTONDOWN;
+                    if self.in_bar(fy) {
+                        if left {
+                            if let Some(b) = self.hit_button(fx, fy) {
                                 self.press(b);
                             }
                         }
                     } else if self.doc.is_some() {
+                        if left {
+                            if let Some(tb) = self.toolbar_hit(fx, fy) {
+                                self.press_tool(tb);
+                                return Some(0);
+                            }
+                            if self.over_tool_ui(fx, fy) || self.tools_canvas_down(fx, fy) {
+                                return Some(0);
+                            }
+                            self.down_at = Some((x, y));
+                        }
+                        // Middle-drag always pans; left-drag pans with the Select tool.
                         self.drag = Some((x, y));
                         SetCapture(hwnd);
-                        SetCursor(LoadCursorW(None, IDC_SIZEALL).ok());
+                    }
+                    Some(0)
+                }
+                WM_LBUTTONDBLCLK => {
+                    let (x, y) = (lo(lp), hi(lp));
+                    if !self.tools_dblclick() && !self.over_tool_ui(x as f32, y as f32) && !self.in_bar(y as f32) {
+                        // Treat as a normal press for the Select tool / toolbar.
+                        return self.handle(hwnd, WM_LBUTTONDOWN, wp, lp);
+                    }
+                    Some(0)
+                }
+                WM_RBUTTONUP => {
+                    if !self.pending_pts.is_empty() {
+                        self.finish_measure();
                     }
                     Some(0)
                 }
@@ -1704,8 +1802,13 @@ impl App {
                         self.pan_by((x - lx) as f32, (y - ly) as f32);
                     } else {
                         let h = if self.in_bar(y as f32) { self.hit_button(x as f32, y as f32) } else { None };
-                        if h != self.hover {
+                        let th = self.toolbar_hit(x as f32, y as f32);
+                        if h != self.hover || th != self.tool_hover {
                             self.hover = h;
+                            self.tool_hover = th;
+                            self.invalidate();
+                        }
+                        if !self.pending_pts.is_empty() {
                             self.invalidate();
                         }
                     }
@@ -1714,6 +1817,13 @@ impl App {
                 WM_LBUTTONUP | WM_MBUTTONUP => {
                     if self.drag.take().is_some() {
                         let _ = ReleaseCapture();
+                    }
+                    let (x, y) = (lo(lp), hi(lp));
+                    if let Some((dx, dy)) = self.down_at.take() {
+                        // A click (not a drag) with the Select tool selects.
+                        if msg == WM_LBUTTONUP && (x - dx).abs() <= 3 && (y - dy).abs() <= 3 {
+                            self.select_at(x as f32, y as f32);
+                        }
                     }
                     Some(0)
                 }

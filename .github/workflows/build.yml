@@ -35,6 +35,8 @@ jobs:
           tar -xzf pdfium.tgz -C vendor/pdfium
       - name: Lint
         run: cargo clippy --release -- -D warnings
+      - name: Test
+        run: cargo test --release
       - name: Build
         run: cargo build --release
       - uses: actions/upload-artifact@v4

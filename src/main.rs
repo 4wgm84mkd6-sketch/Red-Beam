@@ -7,6 +7,7 @@ compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.
 mod app;
 mod gfx;
 mod pdfium;
+mod takeoff;
 mod update;
 mod view;
 mod worker;
@@ -81,8 +82,67 @@ fn rebuild(hwnd: HWND) {
     }
 }
 
+/// Repaint and re-drain render results after a modal loop (messages that
+/// arrived while the App was busy may have been dropped).
+fn repaint(hwnd: HWND) {
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+        let _ = PostMessageW(Some(hwnd), worker::WM_APP_RESULT, WPARAM(0), LPARAM(0));
+    }
+}
+
 /// Work that must run outside the `App` borrow (modal UI, device rebuild).
+/// Native popup menu at the cursor; returns the chosen command id (0 = none).
+fn popup_menu(hwnd: HWND, items: &[app::MenuItem]) -> usize {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return 0 };
+        for it in items {
+            let _ = if it.separator {
+                AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            } else {
+                let flags = if it.checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+                AppendMenuW(menu, flags, it.id, &HSTRING::from(it.label.as_str()))
+            };
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, None, hwnd, None);
+        let _ = DestroyMenu(menu);
+        cmd.0 as usize
+    }
+}
+
+fn save_dialog(hwnd: HWND, default_name: &str) -> Option<PathBuf> {
+    unsafe {
+        let dlg: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let filters = [COMDLG_FILTERSPEC { pszName: w!("CSV (opens in Excel)"), pszSpec: w!("*.csv") }];
+        dlg.SetFileTypes(&filters).ok()?;
+        dlg.SetDefaultExtension(w!("csv")).ok()?;
+        dlg.SetFileName(&HSTRING::from(default_name)).ok()?;
+        dlg.SetTitle(w!("Export takeoff")).ok()?;
+        dlg.Show(Some(hwnd)).ok()?;
+        let p = dlg.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s.map(PathBuf::from)
+    }
+}
+
 fn after(hwnd: HWND) {
+    // Menus and dialogs run their own message loops, so they are shown here,
+    // outside the App borrow.
+    if let Some((kind, items)) = with_app(|a| a.pending_menu.take().map(|k| (k, a.menu_items(k)))).flatten() {
+        let cmd = popup_menu(hwnd, &items);
+        with_app(|a| a.menu_result(kind, cmd));
+        repaint(hwnd);
+    }
+    if let Some(name) = with_app(|a| std::mem::take(&mut a.pending_export).then(|| a.export_default_name())).flatten() {
+        if let Some(p) = save_dialog(hwnd, &name) {
+            with_app(|a| a.export_csv(p));
+        }
+        repaint(hwnd);
+    }
     let Some((err, lost, info, prompt, quit)) = with_app(|a| {
         (
             a.pending_error.take(),
@@ -200,6 +260,7 @@ fn main() -> Result<()> {
             hInstance: hinst.into(),
             hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            style: CS_DBLCLKS,
             lpszClassName: class,
             ..Default::default()
         };
