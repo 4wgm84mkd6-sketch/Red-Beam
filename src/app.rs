@@ -23,6 +23,7 @@ use crate::view::{FitMode, RectF, View};
 use crate::worker::{Engine, Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
 
 pub const WM_APP_OPEN: u32 = WM_APP + 2;
+pub const WM_APP_COMPARE: u32 = WM_APP + 4;
 const TIMER_SETTLE: usize = 1;
 /// How long the view must be still before a pixel-exact detail render is requested.
 const SETTLE_MS: u32 = 140;
@@ -74,6 +75,9 @@ W\tFit width\n\
 Ctrl+1\tActual size (100%)\n\
 + / \u{2212}\tZoom in / out\n\
 Arrow keys\tPan\n\
+Ctrl+K\tCompare with an earlier revision\n\
+Tab\tCompare: overlay \u{2192} old \u{2192} new\n\
+[  /  ]\tCompare: shift the old sheet pairing\n\
 F2\tPerformance readout\n\
 F4\tSwitch PDF engine (PDFium / Windows)\n\
 F1  or  ?\tToggle this help";
@@ -89,6 +93,35 @@ enum Btn {
     FitWidth,
     Help,
     Update,
+    Compare,
+    CmpOverlay,
+    CmpOld,
+    CmpNew,
+}
+
+/// What is shown while comparing revisions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmpMode {
+    /// Old in red, new in blue, unchanged in black.
+    Overlay,
+    Old,
+    New,
+}
+
+/// An earlier revision opened for comparison. Its sheets pair with the
+/// current set by index (plus `offset`) and share the same view.
+struct Compare {
+    doc: Option<Doc>,
+    opening: Option<(u64, PathBuf)>,
+    offset: i64,
+    mode: CmpMode,
+}
+
+/// Offscreen layers + tint effects for the overlay.
+struct Overlay {
+    old: ID2D1Bitmap1,
+    new: ID2D1Bitmap1,
+    size: (u32, u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,15 +183,23 @@ pub struct App {
 
     doc: Option<Doc>,
     next_doc_id: u64,
-    opening: Option<(u64, String)>,
+    opening: Option<(u64, PathBuf)>,
     restore: Option<Restore>,
+    cmp: Option<Compare>,
+    overlay: Option<Overlay>,
+    tint_old: ID2D1Effect,
+    tint_new: ID2D1Effect,
+    /// Darken (per-channel minimum) of the two tinted layers.
+    blend: ID2D1Effect,
 
-    bases: HashMap<u32, Cached>,
+    /// Whole-sheet images keyed by (document, sheet).
+    bases: HashMap<(u64, u32), Cached>,
     /// Sharp renders of recently seen views (any sheet near the current one),
     /// least recently added first.
     details: Vec<Cached>,
     detail_budget: u64,
-    posted_detail: Option<Job>,
+    /// Sharp renders requested for the current view (one per visible layer).
+    posted: Vec<Job>,
     failed: HashSet<JobKey>,
 
     view: View,
@@ -206,6 +247,44 @@ fn lo(lp: LPARAM) -> i32 {
 }
 fn hi(lp: LPARAM) -> i32 {
     ((lp.0 >> 16) & 0xffff) as i16 as i32
+}
+
+enum Tint {
+    Red,
+    Blue,
+}
+
+/// Colour-matrix effect that maps a drawing's darkness to a single hue:
+/// white stays white, black becomes pure red (old) or pure blue (new).
+/// Combining the two with a darken blend leaves unchanged linework black.
+fn make_tint(ctx: &ID2D1DeviceContext, tint: Tint) -> Result<ID2D1Effect> {
+    let (wr, wg, wb) = (0.299f32, 0.587f32, 0.114f32);
+    // Rows: input R, G, B, A, offset. Columns: output R, G, B, A.
+    let lum = [wr, wg, wb, 0.0, 0.0];
+    let mut m = [[0f32; 4]; 5];
+    for row in 0..5 {
+        match tint {
+            Tint::Red => {
+                m[row][1] = lum[row];
+                m[row][2] = lum[row];
+            }
+            Tint::Blue => {
+                m[row][0] = lum[row];
+                m[row][1] = lum[row];
+            }
+        }
+    }
+    match tint {
+        Tint::Red => m[4][0] = 1.0,
+        Tint::Blue => m[4][2] = 1.0,
+    }
+    m[3][3] = 1.0;
+    let bytes: Vec<u8> = m.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+    unsafe {
+        let e = ctx.CreateEffect(&CLSID_D2D1ColorMatrix)?;
+        e.SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32, D2D1_PROPERTY_TYPE_MATRIX_5X4, &bytes)?;
+        Ok(e)
+    }
 }
 
 fn make_fonts(dw: &IDWriteFactory, s: f32) -> Result<Fonts> {
@@ -263,6 +342,13 @@ impl App {
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         let fonts = make_fonts(&dwrite, dpi as f32 / 96.0)?;
         let brush = unsafe { gfx.ctx.CreateSolidColorBrush(&rgb(TEXT, 1.0), None)? };
+        let tint_old = make_tint(&gfx.ctx, Tint::Red)?;
+        let tint_new = make_tint(&gfx.ctx, Tint::Blue)?;
+        let blend = unsafe {
+            let b = gfx.ctx.CreateEffect(&CLSID_D2D1Blend)?;
+            b.SetValue(D2D1_BLEND_PROP_MODE.0 as u32, D2D1_PROPERTY_TYPE_ENUM, &(D2D1_BLEND_MODE_DARKEN.0 as u32).to_le_bytes())?;
+            b
+        };
         let mut rc = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd, &mut rc);
@@ -282,10 +368,15 @@ impl App {
             next_doc_id: 1,
             opening: None,
             restore: None,
+            cmp: None,
+            overlay: None,
+            tint_old,
+            tint_new,
+            blend,
             bases: HashMap::new(),
             details: Vec::new(),
             detail_budget,
-            posted_detail: None,
+            posted: Vec::new(),
             failed: HashSet::new(),
             view: View::default(),
             fit: FitMode::Page,
@@ -439,11 +530,101 @@ impl App {
     pub fn open(&mut self, path: PathBuf) {
         let id = self.next_doc_id;
         self.next_doc_id += 1;
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.opening = Some((id, name));
+        self.opening = Some((id, path));
         self.status = None;
-        self.worker.open(path, id);
+        self.sync_docs();
         self.invalidate();
+    }
+
+    /// Tell the render workers which documents to keep loaded.
+    fn sync_docs(&self) {
+        let mut docs = Vec::new();
+        if let Some(d) = &self.doc {
+            docs.push((d.id, d.path.clone()));
+        }
+        if let Some(o) = &self.opening {
+            docs.push(o.clone());
+        }
+        if let Some(c) = &self.cmp {
+            if let Some(d) = &c.doc {
+                docs.push((d.id, d.path.clone()));
+            }
+            if let Some(o) = &c.opening {
+                docs.push(o.clone());
+            }
+        }
+        self.worker.set_docs(docs);
+    }
+
+    // --------------------------------------------------------------- compare
+
+    pub fn start_compare(&mut self, path: PathBuf) {
+        if self.doc.is_none() {
+            self.pending_error = Some("Open the current drawing set first, then compare it with an earlier revision.".into());
+            return;
+        }
+        let id = self.next_doc_id;
+        self.next_doc_id += 1;
+        self.drop_doc_images(self.cmp.as_ref().and_then(|c| c.doc.as_ref()).map(|d| d.id));
+        self.cmp = Some(Compare { doc: None, opening: Some((id, path)), offset: 0, mode: CmpMode::Overlay });
+        self.sync_docs();
+        self.invalidate();
+    }
+
+    fn end_compare(&mut self) {
+        let id = self.cmp.take().and_then(|c| c.doc).map(|d| d.id);
+        self.drop_doc_images(id);
+        self.overlay = None;
+        self.sync_docs();
+        self.update_jobs(true);
+        self.invalidate();
+    }
+
+    fn drop_doc_images(&mut self, id: Option<u64>) {
+        if let Some(id) = id {
+            self.bases.retain(|k, _| k.0 != id);
+            self.details.retain(|d| d.job.doc_id != id);
+        }
+    }
+
+    fn set_cmp_mode(&mut self, mode: CmpMode) {
+        if let Some(c) = self.cmp.as_mut() {
+            c.mode = mode;
+            self.update_jobs(true);
+            self.invalidate();
+        }
+    }
+
+    fn shift_cmp(&mut self, by: i64) {
+        if let Some(c) = self.cmp.as_mut() {
+            c.offset += by;
+            self.update_jobs(true);
+            self.invalidate();
+        }
+    }
+
+    /// The earlier revision and its sheet paired with the current one.
+    fn cmp_pair(&self) -> Option<(&Doc, u32)> {
+        let c = self.cmp.as_ref()?;
+        let d = c.doc.as_ref()?;
+        let cur = self.doc.as_ref()?.current as i64;
+        let p = cur + c.offset;
+        (p >= 0 && p < d.pages.len() as i64).then_some((d, p as u32))
+    }
+
+    fn cmp_mode(&self) -> Option<CmpMode> {
+        self.cmp.as_ref().filter(|c| c.doc.is_some()).map(|c| c.mode)
+    }
+
+    /// The (document, sheet) layers currently on screen.
+    fn layers(&self) -> Vec<(&Doc, u32)> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let new = (doc, doc.current);
+        match (self.cmp_mode(), self.cmp_pair()) {
+            (Some(CmpMode::Overlay), Some(old)) => vec![old, new],
+            (Some(CmpMode::Old), Some(old)) => vec![old],
+            _ => vec![new],
+        }
     }
 
     pub fn restore_info(&self) -> Option<Restore> {
@@ -535,7 +716,7 @@ impl App {
         let old = doc.pages[doc.current as usize];
         let new = doc.pages[p as usize];
         doc.current = p;
-        self.posted_detail = None;
+        self.posted.clear();
         self.anim = None;
         let same_size = (old.0 - new.0).abs() < 0.5 && (old.1 - new.1).abs() < 0.5;
         if !same_size || self.fit != FitMode::None {
@@ -548,7 +729,7 @@ impl App {
         self.invalidate();
     }
 
-    fn base_job(&self, doc: &Doc, page: u32) -> Job {
+    fn base_job(&self, doc: &Doc, page: u32, prefetch: bool) -> Job {
         let (pw, ph) = doc.pages[page as usize];
         let cap = base_max_px(self.gfx.dedicated_vram_mb, self.gfx.gpu.warp);
         let max_px = cap.min(self.gfx.max_bitmap as f32 - 2.0);
@@ -559,7 +740,7 @@ impl App {
             doc_id: doc.id,
             page,
             kind: JobKind::Base,
-            prefetch: page != doc.current,
+            prefetch,
             src: RectF::new(0.0, 0.0, w as f32 / scale, h as f32 / scale),
             w,
             h,
@@ -569,8 +750,7 @@ impl App {
 
     /// The pixel-exact render that `page` needs for the current view, or
     /// `None` if a cached sharp view already covers it at this zoom.
-    fn desired_detail(&self, page: u32) -> Option<Job> {
-        let doc = self.doc.as_ref()?;
+    fn desired_detail(&self, doc: &Doc, page: u32, prefetch: bool) -> Option<Job> {
         let (pw, ph) = doc.pages[page as usize];
         let (cw, ch) = self.canvas();
         let page_scr = self.view.page_to_screen(&RectF::new(0.0, 0.0, pw, ph));
@@ -589,12 +769,8 @@ impl App {
         if self.details.iter().any(|d| covers(&d.job)) {
             return None;
         }
-        if page == doc.current {
-            if let Some(d) = &self.posted_detail {
-                if covers(d) && !self.failed.contains(&d.key()) {
-                    return Some(d.clone());
-                }
-            }
+        if let Some(d) = self.posted.iter().find(|d| covers(d) && !self.failed.contains(&d.key())) {
+            return Some(d.clone());
         }
         let max = self.gfx.max_bitmap as f32;
         let (pad_max, max_pixels) = detail_padding(self.gfx.dedicated_vram_mb);
@@ -611,7 +787,7 @@ impl App {
                     doc_id: doc.id,
                     page,
                     kind: JobKind::Detail,
-                    prefetch: page != doc.current,
+                    prefetch,
                     src: self.view.screen_to_page(&want),
                     w: (w as u32).clamp(1, max as u32),
                     h: (h as u32).clamp(1, max as u32),
@@ -629,45 +805,58 @@ impl App {
             return;
         };
         let cur = doc.current as i64;
-        let n = doc.pages.len() as i64;
-        self.bases.retain(|&p, _| (p as i64 - cur).abs() <= KEEP_RADIUS);
-        self.details.retain(|d| (d.job.page as i64 - cur).abs() <= KEEP_RADIUS);
-        if with_detail && self.anim.is_none() {
-            self.posted_detail = self.desired_detail(cur as u32);
+        // Keep images near the sheets in use, for each open document.
+        let mut near: Vec<(u64, i64)> = vec![(doc.id, cur)];
+        if let Some((d, p)) = self.cmp_pair() {
+            near.push((d.id, p as i64));
         }
-        let doc = self.doc.as_ref().unwrap();
-        let mut jobs = Vec::new();
-        // 1. Sharp render of what is on screen.
-        if let Some(d) = &self.posted_detail {
-            if d.page as i64 == cur && d.doc_id == doc.id {
-                jobs.push(d.clone());
+        let keep = |id: u64, page: u32| near.iter().any(|&(d, c)| d == id && (page as i64 - c).abs() <= KEEP_RADIUS);
+        self.bases.retain(|&(id, p), _| keep(id, p));
+        self.details.retain(|d| keep(d.job.doc_id, d.job.page));
+
+        if with_detail && self.anim.is_none() {
+            let posted: Vec<Job> = self.layers().iter().filter_map(|(d, p)| self.desired_detail(d, *p, false)).collect();
+            self.posted = posted;
+        }
+        let layers = self.layers();
+        let mut jobs: Vec<Job> = Vec::new();
+        // 1. Sharp renders of what is on screen (every visible layer).
+        jobs.extend(self.posted.iter().cloned());
+        // 2. Whole-sheet images of the visible layers.
+        for (d, p) in &layers {
+            if !self.bases.contains_key(&(d.id, *p)) {
+                jobs.push(self.base_job(d, *p, false));
             }
         }
-        // 2. Whole-page image of this sheet.
-        if !self.bases.contains_key(&(cur as u32)) {
-            jobs.push(self.base_job(doc, cur as u32));
-        }
-        // 3. Once settled: same view on neighbouring same-size sheets, so
-        //    flipping sheets is sharp immediately.
-        if self.posted_detail.is_none() && self.anim.is_none() && self.desired_detail(cur as u32).is_none() {
-            let size = doc.pages[cur as usize];
-            for off in [1i64, -1] {
-                let p = cur + off;
-                if p >= 0 && p < n {
-                    let ps = doc.pages[p as usize];
-                    if (ps.0 - size.0).abs() < 0.5 && (ps.1 - size.1).abs() < 0.5 {
-                        if let Some(j) = self.desired_detail(p as u32) {
-                            jobs.push(j);
+        // 3. Once settled: the same view on neighbouring same-size sheets.
+        let settled = self.posted.is_empty()
+            && self.anim.is_none()
+            && layers.iter().all(|(d, p)| self.desired_detail(d, *p, false).is_none());
+        if settled {
+            for (d, p) in &layers {
+                let size = d.pages[*p as usize];
+                for off in [1i64, -1] {
+                    let q = *p as i64 + off;
+                    if q >= 0 && q < d.pages.len() as i64 {
+                        let qs = d.pages[q as usize];
+                        if (qs.0 - size.0).abs() < 0.5 && (qs.1 - size.1).abs() < 0.5 {
+                            jobs.extend(self.desired_detail(d, q as u32, true));
                         }
                     }
                 }
             }
         }
-        // 4. Whole-page images of nearby sheets.
-        for off in PREFETCH {
-            let p = cur + off;
-            if p >= 0 && p < n && !self.bases.contains_key(&(p as u32)) {
-                jobs.push(self.base_job(doc, p as u32));
+        // 4. Whole-sheet images of nearby sheets (both revisions when comparing).
+        let mut docs: Vec<(&Doc, i64)> = vec![(doc, cur)];
+        if let Some((d, p)) = self.cmp_pair() {
+            docs.push((d, p as i64));
+        }
+        for (d, c) in docs {
+            for off in PREFETCH {
+                let q = c + off;
+                if q >= 0 && q < d.pages.len() as i64 && !self.bases.contains_key(&(d.id, q as u32)) {
+                    jobs.push(self.base_job(d, q as u32, true));
+                }
             }
         }
         jobs.retain(|j| !self.failed.contains(&j.key()));
@@ -675,11 +864,10 @@ impl App {
     }
 
     fn busy(&self) -> bool {
-        if self.opening.is_some() {
+        if self.opening.is_some() || self.cmp.as_ref().is_some_and(|c| c.opening.is_some()) {
             return true;
         }
-        let Some(doc) = &self.doc else { return false };
-        self.posted_detail.is_some() || !self.bases.contains_key(&doc.current)
+        !self.posted.is_empty() || self.layers().iter().any(|(d, p)| !self.bases.contains_key(&(d.id, *p)))
     }
 
     fn insert_detail(&mut self, c: Cached) {
@@ -694,16 +882,24 @@ impl App {
         while let Ok(msg) = self.worker.rx.try_recv() {
             match msg {
                 Msg::Opened { doc_id, path, pages } => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if let Some(c) = self.cmp.as_mut().filter(|c| c.opening.as_ref().map(|o| o.0) == Some(doc_id)) {
+                        c.opening = None;
+                        c.doc = Some(Doc { id: doc_id, path, name, pages, current: 0 });
+                        self.sync_docs();
+                        self.update_jobs(true);
+                        self.invalidate();
+                        continue;
+                    }
                     if self.opening.as_ref().map(|o| o.0) != Some(doc_id) {
                         continue;
                     }
                     self.opening = None;
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let n = pages.len() as u32;
-                    self.bases.clear();
-                    self.details.clear();
+                    let old_id = self.doc.as_ref().map(|d| d.id);
+                    self.drop_doc_images(old_id);
                     self.anim = None;
-                    self.posted_detail = None;
+                    self.posted.clear();
                     self.failed.clear();
                     self.goto_buf.clear();
                     self.last_render = None;
@@ -730,10 +926,18 @@ impl App {
                     if n == 0 {
                         self.status = Some("Document has no pages".into());
                     }
+                    self.sync_docs();
                     self.update_jobs(true);
                 }
                 Msg::OpenFailed { doc_id, path, error } => {
+                    if self.cmp.as_ref().and_then(|c| c.opening.as_ref()).map(|o| o.0) == Some(doc_id) {
+                        self.cmp = None;
+                        self.sync_docs();
+                        self.pending_error = Some(format!("Could not open {} for comparison\n\n{}", path.display(), error));
+                        continue;
+                    }
                     if self.opening.as_ref().map(|o| o.0) == Some(doc_id) {
+                        self.sync_docs();
                         self.opening = None;
                         self.restore = None;
                         self.pending_error = Some(format!(
@@ -761,8 +965,9 @@ impl App {
                         job.h
                     ));
                     self.render_log.truncate(8);
-                    let Some(doc) = &self.doc else { continue };
-                    if job.doc_id != doc.id {
+                    let known = self.doc.as_ref().map(|d| d.id) == Some(job.doc_id)
+                        || self.cmp.as_ref().and_then(|c| c.doc.as_ref()).map(|d| d.id) == Some(job.doc_id);
+                    if !known {
                         continue;
                     }
                     let bmp = match self.gfx.open_shared(handle) {
@@ -779,12 +984,10 @@ impl App {
                     if job.kind == JobKind::Detail && !job.prefetch {
                         self.last_render = Some((ms, job.w, job.h));
                     }
-                    if self.posted_detail.as_ref().map(|d| d.key()) == Some(job.key()) {
-                        self.posted_detail = None;
-                    }
+                    self.posted.retain(|d| d.key() != job.key());
                     match job.kind {
                         JobKind::Base => {
-                            self.bases.insert(job.page, Cached { job, bmp });
+                            self.bases.insert((job.doc_id, job.page), Cached { job, bmp });
                         }
                         JobKind::Detail => self.insert_detail(Cached { job, bmp }),
                     }
@@ -807,9 +1010,7 @@ impl App {
                     self.invalidate();
                 }
                 Msg::RenderFailed { job, error } => {
-                    if self.posted_detail.as_ref().map(|d| d.key()) == Some(job.key()) {
-                        self.posted_detail = None;
-                    }
+                    self.posted.retain(|d| d.key() != job.key());
                     self.failed.insert(job.key());
                     self.status = Some(format!("Render failed: {error}"));
                     self.invalidate();
@@ -864,29 +1065,18 @@ impl App {
         }
     }
 
-    fn paint_page(&self, doc: &Doc) {
-        let s = self.s();
-        let (pw, ph) = doc.pages[doc.current as usize];
-        let page_scr = self.view.page_to_screen(&RectF::new(0.0, 0.0, pw, ph));
-        for i in 1..=4 {
-            let o = i as f32 * 1.5 * s;
-            let r = RectF::new(page_scr.l + o * 0.5, page_scr.t + o, page_scr.r + o, page_scr.b + o);
-            self.fill(&r, 0x000000, 0.10);
-        }
-        self.fill(&page_scr, 0xffffff, 1.0);
-        unsafe {
-            self.gfx.ctx.PushAxisAlignedClip(&d2r(&page_scr), D2D1_ANTIALIAS_MODE_ALIASED);
-        }
-        if let Some(b) = self.bases.get(&doc.current) {
+    /// Draw the cached images of one sheet (whole-sheet image, then sharp
+    /// views, best match on top). The caller sets up clipping.
+    fn draw_layer(&self, doc_id: u64, page: u32) {
+        if let Some(b) = self.bases.get(&(doc_id, page)) {
             self.draw_cached(b);
         }
-        // Sharp views of this sheet: least suitable first, best match on top.
         let (cw, ch) = self.canvas();
         let screen = RectF::new(0.0, 0.0, cw, ch);
         let mut ds: Vec<&Cached> = self
             .details
             .iter()
-            .filter(|d| d.job.page == doc.current && d.job.doc_id == doc.id)
+            .filter(|d| d.job.page == page && d.job.doc_id == doc_id)
             .filter(|d| !self.view.page_to_screen(&d.job.src).intersect(&screen).is_empty())
             .collect();
         let badness = |d: &&Cached| (d.job.scale / self.view.zoom).ln().abs();
@@ -894,8 +1084,94 @@ impl App {
         for d in ds {
             self.draw_cached(d);
         }
+    }
+
+    fn page_shadow(&self, page_scr: &RectF) {
+        let s = self.s();
+        for i in 1..=4 {
+            let o = i as f32 * 1.5 * s;
+            let r = RectF::new(page_scr.l + o * 0.5, page_scr.t + o, page_scr.r + o, page_scr.b + o);
+            self.fill(&r, 0x000000, 0.10);
+        }
+        self.fill(page_scr, 0xffffff, 1.0);
+    }
+
+    /// Normal display of one sheet.
+    fn paint_page(&self, doc: &Doc, page: u32) {
+        let (pw, ph) = doc.pages[page as usize];
+        let page_scr = self.view.page_to_screen(&RectF::new(0.0, 0.0, pw, ph));
+        self.page_shadow(&page_scr);
+        unsafe {
+            self.gfx.ctx.PushAxisAlignedClip(&d2r(&page_scr), D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        self.draw_layer(doc.id, page);
         unsafe {
             self.gfx.ctx.PopAxisAlignedClip();
+        }
+    }
+
+    /// Screen rectangle covering both sheets of an overlay.
+    fn overlay_rect(&self) -> Option<RectF> {
+        let doc = self.doc.as_ref()?;
+        let (old, op) = self.cmp_pair()?;
+        let (a, b) = (doc.pages[doc.current as usize], old.pages[op as usize]);
+        Some(self.view.page_to_screen(&RectF::new(0.0, 0.0, a.0.max(b.0), a.1.max(b.1))))
+    }
+
+    /// Render each revision's sheet into its own offscreen layer. Done before
+    /// the main frame so the layers can be blended as wholes.
+    fn render_overlay_layers(&mut self) -> Result<()> {
+        let (w, h) = self.gfx.size;
+        if self.overlay.as_ref().map(|o| o.size) != Some((w, h)) {
+            let props = gfx::bitmap_props(D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BITMAP_OPTIONS_TARGET);
+            let mk = || unsafe { self.gfx.ctx.CreateBitmap(D2D_SIZE_U { width: w, height: h }, None, 0, &props) };
+            self.overlay = Some(Overlay { old: mk()?, new: mk()?, size: (w, h) });
+        }
+        let (Some(doc), Some((old, op)), Some(rect), Some(ov)) =
+            (self.doc.as_ref(), self.cmp_pair(), self.overlay_rect(), self.overlay.as_ref())
+        else {
+            return Ok(());
+        };
+        let (cw, ch) = self.canvas();
+        let clip = rect.intersect(&RectF::new(0.0, 0.0, cw, ch));
+        let ctx = &self.gfx.ctx;
+        for (target, id, page) in [(&ov.old, old.id, op), (&ov.new, doc.id, doc.current)] {
+            unsafe {
+                ctx.SetTarget(target);
+                ctx.BeginDraw();
+                ctx.SetTransform(&Matrix3x2::identity());
+                ctx.Clear(Some(&rgb(0xffffff, 1.0)));
+                if !clip.is_empty() {
+                    ctx.PushAxisAlignedClip(&d2r(&clip), D2D1_ANTIALIAS_MODE_ALIASED);
+                    self.draw_layer(id, page);
+                    ctx.PopAxisAlignedClip();
+                }
+                let r = ctx.EndDraw(None, None);
+                self.gfx.restore_target();
+                r?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Composite the two layers: old tinted red, new tinted blue, combined
+    /// with a darken (minimum) blend so linework present in both stays black.
+    fn paint_overlay(&self) {
+        let (Some(rect), Some(ov)) = (self.overlay_rect(), self.overlay.as_ref()) else { return };
+        self.page_shadow(&rect);
+        let ctx = &self.gfx.ctx;
+        unsafe {
+            ctx.PushAxisAlignedClip(&d2r(&rect), D2D1_ANTIALIAS_MODE_ALIASED);
+            self.tint_old.SetInput(0, &ov.old, true);
+            self.tint_new.SetInput(0, &ov.new, true);
+            if let (Ok(a), Ok(b)) = (self.tint_old.GetOutput(), self.tint_new.GetOutput()) {
+                self.blend.SetInput(0, &a, true);
+                self.blend.SetInput(1, &b, true);
+                if let Ok(img) = self.blend.GetOutput() {
+                    ctx.DrawImage(&img, None, None, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                }
+            }
+            ctx.PopAxisAlignedClip();
         }
     }
 
@@ -905,7 +1181,10 @@ impl App {
         let cy = ch * 0.38;
         self.text("Red-Beam", &self.fonts.title, &RectF::new(0.0, cy - 40.0 * s, cw, cy + 20.0 * s), TEXT);
         let sub = match &self.opening {
-            Some((_, name)) => format!("Opening {name}\u{2026}"),
+            Some((_, path)) => format!(
+                "Opening {}\u{2026}",
+                path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            ),
             None => "Open a PDF with Ctrl+O, or drag one onto this window.   F1 for shortcuts.".into(),
         };
         self.text(&sub, &self.fonts.ui_center, &RectF::new(0.0, cy + 24.0 * s, cw, cy + 50.0 * s), TEXT_DIM);
@@ -923,7 +1202,7 @@ impl App {
         let s = self.s();
         let (_, h) = self.client;
         let (top, bot) = (h - self.bar_h() + 5.0 * s, h - 5.0 * s);
-        let specs: [(Btn, &str, f32, f32); 9] = [
+        let mut specs: Vec<(Btn, &str, f32, f32)> = vec![
             (Btn::Open, "Open", 56.0, 12.0),
             (Btn::Prev, "\u{25C0}", 32.0, 4.0),
             (Btn::Next, "\u{25B6}", 32.0, 12.0),
@@ -931,9 +1210,16 @@ impl App {
             (Btn::ZoomIn, "+", 32.0, 4.0),
             (Btn::FitPage, "Fit", 44.0, 4.0),
             (Btn::FitWidth, "Width", 56.0, 12.0),
-            (Btn::Help, "?", 30.0, 12.0),
-            (Btn::Update, self.update_label(), 104.0, 0.0),
+            (Btn::Compare, if self.cmp.is_some() { "End compare" } else { "Compare" }, if self.cmp.is_some() { 96.0 } else { 76.0 }, 4.0),
         ];
+        if self.cmp.as_ref().is_some_and(|c| c.doc.is_some()) {
+            specs.push((Btn::CmpOverlay, "Overlay", 66.0, 4.0));
+            specs.push((Btn::CmpOld, "Old", 44.0, 4.0));
+            specs.push((Btn::CmpNew, "New", 44.0, 4.0));
+        }
+        specs.last_mut().unwrap().3 = 12.0;
+        specs.push((Btn::Help, "?", 30.0, 12.0));
+        specs.push((Btn::Update, self.update_label(), 104.0, 0.0));
         let mut x = 6.0 * s;
         specs
             .iter()
@@ -966,7 +1252,11 @@ impl App {
         self.fill(&RectF::new(0.0, bar.t, w, bar.t + 1.0), 0x000000, 0.8);
         let buttons = self.button_layout();
         for (b, r, label) in &buttons {
-            let highlight = *b == Btn::Update && matches!(self.update, UpdState::Available(_));
+            let mode = self.cmp_mode();
+            let highlight = (*b == Btn::Update && matches!(self.update, UpdState::Available(_)))
+                || (*b == Btn::CmpOverlay && mode == Some(CmpMode::Overlay))
+                || (*b == Btn::CmpOld && mode == Some(CmpMode::Old))
+                || (*b == Btn::CmpNew && mode == Some(CmpMode::New));
             let bg = if self.hover == Some(*b) || highlight { ACCENT } else { BTN_BG };
             self.fill(r, bg, 1.0);
             self.text(label, &self.fonts.ui_center, r, TEXT);
@@ -990,7 +1280,19 @@ impl App {
             seg(&format!("{:.0}%", self.zoom_percent()), 70.0 * s, TEXT);
             let (pw, ph) = doc.pages[doc.current as usize];
             seg(&format!("{:.0}\u{2033} \u{00D7} {:.0}\u{2033}", pw / 96.0, ph / 96.0), 90.0 * s, TEXT_DIM);
-            seg(&doc.name, 2000.0 * s, TEXT_DIM);
+            match (&self.cmp, self.cmp_pair()) {
+                (Some(c), _) if c.opening.is_some() => seg("Opening earlier revision\u{2026}", 2000.0 * s, TEXT_DIM),
+                (Some(c), Some((old, op))) => {
+                    let legend = match c.mode {
+                        CmpMode::Overlay => "red = old only \u{00B7} blue = new only \u{00B7} black = unchanged",
+                        CmpMode::Old => "showing OLD revision",
+                        CmpMode::New => "showing NEW revision",
+                    };
+                    seg(&format!("{legend}   |   vs {} sheet {}", old.name, op + 1), 2000.0 * s, TEXT);
+                }
+                (Some(_), None) => seg("no matching sheet in the old revision \u{2014} use [ / ] to pair", 2000.0 * s, TEXT_DIM),
+                (None, _) => seg(&doc.name, 2000.0 * s, TEXT_DIM),
+            }
         }
         let mut right = String::new();
         if self.busy() {
@@ -1008,7 +1310,7 @@ impl App {
     fn paint_help(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
-        let (pw, ph) = (560.0 * s, 440.0 * s);
+        let (pw, ph) = (600.0 * s, 560.0 * s);
         let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round(), 0.0, 0.0);
         let panel = RectF::new(panel.l, panel.t, panel.l + pw, panel.t + ph);
         self.fill(&panel, 0x141518, 0.94);
@@ -1062,6 +1364,18 @@ impl App {
         }
         let t0 = Instant::now();
         self.step_anim();
+        let overlay = self.cmp_mode() == Some(CmpMode::Overlay) && self.cmp_pair().is_some();
+        if overlay {
+            if let Err(e) = self.render_overlay_layers() {
+                if gfx::is_device_lost(&e) {
+                    self.device_lost = true;
+                    return;
+                }
+                self.status = Some(format!("Overlay failed: {}", e.message()));
+            }
+        } else {
+            self.overlay = None;
+        }
         let ctx = self.gfx.ctx.clone();
         let (cw, ch) = self.canvas();
         unsafe {
@@ -1069,9 +1383,11 @@ impl App {
             ctx.SetTransform(&Matrix3x2::identity());
             ctx.Clear(Some(&rgb(CANVAS, 1.0)));
             ctx.PushAxisAlignedClip(&d2r(&RectF::new(0.0, 0.0, cw, ch)), D2D1_ANTIALIAS_MODE_ALIASED);
-            match &self.doc {
-                Some(doc) => self.paint_page(doc),
-                None => self.paint_empty(),
+            match (&self.doc, self.cmp_mode(), self.cmp_pair()) {
+                (Some(_), Some(CmpMode::Overlay), Some(_)) if overlay => self.paint_overlay(),
+                (Some(_), Some(CmpMode::Old), Some((old, op))) => self.paint_page(old, op),
+                (Some(doc), _, _) => self.paint_page(doc, doc.current),
+                (None, _, _) => self.paint_empty(),
             }
             ctx.PopAxisAlignedClip();
             self.paint_bar();
@@ -1139,6 +1455,19 @@ impl App {
             self.pan_by(0.0, (ch / 8.0).round());
         } else if k == VK_DOWN {
             self.pan_by(0.0, -(ch / 8.0).round());
+        } else if ctrl && ch_(b'K') {
+            self.press(Btn::Compare);
+        } else if k == VK_TAB && self.cmp_mode().is_some() {
+            let next = match self.cmp_mode() {
+                Some(CmpMode::Overlay) => CmpMode::Old,
+                Some(CmpMode::Old) => CmpMode::New,
+                _ => CmpMode::Overlay,
+            };
+            self.set_cmp_mode(next);
+        } else if k == VK_OEM_4 && self.cmp.is_some() {
+            self.shift_cmp(-1);
+        } else if k == VK_OEM_6 && self.cmp.is_some() {
+            self.shift_cmp(1);
         } else if k == VK_F4 {
             self.toggle_engine();
         } else if k == VK_F3 {
@@ -1206,13 +1535,11 @@ impl App {
         let old = std::mem::replace(&mut self.worker, new);
         // Joining waits for any render in flight; don't block the UI on it.
         std::thread::spawn(move || drop(old));
-        self.posted_detail = None;
+        self.posted.clear();
         self.failed.clear();
         self.status = None;
         self.render_log.clear();
-        if let Some(doc) = &self.doc {
-            self.worker.open(doc.path.clone(), doc.id);
-        }
+        self.sync_docs();
         self.show_perf = true;
         self.update_jobs(true);
         self.invalidate();
@@ -1248,6 +1575,18 @@ impl App {
                 self.show_help = !self.show_help;
                 self.invalidate();
             }
+            Btn::Compare => {
+                if self.cmp.is_some() {
+                    self.end_compare();
+                } else if self.doc.is_some() {
+                    unsafe {
+                        let _ = PostMessageW(Some(self.hwnd), WM_APP_COMPARE, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+            Btn::CmpOverlay => self.set_cmp_mode(CmpMode::Overlay),
+            Btn::CmpOld => self.set_cmp_mode(CmpMode::Old),
+            Btn::CmpNew => self.set_cmp_mode(CmpMode::New),
             Btn::Update => match self.update {
                 UpdState::Available(b) => self.pending_update_prompt = Some(b),
                 UpdState::Checking | UpdState::Downloading(_) => {}

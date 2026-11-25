@@ -22,11 +22,27 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Fit page / fit width | `F` or `Ctrl+0` / `W` |
 | Actual size (100%) | `Ctrl+1` |
 | Zoom in / out | `+` / `−` |
+| Compare with an earlier revision | `Ctrl+K` or **Compare** |
+| Compare: overlay → old → new | `Tab` (or the **Overlay / Old / New** buttons) |
+| Compare: shift which old sheet is paired | `[` / `]` |
 | Performance readout | `F2` |
 | Switch PDF engine (PDFium / Windows built-in) | `F4` |
 | Help | `F1` or `?` |
 
 When you flip between sheets of the same size, Red-Beam keeps your zoom and position. You can compare the same detail across a drawing set by holding `PgDn`.
+
+### Comparing revisions
+
+1. Open the **current** set, then click **Compare** (or press `Ctrl+K`) and pick the **earlier** revision.
+2. The overlay shows:
+   * **red:** only in the old revision (removed)
+   * **blue:** only in the new revision (added)
+   * **black:** unchanged
+3. Press `Tab`, or use the **Overlay / Old / New** buttons, to flip between views at the same zoom and position.
+4. Sheets pair by position: sheet 5 is compared with sheet 5. If sheets were added or removed between issues, press `[` or `]` to shift the pairing. The status bar shows which old sheet is paired.
+5. Sheets are aligned at their top-left corners. That's correct for Revit sets with the same title block. Point-based alignment for re-scaled or shifted sheets is on the roadmap.
+
+The two sheets are rendered separately, tinted on the GPU and blended with a darken (per-channel minimum) blend, so overlays stay smooth at any zoom.
 
 ## How it works
 
@@ -91,15 +107,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 * Password-protected PDFs aren't supported.
 * Opening a file reads every page size up front. Sets with several thousand sheets take a moment to open.
 
-## Roadmap ideas (Bluebeam-style)
+## Roadmap (goal: replace Bluebeam)
 
-* Thumbnail and sheet-index sidebar, plus continuous-scroll mode
-* View rotation
-* Markups (cloud, callout, text, highlight) saved back into the PDF as standard annotations
-* Calibrated measurements (length, area, count) using the sheet's scale
-* Sheet overlay and compare (revision A vs. B in red and blue)
-* Text search, and hyperlinks between sheets
-* Tabs for several open documents
+1. **Revision compare:** overlay, old/new toggle and sheet pairing are done. Next: point-based alignment, sheet-number matching, and a list of changed areas.
+2. **Takeoffs:** scale calibration, length, polyline, area (with deductions), perimeter and count tools; a quantities panel; CSV and Excel export.
+3. **Markups:** cloud, callout, text, arrow, shapes, highlight and stamps, saved as standard PDF annotations that Bluebeam and Acrobat can read; a markups list; undo.
+4. **Navigation:** sheet sidebar with thumbnails, text search, clickable sheet callouts, tabs.
+5. **Rollout:** installer, "Open with Red-Beam", shared tool sets.
 
 ## Third-party software
 

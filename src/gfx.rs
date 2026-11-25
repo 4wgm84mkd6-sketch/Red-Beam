@@ -87,6 +87,7 @@ pub struct Gfx {
     adapter3: Option<IDXGIAdapter3>,
     pub max_bitmap: u32,
     pub size: (u32, u32),
+    target: Option<ID2D1Bitmap1>,
 }
 
 impl Gfx {
@@ -152,6 +153,7 @@ impl Gfx {
                 dedicated_vram_mb,
                 max_bitmap,
                 size: (d.Width, d.Height),
+                target: None,
             };
             g.create_target()?;
             Ok(g)
@@ -164,8 +166,16 @@ impl Gfx {
             let props = bitmap_props(D2D1_ALPHA_MODE_IGNORE, D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW);
             let bmp = self.ctx.CreateBitmapFromDxgiSurface(&surface, Some(&props))?;
             self.ctx.SetTarget(&bmp);
+            self.target = Some(bmp);
         }
         Ok(())
+    }
+
+    /// Point drawing back at the window after an offscreen pass.
+    pub fn restore_target(&self) {
+        if let Some(t) = &self.target {
+            unsafe { self.ctx.SetTarget(t) };
+        }
     }
 
     pub fn resize(&mut self, w: u32, h: u32) -> Result<()> {
@@ -174,6 +184,7 @@ impl Gfx {
         }
         unsafe {
             self.ctx.SetTarget(None);
+            self.target = None;
             self.swap.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
         }
         self.size = (w, h);

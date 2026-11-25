@@ -25,7 +25,7 @@ use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use app::{App, WM_APP_OPEN};
+use app::{App, WM_APP_COMPARE, WM_APP_OPEN};
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -42,7 +42,7 @@ fn error_box(hwnd: HWND, text: &str) {
     }
 }
 
-fn open_dialog(hwnd: HWND) -> Option<PathBuf> {
+fn open_dialog(hwnd: HWND, title: PCWSTR) -> Option<PathBuf> {
     unsafe {
         let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         let filters = [
@@ -50,7 +50,7 @@ fn open_dialog(hwnd: HWND) -> Option<PathBuf> {
             COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
         ];
         dlg.SetFileTypes(&filters).ok()?;
-        dlg.SetTitle(w!("Open PDF")).ok()?;
+        dlg.SetTitle(title).ok()?;
         dlg.Show(Some(hwnd)).ok()?;
         let item = dlg.GetResult().ok()?;
         let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
@@ -128,8 +128,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     unsafe {
         match msg {
             WM_APP_OPEN => {
-                if let Some(p) = open_dialog(hwnd) {
+                if let Some(p) = open_dialog(hwnd, w!("Open PDF")) {
                     with_app(|a| a.open(p));
+                }
+                after(hwnd);
+                return LRESULT(0);
+            }
+            WM_APP_COMPARE => {
+                if let Some(p) = open_dialog(hwnd, w!("Choose the EARLIER revision to compare against")) {
+                    with_app(|a| a.start_compare(p));
                 }
                 after(hwnd);
                 return LRESULT(0);

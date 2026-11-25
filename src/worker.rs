@@ -117,8 +117,9 @@ pub enum Msg {
 
 #[derive(Default)]
 struct State {
-    path: Option<PathBuf>,
-    doc_id: u64,
+    /// Documents the UI wants loaded (the open set, plus a revision to
+    /// compare against).
+    docs: Vec<(u64, PathBuf)>,
     jobs: Vec<Job>,
     in_progress: HashSet<JobKey>,
     /// Cancel flags of running jobs, and whether each is background work.
@@ -169,12 +170,19 @@ impl Pool {
         Pool { shared, threads, rx, size, engine }
     }
 
-    pub fn open(&self, path: PathBuf, doc_id: u64) {
+    /// Set which documents should be loaded. Work for any other document is
+    /// dropped and the workers unload it.
+    pub fn set_docs(&self, docs: Vec<(u64, PathBuf)>) {
         let mut s = self.shared.m.lock().unwrap();
-        s.path = Some(path);
-        s.doc_id = doc_id;
-        s.jobs.clear();
-        s.delivered.clear();
+        let keep = |id: u64| docs.iter().any(|(d, _)| *d == id);
+        s.jobs.retain(|j| keep(j.doc_id));
+        s.delivered.retain(|k| keep(k.0));
+        for (key, (flag, _)) in &s.running {
+            if !keep(key.0) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        s.docs = docs;
         self.shared.cv.notify_all();
     }
 
@@ -218,24 +226,28 @@ impl Drop for Pool {
 
 enum Task {
     Open(PathBuf, u64),
+    Unload(Vec<u64>),
     Render(Job, usize, Arc<AtomicBool>),
 }
 
-/// `have` = id of the document this worker has loaded (or tried to load).
-fn next_task(shared: &Shared, have: u64, loaded: bool) -> Option<Task> {
+/// `tried` = documents this worker has loaded or attempted; `loaded` = the
+/// ones that succeeded.
+fn next_task(shared: &Shared, tried: &HashSet<u64>, loaded: &HashSet<u64>) -> Option<Task> {
     let mut s = shared.m.lock().unwrap();
     loop {
         if s.quit {
             return None;
         }
-        if s.doc_id != have {
-            if let Some(p) = &s.path {
-                return Some(Task::Open(p.clone(), s.doc_id));
-            }
+        let unwanted: Vec<u64> = tried.iter().copied().filter(|id| !s.docs.iter().any(|(d, _)| d == id)).collect();
+        if !unwanted.is_empty() {
+            return Some(Task::Unload(unwanted));
         }
-        if loaded && s.doc_id == have {
+        if let Some((id, p)) = s.docs.iter().find(|(id, _)| !tried.contains(id)) {
+            return Some(Task::Open(p.clone(), *id));
+        }
+        {
             let eligible = |j: &Job| {
-                j.doc_id == s.doc_id && !s.delivered.contains(&j.key()) && !s.in_progress.contains(&j.key())
+                loaded.contains(&j.doc_id) && !s.delivered.contains(&j.key()) && !s.in_progress.contains(&j.key())
             };
             // Foreground first: background work never starts while a sharp
             // render of the on-screen view is queued or running, so it can't
@@ -404,10 +416,39 @@ impl WorkerGpu {
     }
 }
 
-/// The loaded document, per engine.
-enum Backend {
-    Windows { doc: Option<PdfDocument>, pages: Vec<(u32, PdfPage)> },
-    Pdfium { doc: Option<pdfium::Document>, sizes: Vec<(f32, f32)> },
+/// A loaded document, per engine.
+enum DocHandle {
+    Windows { doc: PdfDocument, pages: Vec<(u32, PdfPage)> },
+    Pdfium { doc: pdfium::Document, sizes: Vec<(f32, f32)> },
+}
+
+fn render_job(g: &WorkerGpu, d: &mut DocHandle, job: &Job, cancel: &AtomicBool) -> Result<Option<(ID3D11Texture2D, isize)>> {
+    match d {
+        DocHandle::Windows { doc, pages } => {
+            let page = match pages.iter().position(|(i, _)| *i == job.page) {
+                Some(ix) => {
+                    let p = pages.remove(ix);
+                    pages.insert(0, p);
+                    pages[0].1.clone()
+                }
+                None => {
+                    let p = doc.GetPage(job.page)?;
+                    pages.insert(0, (job.page, p.clone()));
+                    pages.truncate(4);
+                    p
+                }
+            };
+            g.render(&page, job).map(Some)
+        }
+        DocHandle::Pdfium { doc, sizes } => {
+            let size = sizes.get(job.page as usize).copied().unwrap_or((job.src.w(), job.src.h()));
+            match doc.render(job, size, cancel) {
+                Err(e) => Err(Error::new(E_FAIL, e)),
+                Ok(None) => Ok(None),
+                Ok(Some(px)) => g.upload(job.w, job.h, &px).map(Some),
+            }
+        }
+    }
 }
 
 fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd: isize, engine: Engine) {
@@ -415,87 +456,63 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let mut wgpu = WorkerGpu::new(&gpu);
-    let mut backend = match engine {
+    let use_pdfium = match engine {
         Engine::Pdfium => match pdfium::lib() {
-            Ok(_) => Backend::Pdfium { doc: None, sizes: Vec::new() },
+            Ok(_) => true,
             Err(e) => {
                 if index == 0 {
                     let _ = tx.send(Msg::EngineFallback(e));
                     notify(hwnd);
                 }
-                Backend::Windows { doc: None, pages: Vec::new() }
+                false
             }
         },
-        Engine::Windows => Backend::Windows { doc: None, pages: Vec::new() },
+        Engine::Windows => false,
     };
-    let mut have: u64 = 0;
+    let mut docs: HashMap<u64, DocHandle> = HashMap::new();
+    let mut tried: HashSet<u64> = HashSet::new();
 
     loop {
-        let loaded = match &backend {
-            Backend::Windows { doc, .. } => doc.is_some(),
-            Backend::Pdfium { doc, .. } => doc.is_some(),
-        };
-        let Some(task) = next_task(&shared, have, loaded) else { break };
+        let loaded: HashSet<u64> = docs.keys().copied().collect();
+        let Some(task) = next_task(&shared, &tried, &loaded) else { break };
         match task {
+            Task::Unload(ids) => {
+                for id in ids {
+                    tried.remove(&id);
+                    docs.remove(&id);
+                }
+            }
             Task::Open(path, doc_id) => {
-                have = doc_id;
+                tried.insert(doc_id);
                 // Worker 0 reports the document to the UI; any others just
                 // load their own copy so they can render in parallel.
-                let res: std::result::Result<Vec<(f32, f32)>, String> = match (&wgpu, &mut backend) {
-                    (Err(e), _) => Err(format!("GPU renderer init failed: {}", e.message())),
-                    (Ok(_), Backend::Windows { doc, pages }) => {
-                        *doc = None;
-                        pages.clear();
-                        load(&path, index == 0).map_err(|e| e.message().to_string()).map(|(d, s)| {
-                            *doc = Some(d);
-                            s
-                        })
+                let res: std::result::Result<(DocHandle, Vec<(f32, f32)>), String> = match &wgpu {
+                    Err(e) => Err(format!("GPU renderer init failed: {}", e.message())),
+                    Ok(_) if use_pdfium => pdfium::Document::open(&path)
+                        .map(|(doc, sizes)| (DocHandle::Pdfium { doc, sizes: sizes.clone() }, sizes)),
+                    Ok(_) => load(&path, true)
+                        .map(|(doc, sizes)| (DocHandle::Windows { doc, pages: Vec::new() }, sizes))
+                        .map_err(|e| e.message().to_string()),
+                };
+                let msg = match res {
+                    Ok((handle, pages)) => {
+                        docs.insert(doc_id, handle);
+                        Msg::Opened { doc_id, path, pages }
                     }
-                    (Ok(_), Backend::Pdfium { doc, sizes }) => {
-                        *doc = None;
-                        pdfium::Document::open(&path).map(|(d, s)| {
-                            *doc = Some(d);
-                            *sizes = s.clone();
-                            s
-                        })
-                    }
+                    Err(error) => Msg::OpenFailed { doc_id, path, error },
                 };
                 if index == 0 {
-                    let _ = tx.send(match res {
-                        Ok(pages) => Msg::Opened { doc_id, path, pages },
-                        Err(error) => Msg::OpenFailed { doc_id, path, error },
-                    });
+                    let _ = tx.send(msg);
                     notify(hwnd);
                 }
                 shared.cv.notify_all();
             }
             Task::Render(job, parallel, cancel) => {
                 let t0 = Instant::now();
-                let result: std::result::Result<Option<(ID3D11Texture2D, isize)>, Error> = match (&wgpu, &mut backend) {
+                let result = match (&wgpu, docs.get_mut(&job.doc_id)) {
                     (Err(e), _) => Err(e.clone()),
-                    (Ok(g), Backend::Windows { doc, pages }) => {
-                        let page = match pages.iter().position(|(i, _)| *i == job.page) {
-                            Some(ix) => {
-                                let p = pages.remove(ix);
-                                pages.insert(0, p);
-                                Ok(pages[0].1.clone())
-                            }
-                            None => doc.as_ref().ok_or_else(|| Error::from(E_FAIL)).and_then(|d| d.GetPage(job.page)).inspect(|p| {
-                                pages.insert(0, (job.page, p.clone()));
-                                pages.truncate(4);
-                            }),
-                        };
-                        page.and_then(|p| g.render(&p, &job)).map(Some)
-                    }
-                    (Ok(g), Backend::Pdfium { doc, sizes }) => {
-                        let size = sizes.get(job.page as usize).copied().unwrap_or((job.src.w(), job.src.h()));
-                        match doc.as_mut().map(|d| d.render(&job, size, &cancel)) {
-                            None => Err(Error::from(E_FAIL)),
-                            Some(Err(e)) => Err(Error::new(E_FAIL, e)),
-                            Some(Ok(None)) => Ok(None),
-                            Some(Ok(Some(px))) => g.upload(job.w, job.h, &px).map(Some),
-                        }
-                    }
+                    (Ok(_), None) => Ok(None), // document was unloaded meanwhile
+                    (Ok(g), Some(d)) => render_job(g, d, &job, &cancel),
                 };
                 // GPU reset (driver update / TDR): rebuild this worker's device.
                 if let Err(e) = &result {
@@ -534,7 +551,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
             }
         }
     }
-    drop(backend);
+    drop(docs);
     drop(wgpu);
     unsafe { CoUninitialize() };
 }
