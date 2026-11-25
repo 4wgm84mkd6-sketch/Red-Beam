@@ -4,12 +4,10 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 
 > **About Revit files:** Red-Beam opens **PDFs**, including the very large sheets that Revit exports. It can't open native `.rvt` models. Reading those needs Autodesk's own software or a commercially licensed SDK.
 
-## Download
+## Download and updates
 
-* Every push to `main` builds `RedBeam.exe` on GitHub Actions. Open **Actions → Build → latest run → Artifacts → RedBeam-windows-x64**.
-* Pushing a tag such as `v0.1.0` also attaches the exe to a GitHub Release.
-
-`RedBeam.exe` is a single file with no installer. It only uses DLLs built into Windows 10 and 11.
+* **First install:** open the [latest release](https://github.com/4wgm84mkd6-sketch/Red-Beam/releases/latest) and download `RedBeam.exe`. It's a single file with no installer, and it only uses DLLs built into Windows 10 and 11. Put it in a folder you can write to, such as Documents or Desktop, not Program Files.
+* **Updates:** every push to `main` is built on GitHub Actions and published as a release named `build-<n>`. Red-Beam checks for a newer build at startup. When there is one, the **Update ●** button in the status bar turns red. Click it, confirm, and the app downloads the new version, replaces itself and reopens your drawing on the same sheet. Clicking **Update** at any other time checks again.
 
 ## Using it
 
@@ -78,6 +76,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/main.rs` | Window creation, message loop, Open dialog, drag and drop, GPU device-loss rebuild |
 | `src/app.rs` | View and document state, render-request scheduling, input handling, composition and status bar |
 | `src/worker.rs` | Render worker pool: each worker has a private GPU device and loads its own copy of the PDF; renders into shared textures |
+| `src/update.rs` | Checks GitHub Releases for a newer build, downloads it, swaps the exe and restarts |
 | `src/gfx.rs` | Direct3D 11, Direct2D and DXGI swap-chain setup |
 | `src/view.rs` | Camera math: zoom about a point, fit page or width, pan clamping |
 

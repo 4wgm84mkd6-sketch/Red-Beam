@@ -6,6 +6,7 @@ compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.
 
 mod app;
 mod gfx;
+mod update;
 mod view;
 mod worker;
 
@@ -81,12 +82,44 @@ fn rebuild(hwnd: HWND) {
 
 /// Work that must run outside the `App` borrow (modal UI, device rebuild).
 fn after(hwnd: HWND) {
-    let (err, lost) = with_app(|a| (a.pending_error.take(), a.device_lost)).unwrap_or((None, false));
+    let Some((err, lost, info, prompt, quit)) = with_app(|a| {
+        (
+            a.pending_error.take(),
+            a.device_lost,
+            a.pending_info.take(),
+            a.pending_update_prompt.take(),
+            a.quit_for_update,
+        )
+    }) else {
+        return;
+    };
+    if quit {
+        // The updated copy has been launched; close this one.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        return;
+    }
     if lost {
         rebuild(hwnd);
     }
     if let Some(e) = err {
         error_box(hwnd, &e);
+    }
+    if let Some(i) = info {
+        unsafe {
+            MessageBoxW(Some(hwnd), &HSTRING::from(i), w!("Red-Beam"), MB_OK | MB_ICONINFORMATION);
+        }
+    }
+    if let Some(b) = prompt {
+        let text = format!(
+            "Red-Beam build {b} is available (you have {}).\n\nDownload and restart now? Your open drawing will reopen on the same sheet.",
+            update::build_label()
+        );
+        let r = unsafe { MessageBoxW(Some(hwnd), &HSTRING::from(text), w!("Update Red-Beam"), MB_YESNO | MB_ICONQUESTION) };
+        if r == IDYES {
+            with_app(|a| a.start_download(b));
+        }
     }
 }
 
@@ -188,8 +221,17 @@ fn main() -> Result<()> {
             }
         }
         let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
-        if let Some(p) = std::env::args_os().nth(1) {
-            with_app(|a| a.open(PathBuf::from(p)));
+        // RedBeam.exe [file.pdf] [--page=N]
+        let mut file = None;
+        let mut page = 0u32;
+        for a in std::env::args_os().skip(1) {
+            match a.to_str().and_then(|s| s.strip_prefix("--page=")) {
+                Some(n) => page = n.parse::<u32>().unwrap_or(1).saturating_sub(1),
+                None => file = Some(PathBuf::from(a)),
+            }
+        }
+        if let Some(p) = file {
+            with_app(|a| a.open_at(p, page));
         }
 
         let mut msg = MSG::default();

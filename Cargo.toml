@@ -37,6 +37,9 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
+    "Web_Http",
+    "Web_Http_Filters",
+    "Web_Http_Headers",
 ]
 
 [profile.release]

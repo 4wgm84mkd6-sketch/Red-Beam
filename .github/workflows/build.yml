@@ -3,7 +3,6 @@ name: Build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -13,6 +12,10 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      # Baked into the exe; the in-app Update button compares it with the
+      # latest release.
+      REDBEAM_BUILD: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,8 +30,15 @@ jobs:
         with:
           name: RedBeam-windows-x64
           path: target/release/RedBeam.exe
-      - name: Publish release (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      # Every build of main becomes a release, which the app's Update button
+      # downloads. The URL pattern is .../releases/download/build-<n>/RedBeam.exe
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: build-${{ github.run_number }}
+          name: Red-Beam build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: ${{ github.event.head_commit.message }}
           files: target/release/RedBeam.exe

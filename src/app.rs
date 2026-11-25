@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use windows::core::*;
@@ -17,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
 
 use crate::gfx::{self, Gfx};
+use crate::update::{self, UpdateMsg, WM_APP_UPDATE};
 use crate::view::{FitMode, RectF, View};
 use crate::worker::{Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
 
@@ -85,6 +87,16 @@ enum Btn {
     FitPage,
     FitWidth,
     Help,
+    Update,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(u32),
+    Downloading(u32),
 }
 
 struct Cached {
@@ -164,7 +176,14 @@ pub struct App {
     render_log: VecDeque<String>,
     status: Option<String>,
 
+    update: UpdState,
+    upd_tx: Sender<UpdateMsg>,
+    upd_rx: Receiver<UpdateMsg>,
+
     pub pending_error: Option<String>,
+    pub pending_info: Option<String>,
+    pub pending_update_prompt: Option<u32>,
+    pub quit_for_update: bool,
     pub device_lost: bool,
 }
 
@@ -246,6 +265,8 @@ impl App {
         unsafe {
             let _ = GetClientRect(hwnd, &mut rc);
         }
+        let (upd_tx, upd_rx) = channel();
+        update::spawn_check(hwnd, upd_tx.clone(), false);
         Ok(App {
             worker,
             gfx,
@@ -278,7 +299,13 @@ impl App {
             last_render: None,
             render_log: VecDeque::new(),
             status: None,
+            update: UpdState::Checking,
+            upd_tx,
+            upd_rx,
             pending_error: None,
+            pending_info: None,
+            pending_update_prompt: None,
+            quit_for_update: false,
             device_lost: false,
         })
     }
@@ -421,6 +448,71 @@ impl App {
             view: self.view,
             fit: self.fit,
         })
+    }
+
+    /// Open a file at a given sheet (0-based), e.g. after a self-update restart.
+    pub fn open_at(&mut self, path: PathBuf, page: u32) {
+        if page > 0 {
+            self.restore = Some(Restore { path: path.clone(), page, view: View::default(), fit: FitMode::Page });
+        }
+        self.open(path);
+    }
+
+    /// Command-line arguments that reopen the current file and sheet.
+    fn restart_args(&self) -> Vec<String> {
+        match &self.doc {
+            Some(d) => vec![d.path.to_string_lossy().into_owned(), format!("--page={}", d.current + 1)],
+            None => Vec::new(),
+        }
+    }
+
+    pub fn start_download(&mut self, build: u32) {
+        self.update = UpdState::Downloading(build);
+        update::spawn_download(self.hwnd, self.upd_tx.clone(), build);
+        self.invalidate();
+    }
+
+    fn on_update_msgs(&mut self) {
+        while let Ok(m) = self.upd_rx.try_recv() {
+            match m {
+                UpdateMsg::Checked { latest, manual, error } => match latest {
+                    Some(b) if b > update::current_build() => {
+                        self.update = UpdState::Available(b);
+                        if manual {
+                            self.pending_update_prompt = Some(b);
+                        }
+                    }
+                    Some(_) => {
+                        self.update = UpdState::UpToDate;
+                        if manual {
+                            self.pending_info = Some(format!("Red-Beam is up to date ({}).", update::build_label()));
+                        }
+                    }
+                    None => {
+                        self.update = UpdState::Idle;
+                        if manual {
+                            self.pending_error =
+                                Some(format!("Couldn't check for updates:\n{}", error.unwrap_or_default()));
+                        }
+                    }
+                },
+                UpdateMsg::Downloaded { build, path } => match update::install_and_restart(&path, &self.restart_args()) {
+                    Ok(()) => self.quit_for_update = true,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&path);
+                        self.update = UpdState::Available(build);
+                        self.pending_error = Some(format!("Update failed: {e}"));
+                    }
+                },
+                UpdateMsg::DownloadFailed(e) => {
+                    if let UpdState::Downloading(b) = self.update {
+                        self.update = UpdState::Available(b);
+                    }
+                    self.pending_error = Some(format!("Update download failed: {e}"));
+                }
+            }
+        }
+        self.invalidate();
     }
 
     pub fn open_restore(&mut self, r: Restore) {
@@ -622,11 +714,12 @@ impl App {
                         let _ = SetWindowTextW(self.hwnd, &HSTRING::from(format!("{name} \u{2014} Red-Beam")));
                     }
                     match restore {
-                        Some(r) => {
+                        Some(r) if r.fit == FitMode::None => {
                             self.view = r.view;
                             self.fit = r.fit;
                             self.view_changed();
                         }
+                        Some(r) => self.apply_fit(r.fit),
                         None => self.apply_fit(FitMode::Page),
                     }
                     if n == 0 {
@@ -803,13 +896,15 @@ impl App {
             if self.gfx.gpu.warp { "  (software fallback \u{2014} no hardware GPU found)" } else { "" }
         );
         self.text(&gpu, &self.fonts.ui_center, &RectF::new(0.0, cy + 54.0 * s, cw, cy + 78.0 * s), TEXT_DIM);
+        let ver = format!("Red-Beam {}", update::build_label());
+        self.text(&ver, &self.fonts.ui_center, &RectF::new(0.0, cy + 80.0 * s, cw, cy + 104.0 * s), TEXT_DIM);
     }
 
     fn button_layout(&self) -> Vec<(Btn, RectF, &'static str)> {
         let s = self.s();
         let (_, h) = self.client;
         let (top, bot) = (h - self.bar_h() + 5.0 * s, h - 5.0 * s);
-        let specs: [(Btn, &str, f32, f32); 8] = [
+        let specs: [(Btn, &str, f32, f32); 9] = [
             (Btn::Open, "Open", 56.0, 12.0),
             (Btn::Prev, "\u{25C0}", 32.0, 4.0),
             (Btn::Next, "\u{25B6}", 32.0, 12.0),
@@ -817,7 +912,8 @@ impl App {
             (Btn::ZoomIn, "+", 32.0, 4.0),
             (Btn::FitPage, "Fit", 44.0, 4.0),
             (Btn::FitWidth, "Width", 56.0, 12.0),
-            (Btn::Help, "?", 30.0, 0.0),
+            (Btn::Help, "?", 30.0, 12.0),
+            (Btn::Update, self.update_label(), 104.0, 0.0),
         ];
         let mut x = 6.0 * s;
         specs
@@ -828,6 +924,15 @@ impl App {
                 (b, r, label)
             })
             .collect()
+    }
+
+    fn update_label(&self) -> &'static str {
+        match self.update {
+            UpdState::Checking => "Checking\u{2026}",
+            UpdState::Downloading(_) => "Updating\u{2026}",
+            UpdState::Available(_) => "Update \u{25CF}",
+            _ => "Update",
+        }
     }
 
     fn hit_button(&self, x: f32, y: f32) -> Option<Btn> {
@@ -842,7 +947,8 @@ impl App {
         self.fill(&RectF::new(0.0, bar.t, w, bar.t + 1.0), 0x000000, 0.8);
         let buttons = self.button_layout();
         for (b, r, label) in &buttons {
-            let bg = if self.hover == Some(*b) { ACCENT } else { BTN_BG };
+            let highlight = *b == Btn::Update && matches!(self.update, UpdState::Available(_));
+            let bg = if self.hover == Some(*b) || highlight { ACCENT } else { BTN_BG };
             self.fill(r, bg, 1.0);
             self.text(label, &self.fonts.ui_center, r, TEXT);
         }
@@ -913,7 +1019,8 @@ impl App {
             None => "\u{2014}".into(),
         };
         let txt = format!(
-"Frame rate\t{fps}\nFrame CPU time\t{:.1} ms\nGPU\t{}\nVideo memory\t{vram}\nRender workers\t{} ({} busy)   \u{2014} F3 to change\nCached on GPU\t{} sheets + {} sharp views ({cache_mb} MB)\nLast sharp render\t{last}\n\nRecent renders (newest first):\n{}",
+            "Version\tRed-Beam {}\nFrame rate\t{fps}\nFrame CPU time\t{:.1} ms\nGPU\t{}\nVideo memory\t{vram}\nRender workers\t{} ({} busy)   \u{2014} F3 to change\nCached on GPU\t{} sheets + {} sharp views ({cache_mb} MB)\nLast sharp render\t{last}\n\nRecent renders (newest first):\n{}",
+            update::build_label(),
             self.paint_ms,
             self.gfx.adapter_name,
             self.worker.size,
@@ -922,7 +1029,7 @@ impl App {
             self.details.len(),
             self.render_log.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"),
         );
-        let panel = RectF::new(12.0 * s, 12.0 * s, 12.0 * s + 640.0 * s, 12.0 * s + 360.0 * s);
+        let panel = RectF::new(12.0 * s, 12.0 * s, 12.0 * s + 640.0 * s, 12.0 * s + 380.0 * s);
         self.fill(&panel, 0x141518, 0.88);
         self.fill(&RectF::new(panel.l, panel.t, panel.l + 3.0 * s, panel.b), ACCENT, 1.0);
         let inner = RectF::new(panel.l + 16.0 * s, panel.t + 10.0 * s, panel.r - 10.0 * s, panel.b - 6.0 * s);
@@ -1089,6 +1196,15 @@ impl App {
                 self.show_help = !self.show_help;
                 self.invalidate();
             }
+            Btn::Update => match self.update {
+                UpdState::Available(b) => self.pending_update_prompt = Some(b),
+                UpdState::Checking | UpdState::Downloading(_) => {}
+                _ => {
+                    self.update = UpdState::Checking;
+                    update::spawn_check(self.hwnd, self.upd_tx.clone(), true);
+                    self.invalidate();
+                }
+            },
         }
     }
 
@@ -1234,6 +1350,10 @@ impl App {
                 }
                 WM_APP_RESULT => {
                     self.on_results();
+                    Some(0)
+                }
+                WM_APP_UPDATE => {
+                    self.on_update_msgs();
                     Some(0)
                 }
                 _ => None,
