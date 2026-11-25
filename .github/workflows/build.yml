@@ -22,6 +22,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # PDFium (BSD-3-Clause) prebuilt by bblanchon/pdfium-binaries, pinned
+      # and checksum-verified; build.rs embeds the DLL into RedBeam.exe.
+      - name: Fetch PDFium
+        shell: pwsh
+        run: |
+          $url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8179/pdfium-win-x64.tgz"
+          Invoke-WebRequest $url -OutFile pdfium.tgz
+          $hash = (Get-FileHash pdfium.tgz -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "836a77c9053f624839c66010cddea7b675628a36b8831d2330178bb169d241b6") { throw "PDFium checksum mismatch: $hash" }
+          New-Item -ItemType Directory -Force vendor/pdfium | Out-Null
+          tar -xzf pdfium.tgz -C vendor/pdfium
       - name: Lint
         run: cargo clippy --release -- -D warnings
       - name: Build

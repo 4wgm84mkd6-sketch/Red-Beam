@@ -6,6 +6,7 @@ compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.
 
 mod app;
 mod gfx;
+mod pdfium;
 mod update;
 mod view;
 mod worker;

@@ -5,7 +5,8 @@
 //! regions/sheets rasterise in parallel and the UI thread never waits on a
 //! render. Results are GPU textures shared with the UI device by handle.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -26,6 +27,7 @@ use windows::Win32::System::WinRT::Pdf::*;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::gfx::{self, bitmap_props, GpuChoice};
+use crate::pdfium;
 use crate::view::RectF;
 
 pub const WM_APP_RESULT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
@@ -33,6 +35,26 @@ pub const WM_APP_RESULT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP +
 /// Moves a COM pointer across threads (D3D device-child objects are free-threaded).
 pub struct Sendable<T>(pub T);
 unsafe impl<T> Send for Sendable<T> {}
+
+/// Which PDF engine rasterises pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// PDFium (Chrome/Edge's engine), embedded. Parses each page once, keeps
+    /// it loaded, skips off-screen content and can abandon stale renders.
+    /// Single-threaded.
+    Pdfium,
+    /// Windows.Data.Pdf rendering through Direct2D on the GPU.
+    Windows,
+}
+
+impl Engine {
+    pub fn name(self) -> &'static str {
+        match self {
+            Engine::Pdfium => "PDFium",
+            Engine::Windows => "Windows built-in",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
@@ -87,6 +109,10 @@ pub enum Msg {
     /// `parallel` = renders running at the moment this one started (incl. itself).
     Rendered { job: Job, handle: isize, texture: Sendable<ID3D11Texture2D>, ms: f32, parallel: usize },
     RenderFailed { job: Job, error: String },
+    /// Abandoned because it was no longer wanted (PDFium only).
+    Cancelled { job: Job, ms: f32 },
+    /// PDFium could not be loaded; the pool fell back to the Windows engine.
+    EngineFallback(String),
 }
 
 #[derive(Default)]
@@ -95,6 +121,8 @@ struct State {
     doc_id: u64,
     jobs: Vec<Job>,
     in_progress: HashSet<JobKey>,
+    /// Cancel flags of running jobs, and whether each is background work.
+    running: HashMap<JobKey, (Arc<AtomicBool>, bool)>,
     /// Finished but not yet acknowledged by the UI (avoids duplicate renders
     /// when the UI re-posts its wish list before a result arrives).
     delivered: HashSet<JobKey>,
@@ -116,10 +144,13 @@ pub struct Pool {
     threads: Vec<JoinHandle<()>>,
     pub rx: Receiver<Msg>,
     pub size: usize,
+    pub engine: Engine,
 }
 
 impl Pool {
-    pub fn start(gpu: &GpuChoice, hwnd: HWND, size: usize) -> Pool {
+    pub fn start(gpu: &GpuChoice, hwnd: HWND, size: usize, engine: Engine) -> Pool {
+        // PDFium is single-threaded.
+        let size = if engine == Engine::Pdfium { 1 } else { size.max(1) };
         let state = State { bg_limit: size.saturating_sub(1).max(1), ..Default::default() };
         let shared = Arc::new(Shared { m: Mutex::new(state), cv: Condvar::new() });
         let (tx, rx) = channel();
@@ -131,11 +162,11 @@ impl Pool {
                 let gpu = gpu.clone();
                 std::thread::Builder::new()
                     .name(format!("pdf-render-{i}"))
-                    .spawn(move || run(i, s, gpu, tx, hwnd_raw))
+                    .spawn(move || run(i, s, gpu, tx, hwnd_raw, engine))
                     .expect("spawn render thread")
             })
             .collect();
-        Pool { shared, threads, rx, size }
+        Pool { shared, threads, rx, size, engine }
     }
 
     pub fn open(&self, path: PathBuf, doc_id: u64) {
@@ -150,6 +181,15 @@ impl Pool {
     /// Replace the queue with a new priority-ordered wish list.
     pub fn set_jobs(&self, jobs: Vec<Job>) {
         let mut s = self.shared.m.lock().unwrap();
+        // Abandon running work that no longer matters: background work when
+        // the view on screen needs a render, or a view the user moved away from.
+        let fg_wanted = jobs.iter().any(|j| !j.is_background() && !s.delivered.contains(&j.key()));
+        for (key, (flag, bg)) in &s.running {
+            let stale = if *bg { fg_wanted } else { !jobs.iter().any(|j| j.key() == *key) };
+            if stale {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
         s.jobs = jobs;
         self.shared.cv.notify_all();
     }
@@ -178,7 +218,7 @@ impl Drop for Pool {
 
 enum Task {
     Open(PathBuf, u64),
-    Render(Job, usize),
+    Render(Job, usize, Arc<AtomicBool>),
 }
 
 /// `have` = id of the document this worker has loaded (or tried to load).
@@ -212,7 +252,9 @@ fn next_task(shared: &Shared, have: u64, loaded: bool) -> Option<Task> {
                     s.fg_running += 1;
                 }
                 let parallel = s.in_progress.len();
-                return Some(Task::Render(j, parallel));
+                let flag = Arc::new(AtomicBool::new(false));
+                s.running.insert(j.key(), (flag.clone(), j.is_background()));
+                return Some(Task::Render(j, parallel, flag));
             }
         }
         s = shared.cv.wait(s).unwrap();
@@ -310,20 +352,21 @@ impl WorkerGpu {
             r?;
             e?;
 
-            // Wait until the GPU has finished drawing before handing the
-            // texture to the UI device (shared resources are not otherwise
-            // synchronised across devices).
+            self.finish(tex)
+        }
+    }
+
+    /// Wait for the GPU, then share the texture with the UI device.
+    fn finish(&self, tex: ID3D11Texture2D) -> Result<(ID3D11Texture2D, isize)> {
+        unsafe {
+            // Shared resources are not synchronised across devices, so make
+            // sure the GPU is done before the UI samples the texture.
             self.imm.End(&self.query);
             self.imm.Flush();
             let t0 = Instant::now();
             loop {
                 let mut done = BOOL(0);
-                let _ = self.imm.GetData(
-                    &self.query,
-                    Some(&mut done as *mut BOOL as *mut _),
-                    size_of::<BOOL>() as u32,
-                    0,
-                );
+                let _ = self.imm.GetData(&self.query, Some(&mut done as *mut BOOL as *mut _), size_of::<BOOL>() as u32, 0);
                 if done.as_bool() || t0.elapsed() > Duration::from_secs(20) {
                     break;
                 }
@@ -333,87 +376,157 @@ impl WorkerGpu {
             Ok((tex, handle.0 as isize))
         }
     }
+
+    /// Upload a CPU-rendered BGRA image into a shared GPU texture.
+    fn upload(&self, w: u32, h: u32, pixels: &[u8]) -> Result<(ID3D11Texture2D, isize)> {
+        unsafe {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            };
+            let init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: pixels.as_ptr() as *const _,
+                SysMemPitch: w * 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut tex = None;
+            self.d3d.CreateTexture2D(&desc, Some(&init), Some(&mut tex))?;
+            self.finish(tex.ok_or_else(|| Error::from(E_POINTER))?)
+        }
+    }
 }
 
-fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd: isize) {
+/// The loaded document, per engine.
+enum Backend {
+    Windows { doc: Option<PdfDocument>, pages: Vec<(u32, PdfPage)> },
+    Pdfium { doc: Option<pdfium::Document>, sizes: Vec<(f32, f32)> },
+}
+
+fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd: isize, engine: Engine) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let mut wgpu = WorkerGpu::new(&gpu);
+    let mut backend = match engine {
+        Engine::Pdfium => match pdfium::lib() {
+            Ok(_) => Backend::Pdfium { doc: None, sizes: Vec::new() },
+            Err(e) => {
+                if index == 0 {
+                    let _ = tx.send(Msg::EngineFallback(e));
+                    notify(hwnd);
+                }
+                Backend::Windows { doc: None, pages: Vec::new() }
+            }
+        },
+        Engine::Windows => Backend::Windows { doc: None, pages: Vec::new() },
+    };
     let mut have: u64 = 0;
-    let mut doc: Option<PdfDocument> = None;
-    // Small MRU of page objects so repeat renders of a sheet skip GetPage.
-    let mut pages: Vec<(u32, PdfPage)> = Vec::new();
 
-    while let Some(task) = next_task(&shared, have, doc.is_some()) {
+    loop {
+        let loaded = match &backend {
+            Backend::Windows { doc, .. } => doc.is_some(),
+            Backend::Pdfium { doc, .. } => doc.is_some(),
+        };
+        let Some(task) = next_task(&shared, have, loaded) else { break };
         match task {
             Task::Open(path, doc_id) => {
                 have = doc_id;
-                doc = None;
-                pages.clear();
-                // Worker 0 reports the document to the UI; the others just load
-                // their own copy so they can render in parallel.
-                let res = match &wgpu {
-                    Err(e) => Err(Error::new(e.code(), format!("GPU renderer init failed: {}", e.message()))),
-                    Ok(_) => load(&path, index == 0),
+                // Worker 0 reports the document to the UI; any others just
+                // load their own copy so they can render in parallel.
+                let res: std::result::Result<Vec<(f32, f32)>, String> = match (&wgpu, &mut backend) {
+                    (Err(e), _) => Err(format!("GPU renderer init failed: {}", e.message())),
+                    (Ok(_), Backend::Windows { doc, pages }) => {
+                        *doc = None;
+                        pages.clear();
+                        load(&path, index == 0).map_err(|e| e.message().to_string()).map(|(d, s)| {
+                            *doc = Some(d);
+                            s
+                        })
+                    }
+                    (Ok(_), Backend::Pdfium { doc, sizes }) => {
+                        *doc = None;
+                        pdfium::Document::open(&path).map(|(d, s)| {
+                            *doc = Some(d);
+                            *sizes = s.clone();
+                            s
+                        })
+                    }
                 };
-                match res {
-                    Ok((d, sizes)) => {
-                        doc = Some(d);
-                        if index == 0 {
-                            let _ = tx.send(Msg::Opened { doc_id, path, pages: sizes });
-                            notify(hwnd);
-                        }
-                    }
-                    Err(e) if index == 0 => {
-                        let _ = tx.send(Msg::OpenFailed { doc_id, path, error: e.message().to_string() });
-                        notify(hwnd);
-                    }
-                    Err(_) => {}
+                if index == 0 {
+                    let _ = tx.send(match res {
+                        Ok(pages) => Msg::Opened { doc_id, path, pages },
+                        Err(error) => Msg::OpenFailed { doc_id, path, error },
+                    });
+                    notify(hwnd);
                 }
-                // Wake others: this worker may now take jobs.
                 shared.cv.notify_all();
             }
-            Task::Render(job, parallel) => {
+            Task::Render(job, parallel, cancel) => {
                 let t0 = Instant::now();
-                let page = match pages.iter().position(|(i, _)| *i == job.page) {
-                    Some(ix) => {
-                        let p = pages.remove(ix);
-                        pages.insert(0, p);
-                        Ok(pages[0].1.clone())
+                let result: std::result::Result<Option<(ID3D11Texture2D, isize)>, Error> = match (&wgpu, &mut backend) {
+                    (Err(e), _) => Err(e.clone()),
+                    (Ok(g), Backend::Windows { doc, pages }) => {
+                        let page = match pages.iter().position(|(i, _)| *i == job.page) {
+                            Some(ix) => {
+                                let p = pages.remove(ix);
+                                pages.insert(0, p);
+                                Ok(pages[0].1.clone())
+                            }
+                            None => doc.as_ref().ok_or_else(|| Error::from(E_FAIL)).and_then(|d| d.GetPage(job.page)).inspect(|p| {
+                                pages.insert(0, (job.page, p.clone()));
+                                pages.truncate(4);
+                            }),
+                        };
+                        page.and_then(|p| g.render(&p, &job)).map(Some)
                     }
-                    None => doc.as_ref().ok_or_else(|| Error::from(E_FAIL)).and_then(|d| d.GetPage(job.page)).inspect(|p| {
-                        pages.insert(0, (job.page, p.clone()));
-                        pages.truncate(4);
-                    }),
+                    (Ok(g), Backend::Pdfium { doc, sizes }) => {
+                        let size = sizes.get(job.page as usize).copied().unwrap_or((job.src.w(), job.src.h()));
+                        match doc.as_mut().map(|d| d.render(&job, size, &cancel)) {
+                            None => Err(Error::from(E_FAIL)),
+                            Some(Err(e)) => Err(Error::new(E_FAIL, e)),
+                            Some(Ok(None)) => Ok(None),
+                            Some(Ok(Some(px))) => g.upload(job.w, job.h, &px).map(Some),
+                        }
+                    }
                 };
-                let mut result = match (&wgpu, &page) {
-                    (Ok(g), Ok(p)) => g.render(p, &job),
-                    (Err(e), _) | (_, Err(e)) => Err(e.clone()),
-                };
-                // GPU reset (driver update / TDR): rebuild this worker's device once.
+                // GPU reset (driver update / TDR): rebuild this worker's device.
                 if let Err(e) = &result {
                     if gfx::is_device_lost(e) {
                         wgpu = WorkerGpu::new(&gpu);
-                        if let (Ok(g), Ok(p)) = (&wgpu, &page) {
-                            result = g.render(p, &job);
-                        }
                     }
                 }
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                let cancelled = matches!(result, Ok(None));
                 {
                     let mut s = shared.m.lock().unwrap();
                     s.in_progress.remove(&job.key());
-                    s.delivered.insert(job.key());
+                    s.running.remove(&job.key());
                     if job.is_background() {
                         s.bg_running -= 1;
                     } else {
                         s.fg_running -= 1;
                     }
+                    if cancelled {
+                        // Background work is still wanted later; put it back.
+                        if job.is_background() && !s.jobs.iter().any(|j| j.key() == job.key()) {
+                            s.jobs.push(job.clone());
+                        }
+                    } else {
+                        s.delivered.insert(job.key());
+                    }
                     shared.cv.notify_all();
                 }
                 let msg = match result {
-                    Ok((tex, handle)) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel },
+                    Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel },
+                    Ok(None) => Msg::Cancelled { job, ms },
                     Err(e) => Msg::RenderFailed { job, error: e.message().to_string() },
                 };
                 let _ = tx.send(msg);
@@ -421,8 +534,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
             }
         }
     }
-    drop(pages);
-    drop(doc);
+    drop(backend);
     drop(wgpu);
     unsafe { CoUninitialize() };
 }

@@ -23,7 +23,7 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Actual size (100%) | `Ctrl+1` |
 | Zoom in / out | `+` / `−` |
 | Performance readout | `F2` |
-| Change the number of render workers (1, 2 or 3) | `F3` |
+| Switch PDF engine (PDFium / Windows built-in) | `F4` |
 | Help | `F1` or `?` |
 
 When you flip between sheets of the same size, Red-Beam keeps your zoom and position. You can compare the same detail across a drawing set by holding `PgDn`.
@@ -31,24 +31,26 @@ When you flip between sheets of the same size, Red-Beam keeps your zoom and posi
 ## How it works
 
 ```
- UI thread (its own D3D11 device)          Render workers ×1–3 (each: own D3D11 device,
- ────────────────────────────────           own Direct2D context, own copy of the PDF)
- DXGI flip swap chain, vsync-paced          ──────────────────────────────────────────
- composition of cached GPU bitmaps  ◀────── Windows.Data.Pdf → IPdfRendererNative →
-   ├─ whole-sheet "base" images              Direct2D → shared GPU texture (by handle)
+ UI thread (its own D3D11 device)          Render worker (own D3D11 device)
+ ────────────────────────────────           ────────────────────────────────
+ DXGI flip swap chain, vsync-paced          PDF engine → pixels → shared GPU texture
+ composition of cached GPU bitmaps  ◀─────    • PDFium (default, embedded)
+   ├─ whole-sheet "base" images               • Windows.Data.Pdf via Direct2D (F4)
    └─ sharp "detail" views (cache)
 ```
 
-* **The screen never waits on rendering.** Each render worker has its own GPU device and its own copy of the document. Finished pages are handed to the UI as shared GPU textures, which are never copied through system memory. Panning and zooming are vsync-paced GPU composition of what's already cached.
-* **Foreground first.** There are two render workers by default; press `F3` to switch between 1, 2 and 3. Background work (whole-sheet images, neighbouring sheets) never starts while a sharp render of the on-screen view is queued or running, so it can't compete with it.
-* **Whole-sheet images.** Nearby sheets keep a whole-page image in GPU memory, sized to the card: 2048 or 4096 px on the long edge. Flipping sheets and fast zooms show those instantly.
-* **Sharp views.** About 140 ms after the view stops moving, the visible area is rendered at exact screen resolution and drawn 1:1. Sharp views are cached, up to about 1/6 of GPU memory, so returning to a view is instant.
-* **Rendering beyond the screen.** Each render costs about the same however much area it covers, because the PDF engine processes the whole sheet's content every time. So on cards with plenty of memory, each sharp render covers well beyond the screen edges and pans reuse it.
-* **Neighbouring sheets.** Once a view is sharp, the same view on the next and previous same-size sheets is rendered too, so flipping between sheets stays sharp.
-* **Animated zoom.** Wheel notches accumulate into one smooth zoom.
+* **The GPU does everything you see.** Panning, zooming (animated, vsync-paced) and sheet flips are GPU composition of images already cached in video memory. The screen never waits for a render.
+* **The PDF engine is the slow part, not the GPU.** Field data on a 72 MB, 18-sheet Revit set: Windows' built-in engine took 2–9 s per render while the GPU sat at about 3%, and it got slower when asked to render in parallel. So the default engine is now **PDFium**, the engine in Chrome and Edge:
+  * Each sheet is parsed once and kept loaded (up to 6 sheets), so later renders only draw.
+  * Only content inside the requested area is drawn, so zoomed-in views are cheap.
+  * Renders are progressive and can be abandoned. When you move on, a stale render is cancelled immediately instead of blocking the next one.
+  * Windows' engine is still available with **F4**, for comparison.
+* **Whole-sheet images.** Nearby sheets keep a whole-page image (up to 4096 px) in GPU memory for instant flips and fast zooms.
+* **Sharp views.** About 140 ms after the view stops moving, the visible area plus a margin is rendered at exact screen resolution and drawn 1:1. Sharp views are cached, so returning to a view is instant. Once a view is sharp, the same view on the neighbouring same-size sheets is pre-rendered.
+* **The on-screen view goes first.** Background work never starts while the sharp render of the view is waiting, and it's cancelled if the view needs one.
 * **GPU choice.** It picks the high-performance GPU on multi-GPU systems, rebuilds after a GPU reset, and falls back to WARP if no hardware GPU is present.
 
-Press **F2** for a performance readout: frame rate, video memory, busy workers, cache contents, and a log of recent renders showing how long each took and how many were running alongside it.
+Press **F2** for a performance readout: engine, frame rate, video memory, cache contents, and a log of recent renders with their times.
 
 ## Building from source
 
@@ -61,6 +63,8 @@ cargo build --release
 ```
 
 The executable is written to `target\release\RedBeam.exe`.
+
+PDFium is embedded when `vendor/pdfium/bin/pdfium.dll` exists, or when the `PDFIUM_DLL` environment variable points at one. Download `pdfium-win-x64.tgz` from [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium%2F8179) and extract it to `vendor/pdfium`. Without it, the build falls back to the Windows engine only.
 
 To cross-compile from Linux, install the `gcc-mingw-w64-x86-64` package, then run:
 
@@ -75,8 +79,9 @@ cargo build --release --target x86_64-pc-windows-gnu
 |---|---|
 | `src/main.rs` | Window creation, message loop, Open dialog, drag and drop, GPU device-loss rebuild |
 | `src/app.rs` | View and document state, render-request scheduling, input handling, composition and status bar |
-| `src/worker.rs` | Render worker pool: each worker has a private GPU device and loads its own copy of the PDF; renders into shared textures |
+| `src/worker.rs` | Render worker: private GPU device, PDFium or Windows engine, priority queue with cancellation, shared textures to the UI |
 | `src/update.rs` | Checks GitHub Releases for a newer build, downloads it, swaps the exe and restarts |
+| `src/pdfium.rs` | Loads the embedded PDFium DLL; parses sheets once and renders regions progressively (cancellable) |
 | `src/gfx.rs` | Direct3D 11, Direct2D and DXGI swap-chain setup |
 | `src/view.rs` | Camera math: zoom about a point, fit page or width, pan clamping |
 
@@ -85,7 +90,6 @@ cargo build --release --target x86_64-pc-windows-gnu
 * Viewing only for now: no markups, measurements or text search yet.
 * Password-protected PDFs aren't supported.
 * Opening a file reads every page size up front. Sets with several thousand sheets take a moment to open.
-* Rendering quality and speed depend on the `Windows.Data.Pdf` engine built into Windows.
 
 ## Roadmap ideas (Bluebeam-style)
 
@@ -96,3 +100,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 * Sheet overlay and compare (revision A vs. B in red and blue)
 * Text search, and hyperlinks between sheets
 * Tabs for several open documents
+
+## Third-party software
+
+Red-Beam embeds [PDFium](https://pdfium.googlesource.com/pdfium/) (BSD-3-Clause), built by [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) (Apache-2.0 build scripts). PDFium includes third-party components such as FreeType, libjpeg-turbo, OpenJPEG, LittleCMS, zlib and AGG, each under its own permissive license. The full license texts ship in the `licenses/` folder of the PDFium release archive.

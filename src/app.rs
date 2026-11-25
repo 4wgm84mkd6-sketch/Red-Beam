@@ -20,7 +20,7 @@ use windows_numerics::Matrix3x2;
 use crate::gfx::{self, Gfx};
 use crate::update::{self, UpdateMsg, WM_APP_UPDATE};
 use crate::view::{FitMode, RectF, View};
-use crate::worker::{Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
+use crate::worker::{Engine, Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
 
 pub const WM_APP_OPEN: u32 = WM_APP + 2;
 const TIMER_SETTLE: usize = 1;
@@ -74,7 +74,8 @@ W\tFit width\n\
 Ctrl+1\tActual size (100%)\n\
 + / \u{2212}\tZoom in / out\n\
 Arrow keys\tPan\n\
-F2 / F3\tPerformance readout / change worker count\n\
+F2\tPerformance readout\n\
+F4\tSwitch PDF engine (PDFium / Windows)\n\
 F1  or  ?\tToggle this help";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -253,9 +254,10 @@ fn make_fonts(dw: &IDWriteFactory, s: f32) -> Result<Fonts> {
 impl App {
     pub fn new(hwnd: HWND) -> Result<App> {
         let gfx = Gfx::new(hwnd)?;
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let workers = if cores >= 4 { 2 } else { 1 };
-        let worker = Pool::start(&gfx.gpu, hwnd, workers);
+        // Field data: Windows.Data.Pdf got slower, not faster, with parallel
+        // renders, so both engines default to a single render thread.
+        let engine = if crate::pdfium::available() { Engine::Pdfium } else { Engine::Windows };
+        let worker = Pool::start(&gfx.gpu, hwnd, 1, engine);
         let detail_budget = ((gfx.dedicated_vram_mb / 6).clamp(256, 4096)) << 20;
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
@@ -348,6 +350,9 @@ impl App {
 
     /// Call after any change to the view: repaint now, detail render once settled.
     fn view_changed(&mut self) {
+        // Whole-pixel origin keeps sharp renders pixel-aligned with the screen.
+        self.view.ox = self.view.ox.round();
+        self.view.oy = self.view.oy.round();
         if let Some((pw, ph)) = self.page_size() {
             let (cw, ch) = self.canvas();
             self.view.clamp_pan(cw, ch, pw, ph, 48.0 * self.s());
@@ -787,6 +792,20 @@ impl App {
                     self.update_jobs(false);
                     self.invalidate();
                 }
+                Msg::Cancelled { job, ms } => {
+                    self.render_log.push_front(format!(
+                        "sheet {}\t{} cancelled after {ms:.0} ms (no longer needed)",
+                        job.page + 1,
+                        if job.kind == JobKind::Base { "whole sheet" } else { "sharp view" }
+                    ));
+                    self.render_log.truncate(8);
+                    self.invalidate();
+                }
+                Msg::EngineFallback(why) => {
+                    self.worker.engine = Engine::Windows;
+                    self.status = Some(format!("PDFium unavailable ({why}); using Windows engine"));
+                    self.invalidate();
+                }
                 Msg::RenderFailed { job, error } => {
                     if self.posted_detail.as_ref().map(|d| d.key()) == Some(job.key()) {
                         self.posted_detail = None;
@@ -982,7 +1001,7 @@ impl App {
         } else if let Some((ms, rw, rh)) = self.last_render {
             right.push_str(&format!("last render {ms:.0} ms ({rw}\u{00D7}{rh})   "));
         }
-        right.push_str(&format!("GPU: {}", self.gfx.adapter_name));
+        right.push_str(&format!("{}  \u{00B7}  GPU: {}", self.worker.engine.name(), self.gfx.adapter_name));
         self.text(&right, &self.fonts.ui_right, &RectF::new(w - right_w, bar.t, w - 10.0 * s, bar.b), TEXT_DIM);
     }
 
@@ -1019,8 +1038,9 @@ impl App {
             None => "\u{2014}".into(),
         };
         let txt = format!(
-            "Version\tRed-Beam {}\nFrame rate\t{fps}\nFrame CPU time\t{:.1} ms\nGPU\t{}\nVideo memory\t{vram}\nRender workers\t{} ({} busy)   \u{2014} F3 to change\nCached on GPU\t{} sheets + {} sharp views ({cache_mb} MB)\nLast sharp render\t{last}\n\nRecent renders (newest first):\n{}",
+            "Version\tRed-Beam {}\nPDF engine\t{}   \u{2014} F4 to switch\nFrame rate\t{fps}\nFrame CPU time\t{:.1} ms\nGPU\t{}\nVideo memory\t{vram}\nRender workers\t{} ({} busy)\nCached on GPU\t{} sheets + {} sharp views ({cache_mb} MB)\nLast sharp render\t{last}\n\nRecent renders (newest first):\n{}",
             update::build_label(),
+            self.worker.engine.name(),
             self.paint_ms,
             self.gfx.adapter_name,
             self.worker.size,
@@ -1029,7 +1049,7 @@ impl App {
             self.details.len(),
             self.render_log.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"),
         );
-        let panel = RectF::new(12.0 * s, 12.0 * s, 12.0 * s + 640.0 * s, 12.0 * s + 380.0 * s);
+        let panel = RectF::new(12.0 * s, 12.0 * s, 12.0 * s + 640.0 * s, 12.0 * s + 400.0 * s);
         self.fill(&panel, 0x141518, 0.88);
         self.fill(&RectF::new(panel.l, panel.t, panel.l + 3.0 * s, panel.b), ACCENT, 1.0);
         let inner = RectF::new(panel.l + 16.0 * s, panel.t + 10.0 * s, panel.r - 10.0 * s, panel.b - 6.0 * s);
@@ -1119,6 +1139,8 @@ impl App {
             self.pan_by(0.0, (ch / 8.0).round());
         } else if k == VK_DOWN {
             self.pan_by(0.0, -(ch / 8.0).round());
+        } else if k == VK_F4 {
+            self.toggle_engine();
         } else if k == VK_F3 {
             self.cycle_workers();
         } else if k == VK_F2 {
@@ -1150,14 +1172,44 @@ impl App {
     /// given machine). Cached images stay; the document is reloaded by the
     /// new workers in the background.
     fn cycle_workers(&mut self) {
+        if self.worker.engine == Engine::Pdfium {
+            self.render_log.push_front("PDFium uses a single render thread (F4 switches engine)".into());
+            self.show_perf = true;
+            self.invalidate();
+            return;
+        }
         let n = self.worker.size % 3 + 1;
-        let new = Pool::start(&self.gfx.gpu, self.hwnd, n);
+        self.restart_pool(n, Engine::Windows);
+        self.render_log.push_front(format!("switched to {n} worker{}", if n == 1 { "" } else { "s" }));
+    }
+
+    /// F4: switch PDF engine. Already-rendered images stay on screen.
+    fn toggle_engine(&mut self) {
+        let next = match self.worker.engine {
+            Engine::Pdfium => Engine::Windows,
+            Engine::Windows if crate::pdfium::available() => Engine::Pdfium,
+            Engine::Windows => {
+                self.status = Some("this build does not include PDFium".into());
+                self.invalidate();
+                return;
+            }
+        };
+        // Fresh images from the new engine, so the comparison is fair.
+        self.bases.clear();
+        self.details.clear();
+        self.restart_pool(1, next);
+        self.render_log.push_front(format!("switched to {} engine", next.name()));
+    }
+
+    fn restart_pool(&mut self, n: usize, engine: Engine) {
+        let new = Pool::start(&self.gfx.gpu, self.hwnd, n, engine);
         let old = std::mem::replace(&mut self.worker, new);
         // Joining waits for any render in flight; don't block the UI on it.
         std::thread::spawn(move || drop(old));
         self.posted_detail = None;
+        self.failed.clear();
+        self.status = None;
         self.render_log.clear();
-        self.render_log.push_front(format!("switched to {n} worker{}", if n == 1 { "" } else { "s" }));
         if let Some(doc) = &self.doc {
             self.worker.open(doc.path.clone(), doc.id);
         }
