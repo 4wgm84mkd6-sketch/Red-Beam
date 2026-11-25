@@ -20,10 +20,10 @@ use windows_numerics::Matrix3x2;
 mod tools;
 
 pub use tools::{MenuItem, MenuKind};
-use tools::{Prompt, TBtn, Tool, Undo};
+use tools::{EditDrag, Prompt, TBtn, Tool, Undo};
 
 use crate::gfx::{self, Gfx};
-use crate::takeoff::Takeoff;
+use crate::takeoff::{Measure, Takeoff, DEFAULT_LAYER};
 use crate::update::{self, UpdateMsg, WM_APP_UPDATE};
 use crate::view::{FitMode, RectF, View};
 use crate::worker::{Engine, Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
@@ -82,7 +82,10 @@ Ctrl+1\tActual size (100%)\n\
 + / \u{2212}\tZoom in / out\n\
 Arrow keys\tPan\n\
 L / Y / A / C\tTakeoff: length / polyline / area / count\n\
-V  or  Esc\tSelect tool (click a measurement; Del deletes)\n\
+V  or  Esc\tSelect: drag to move, drag handles to reshape\n\
+  \tDrag a label for a leader \u{00B7} right-click for properties\n\
+  \tDouble-click an edge to add a point \u{00B7} Del deletes\n\
+Ctrl+C / V / D\tCopy, paste at cursor, duplicate\n\
 Enter / dbl-click\tFinish polyline, area or count\n\
 Shift (while measuring)\tStraight lines (0\u{00B0}/45\u{00B0}/90\u{00B0})\n\
 Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
@@ -239,6 +242,12 @@ pub struct App {
     pending_pts: Vec<[f32; 2]>,
     /// Active group (Bluebeam "subject") for new measurements.
     group: String,
+    /// Active layer for new measurements.
+    layer: String,
+    /// Move / reshape / label drag in progress.
+    edit: Option<EditDrag>,
+    /// Copied measurement (Ctrl+C / Ctrl+V).
+    clip: Option<Measure>,
     selected: Option<u64>,
     undo: Vec<Undo>,
     prompt: Option<Prompt>,
@@ -425,11 +434,14 @@ impl App {
             last_render: None,
             render_log: VecDeque::new(),
             status: None,
-            takeoff: Takeoff::default(),
+            takeoff: Takeoff::new(),
             takeoff_path: None,
             tool: Tool::Select,
             pending_pts: Vec::new(),
             group: "General".into(),
+            layer: DEFAULT_LAYER.into(),
+            edit: None,
+            clip: None,
             selected: None,
             undo: Vec::new(),
             prompt: None,
@@ -1368,7 +1380,7 @@ impl App {
     fn paint_help(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
-        let (pw, ph) = (640.0 * s, 680.0 * s);
+        let (pw, ph) = (660.0 * s, 760.0 * s);
         let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round(), 0.0, 0.0);
         let panel = RectF::new(panel.l, panel.t, panel.l + pw, panel.t + ph);
         self.fill(&panel, 0x141518, 0.94);
@@ -1679,6 +1691,8 @@ impl App {
             IDC_HAND
         } else if self.over_tool_ui(x, y) {
             IDC_ARROW
+        } else if let Some(c) = self.edit_cursor(x, y) {
+            c
         } else if self.doc.is_some() && self.tool != Tool::Select && self.takeoff_sheet().is_some() {
             IDC_CROSS
         } else if self.doc.is_some() {
@@ -1772,6 +1786,10 @@ impl App {
                             if self.over_tool_ui(fx, fy) || self.tools_canvas_down(fx, fy) {
                                 return Some(0);
                             }
+                            if self.select_mouse_down(fx, fy) {
+                                SetCapture(hwnd);
+                                return Some(0);
+                            }
                             self.down_at = Some((x, y));
                         }
                         // Middle-drag always pans; left-drag pans with the Select tool.
@@ -1782,21 +1800,27 @@ impl App {
                 }
                 WM_LBUTTONDBLCLK => {
                     let (x, y) = (lo(lp), hi(lp));
-                    if !self.tools_dblclick() && !self.over_tool_ui(x as f32, y as f32) && !self.in_bar(y as f32) {
+                    if !self.tools_dblclick(x as f32, y as f32) && !self.over_tool_ui(x as f32, y as f32) && !self.in_bar(y as f32) {
                         // Treat as a normal press for the Select tool / toolbar.
                         return self.handle(hwnd, WM_LBUTTONDOWN, wp, lp);
                     }
                     Some(0)
                 }
                 WM_RBUTTONUP => {
+                    let (x, y) = (lo(lp) as f32, hi(lp) as f32);
                     if !self.pending_pts.is_empty() {
                         self.finish_measure();
+                    } else if !self.in_bar(y) && !self.over_tool_ui(x, y) {
+                        self.context_menu_at(x, y);
                     }
                     Some(0)
                 }
                 WM_MOUSEMOVE => {
                     let (x, y) = (lo(lp), hi(lp));
                     self.mouse = (x, y);
+                    if self.edit_drag_move(x as f32, y as f32) {
+                        return Some(0);
+                    }
                     if let Some((lx, ly)) = self.drag {
                         self.drag = Some((x, y));
                         self.pan_by((x - lx) as f32, (y - ly) as f32);
@@ -1815,6 +1839,10 @@ impl App {
                     Some(0)
                 }
                 WM_LBUTTONUP | WM_MBUTTONUP => {
+                    if msg == WM_LBUTTONUP && self.edit_drag_end() {
+                        let _ = ReleaseCapture();
+                        return Some(0);
+                    }
                     if self.drag.take().is_some() {
                         let _ = ReleaseCapture();
                     }
@@ -1829,6 +1857,7 @@ impl App {
                 }
                 WM_CAPTURECHANGED => {
                     self.drag = None;
+                    self.edit_drag_end();
                     Some(0)
                 }
                 WM_KEYDOWN => self.on_key(wp.0 as u16).then_some(0),

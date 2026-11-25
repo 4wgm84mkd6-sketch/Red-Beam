@@ -67,6 +67,53 @@ pub struct Group {
     pub color: u32,
 }
 
+/// Arrowheads / caps for line ends and label leaders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EndStyle {
+    #[default]
+    None,
+    ClosedArrow,
+    OpenArrow,
+    /// Architectural slash.
+    Tick,
+    Dot,
+    Square,
+    Circle,
+}
+
+impl EndStyle {
+    pub const ALL: [EndStyle; 7] = [
+        EndStyle::None,
+        EndStyle::ClosedArrow,
+        EndStyle::OpenArrow,
+        EndStyle::Tick,
+        EndStyle::Dot,
+        EndStyle::Square,
+        EndStyle::Circle,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            EndStyle::None => "None",
+            EndStyle::ClosedArrow => "Closed arrow",
+            EndStyle::OpenArrow => "Open arrow",
+            EndStyle::Tick => "Architectural tick",
+            EndStyle::Dot => "Dot",
+            EndStyle::Square => "Square",
+            EndStyle::Circle => "Circle",
+        }
+    }
+}
+
+pub const DEFAULT_LAYER: &str = "Default";
+
+fn default_layer() -> String {
+    DEFAULT_LAYER.to_string()
+}
+
+fn default_ends() -> EndStyle {
+    EndStyle::ClosedArrow
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Measure {
     pub id: u64,
@@ -76,6 +123,24 @@ pub struct Measure {
     /// Page DIPs.
     pub points: Vec<[f32; 2]>,
     pub group: String,
+    #[serde(default = "default_layer")]
+    pub layer: String,
+    /// Caps on both ends of length / polyline measurements.
+    #[serde(default)]
+    pub ends: EndStyle,
+    /// Label moved away from its default spot (page DIPs, relative to it).
+    #[serde(default)]
+    pub label_offset: Option<[f32; 2]>,
+    /// Arrowhead where the leader meets the measurement.
+    #[serde(default)]
+    pub leader: EndStyle,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Layer {
+    pub name: String,
+    pub visible: bool,
+    pub locked: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -87,6 +152,14 @@ pub struct Takeoff {
     pub groups: Vec<Group>,
     pub items: Vec<Measure>,
     pub next_id: u64,
+    #[serde(default)]
+    pub layers: Vec<Layer>,
+    /// Style for new length / polyline measurements (last one chosen).
+    #[serde(default = "default_ends")]
+    pub default_ends: EndStyle,
+    /// Leader style for labels moved off their measurement.
+    #[serde(default = "default_ends")]
+    pub default_leader: EndStyle,
 }
 
 /// Distinct, print-friendly colours handed to new groups in turn.
@@ -251,8 +324,17 @@ impl Measure {
         }
     }
 
-    /// Where the label goes (page DIPs).
+    /// Where the label is drawn (page DIPs), honouring a moved label.
     pub fn label_pos(&self) -> [f32; 2] {
+        let a = self.anchor();
+        match self.label_offset {
+            Some(o) => [a[0] + o[0], a[1] + o[1]],
+            None => a,
+        }
+    }
+
+    /// Default label spot, and where a leader points to (page DIPs).
+    pub fn anchor(&self) -> [f32; 2] {
         match self.kind {
             Kind::Area => centroid(&self.points),
             Kind::Count => self.points.first().copied().unwrap_or([0.0, 0.0]),
@@ -396,6 +478,15 @@ pub fn parse_len(input: &str) -> Option<f64> {
 // -------------------------------------------------------------- persistence
 
 impl Takeoff {
+    pub fn new() -> Takeoff {
+        Takeoff {
+            version: 2,
+            default_ends: default_ends(),
+            default_leader: default_ends(),
+            ..Default::default()
+        }
+    }
+
     pub fn scale(&self, sheet: u32) -> Option<&Scale> {
         self.scales.get(&sheet)
     }
@@ -415,12 +506,58 @@ impl Takeoff {
         name.to_string()
     }
 
-    pub fn add(&mut self, sheet: u32, kind: Kind, points: Vec<[f32; 2]>, group: &str) -> u64 {
+    /// Add a layer if it doesn't exist; returns its name.
+    pub fn ensure_layer(&mut self, name: &str) -> String {
+        let name = name.trim();
+        let name = if name.is_empty() { DEFAULT_LAYER } else { name };
+        if !self.layers.iter().any(|l| l.name == name) {
+            self.layers.push(Layer { name: name.to_string(), visible: true, locked: false });
+        }
+        name.to_string()
+    }
+
+    pub fn layer_visible(&self, name: &str) -> bool {
+        self.layers.iter().find(|l| l.name == name).is_none_or(|l| l.visible)
+    }
+
+    pub fn layer_locked(&self, name: &str) -> bool {
+        self.layers.iter().find(|l| l.name == name).is_some_and(|l| l.locked)
+    }
+
+    /// Items that count toward quantities (on visible layers).
+    pub fn visible_items(&self) -> impl Iterator<Item = &Measure> {
+        self.items.iter().filter(|m| self.layer_visible(&m.layer))
+    }
+
+    pub fn add(&mut self, sheet: u32, kind: Kind, points: Vec<[f32; 2]>, group: &str, layer: &str) -> u64 {
         let group = self.ensure_group(group);
+        let layer = self.ensure_layer(layer);
         self.next_id += 1;
         let id = self.next_id;
-        self.items.push(Measure { id, sheet, kind, points, group });
+        let ends = if matches!(kind, Kind::Length | Kind::Polyline) { self.default_ends } else { EndStyle::None };
+        let leader = self.default_leader;
+        self.items.push(Measure { id, sheet, kind, points, group, layer, ends, label_offset: None, leader });
         id
+    }
+
+    /// Copy of an existing measurement with a new id.
+    pub fn duplicate(&mut self, m: &Measure, sheet: u32, offset: [f32; 2]) -> u64 {
+        self.next_id += 1;
+        let mut c = m.clone();
+        c.id = self.next_id;
+        c.sheet = sheet;
+        for p in &mut c.points {
+            p[0] += offset[0];
+            p[1] += offset[1];
+        }
+        self.ensure_group(&c.group);
+        self.ensure_layer(&c.layer);
+        self.items.push(c);
+        self.next_id
+    }
+
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut Measure> {
+        self.items.iter_mut().find(|m| m.id == id)
     }
 
     /// Where a drawing's takeoff is stored: next to the PDF.
@@ -475,15 +612,18 @@ impl Takeoff {
                 s.to_string()
             }
         };
-        let mut out = String::from("Group,Sheet,Type,Quantity,Unit,Perimeter,Perimeter unit,Display,Scale\n");
+        let mut out = String::from("Group,Layer,Sheet,Type,Quantity,Unit,Perimeter,Perimeter unit,Display,Scale,Counted\n");
         let mut items: Vec<&Measure> = self.items.iter().collect();
         items.sort_by(|a, b| (&a.group, a.sheet, a.id).cmp(&(&b.group, b.sheet, b.id)));
         // (length in, area sq in, perimeter in, count)
         let mut totals: BTreeMap<&str, (f64, f64, f64, usize)> = BTreeMap::new();
+        let mut hidden = (0f64, 0f64, 0f64, 0usize);
         for m in &items {
             let scale = self.scale(m.sheet);
             let q = m.qty(scale);
-            let t = totals.entry(m.group.as_str()).or_default();
+            let counted = self.layer_visible(&m.layer);
+            // Items on hidden layers are listed but left out of the totals.
+            let t = if counted { totals.entry(m.group.as_str()).or_default() } else { &mut hidden };
             let (qty, unit, per, per_unit) = match q {
                 Qty::Length(l) => {
                     t.0 += l;
@@ -501,8 +641,9 @@ impl Takeoff {
                 Qty::Unscaled => (String::new(), "no scale", String::new(), ""),
             };
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{}\n",
                 esc(&m.group),
+                esc(&m.layer),
                 esc(&sheet_names(m.sheet)),
                 m.kind.name(),
                 qty,
@@ -510,10 +651,11 @@ impl Takeoff {
                 per,
                 per_unit,
                 esc(&fmt_qty(q, units)),
-                esc(&scale.map(|s| s.label.clone()).unwrap_or_default())
+                esc(&scale.map(|s| s.label.clone()).unwrap_or_default()),
+                if counted { "yes" } else { "no (hidden layer)" }
             ));
         }
-        out.push_str("\nTOTALS\nGroup,Length,Length unit,Area,Area unit,Perimeter,Perimeter unit,Count\n");
+        out.push_str("\nTOTALS (visible layers)\nGroup,Length,Length unit,Area,Area unit,Perimeter,Perimeter unit,Count\n");
         for (g, (l, a, p, c)) in totals {
             out.push_str(&format!("{},{},{len_unit},{},{area_unit},{},{len_unit},{c}\n", esc(g), len_num(l), area_num(a), len_num(p)));
         }
@@ -569,16 +711,21 @@ mod tests {
     fn geometry_and_scale() {
         // 1/8" = 1'-0": one paper inch (96 DIP) is 8 ft (96 in).
         let s = Scale::from_ratio("1/8\" = 1'-0\"", 96.0);
-        let m = Measure { id: 1, sheet: 0, kind: Kind::Length, points: vec![[0.0, 0.0], [96.0, 0.0]], group: "G".into() };
+        let mk = |kind, points: Vec<[f32; 2]>| Measure {
+            id: 1,
+            sheet: 0,
+            kind,
+            points,
+            group: "G".into(),
+            layer: DEFAULT_LAYER.into(),
+            ends: EndStyle::None,
+            label_offset: None,
+            leader: EndStyle::None,
+        };
+        let m = mk(Kind::Length, vec![[0.0, 0.0], [96.0, 0.0]]);
         assert_eq!(m.qty(Some(&s)), Qty::Length(96.0));
         // A 2" x 1" paper rectangle at 1/8" scale is 16' x 8' = 128 SF, perimeter 48'.
-        let r = Measure {
-            id: 2,
-            sheet: 0,
-            kind: Kind::Area,
-            points: vec![[0.0, 0.0], [192.0, 0.0], [192.0, 96.0], [0.0, 96.0]],
-            group: "G".into(),
-        };
+        let mut r = mk(Kind::Area, vec![[0.0, 0.0], [192.0, 0.0], [192.0, 96.0], [0.0, 96.0]]);
         match r.qty(Some(&s)) {
             Qty::Area { area, perimeter } => {
                 assert!((area / 144.0 - 128.0).abs() < 1e-9);
@@ -587,6 +734,10 @@ mod tests {
             q => panic!("{q:?}"),
         }
         assert_eq!(centroid(&r.points), [96.0, 48.0]);
+        assert_eq!(r.label_pos(), [96.0, 48.0]);
+        r.label_offset = Some([10.0, -5.0]);
+        assert_eq!(r.label_pos(), [106.0, 43.0]);
+        assert_eq!(r.anchor(), [96.0, 48.0]);
         assert!(point_in_polygon([10.0, 10.0], &r.points));
         assert!(!point_in_polygon([200.0, 10.0], &r.points));
         // Calibration: 200 DIP measured as 25 ft.
@@ -600,18 +751,36 @@ mod tests {
 
     #[test]
     fn csv_and_roundtrip() {
-        let mut t = Takeoff::default();
+        let mut t = Takeoff::new();
         t.scales.insert(0, Scale::from_ratio("1/8\" = 1'-0\"", 96.0));
-        t.add(0, Kind::Length, vec![[0.0, 0.0], [96.0, 0.0]], "Drywall, Type A");
-        t.add(0, Kind::Area, vec![[0.0, 0.0], [192.0, 0.0], [192.0, 96.0], [0.0, 96.0]], "Flooring");
-        t.add(1, Kind::Count, vec![[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]], "Flooring");
-        t.add(1, Kind::Length, vec![[0.0, 0.0], [10.0, 0.0]], "Flooring");
+        let a = t.add(0, Kind::Length, vec![[0.0, 0.0], [96.0, 0.0]], "Drywall, Type A", "Base");
+        t.add(0, Kind::Area, vec![[0.0, 0.0], [192.0, 0.0], [192.0, 96.0], [0.0, 96.0]], "Flooring", "Base");
+        t.add(1, Kind::Count, vec![[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]], "Flooring", "Base");
+        t.add(1, Kind::Length, vec![[0.0, 0.0], [10.0, 0.0]], "Flooring", "Base");
+        // An alternate on a hidden layer: listed, not totalled.
+        t.add(0, Kind::Area, vec![[0.0, 0.0], [96.0, 0.0], [96.0, 96.0]], "Flooring", "Alt 1");
+        t.layers.iter_mut().find(|l| l.name == "Alt 1").unwrap().visible = false;
+        assert_eq!(t.items[0].ends, EndStyle::ClosedArrow);
+        assert_eq!(t.items[1].ends, EndStyle::None);
         let csv = t.to_csv(&|i| format!("Sheet {}", i + 1));
-        assert!(csv.contains("\"Drywall, Type A\",Sheet 1,Length,8.00,ft"), "{csv}");
-        assert!(csv.contains("Flooring,Sheet 1,Area,128.00,sf,48.00,ft"), "{csv}");
-        assert!(csv.contains("Flooring,Sheet 2,Count,3,ea"), "{csv}");
-        assert!(csv.contains("Flooring,Sheet 2,Length,,no scale"), "{csv}");
+        assert!(csv.contains("\"Drywall, Type A\",Base,Sheet 1,Length,8.00,ft"), "{csv}");
+        assert!(csv.contains("Flooring,Base,Sheet 1,Area,128.00,sf,48.00,ft"), "{csv}");
+        assert!(csv.contains("Flooring,Base,Sheet 2,Count,3,ea"), "{csv}");
+        assert!(csv.contains("Flooring,Base,Sheet 2,Length,,no scale"), "{csv}");
+        assert!(csv.contains("Flooring,Alt 1,Sheet 1,Area,32.00,sf"), "{csv}");
+        assert!(csv.contains("no (hidden layer)"), "{csv}");
         assert!(csv.contains("Flooring,0.00,ft,128.00,sf,48.00,ft,3"), "{csv}");
+        assert_eq!(t.visible_items().count(), 4);
+        let src = t.items.iter().find(|m| m.id == a).unwrap().clone();
+        let d = t.duplicate(&src, 2, [5.0, 5.0]);
+        let dup = t.items.iter().find(|m| m.id == d).unwrap();
+        assert_eq!((dup.sheet, dup.points[0]), (2, [5.0, 5.0]));
+        // Files saved before layers/leaders existed still load.
+        let old = r#"{"version":1,"units":"FeetInches","scales":{},"groups":[],"next_id":1,
+            "items":[{"id":1,"sheet":0,"kind":"Length","points":[[0,0],[1,1]],"group":"G"}]}"#;
+        let o: Takeoff = serde_json::from_str(old).unwrap();
+        assert_eq!(o.items[0].layer, DEFAULT_LAYER);
+        assert_eq!(o.default_ends, EndStyle::ClosedArrow);
         let dir = std::env::temp_dir().join(format!("rb-test-{}", std::process::id()));
         let path = Takeoff::sidecar_path(&dir.join("A-101 Plans.pdf"));
         assert!(path.ends_with("A-101 Plans.redbeam.json"));
@@ -619,6 +788,7 @@ mod tests {
         assert_eq!(Takeoff::load(&path).unwrap(), t);
         let _ = std::fs::remove_dir_all(dir);
         assert_eq!(t.groups.len(), 2);
+        assert_eq!(t.layers.len(), 2);
         assert_ne!(t.group_color("Flooring"), t.group_color("Drywall, Type A"));
     }
 }

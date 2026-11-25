@@ -49,10 +49,19 @@ The takeoff toolbar sits at the top-left of the drawing.
    * **Area** (`A`): click the corners, then finish. Shows the area in SF and its perimeter.
    * **Count** (`C`): click each item, then finish.
    * Hold **Shift** for straight 0°/45°/90° lines. **Ctrl+Z** undoes the last point or measurement. **Esc** cancels.
-4. **Select** (`V`): click a measurement to highlight it, then press **Del** to delete it.
-5. **Quantities** (`Q`): totals per group (length, area, perimeter, count) across all sheets, with warnings for sheets that have no scale.
-6. **Export CSV:** one row per measurement plus group totals. It opens directly in Excel.
-7. **Units ▾:** feet-inches (default), decimal feet, or metric.
+4. **Select** (`V`) to edit:
+   * **Move:** drag a measurement.
+   * **Reshape:** drag its square handles. Hold Shift to keep a point square to its neighbour.
+   * **Add a point:** double-click an edge. A length with an added point becomes a polyline.
+   * **Remove a point or count marker:** right-click it.
+   * **Leaders:** drag a label off its measurement and a leader line connects it back.
+   * **Properties:** right-click a measurement to set its group, layer, line ends and leader style, put the label back, duplicate it or delete it.
+   * **Copy and paste:** **Ctrl+C**, **Ctrl+V** (pastes under the cursor, on any sheet) and **Ctrl+D** (duplicate). **Ctrl+Z** undoes edits.
+   * **Line ends and leaders:** none, closed arrow, open arrow, architectural tick, dot, square or circle. The style chosen last becomes the default for new measurements.
+5. **Layer ▾:** each measurement sits on a layer, such as *Base bid*, *Alt 1* or *Existing*. Choose which layer you're drawing on, and show/hide, lock, rename, delete or create layers. **Hidden layers are left out of the quantities and CSV totals**, so toggling an alternate shows its effect on the totals. Locked layers can't be edited by accident.
+6. **Quantities** (`Q`): totals per group (length, area, perimeter, count) across all sheets, with warnings for sheets that have no scale.
+7. **Export CSV:** one row per measurement, with group and layer, plus group totals for visible layers. It opens directly in Excel.
+8. **Units ▾:** feet-inches (default), decimal feet, or metric.
 
 Takeoffs save automatically to `<drawing name>.redbeam.json` next to the PDF. If that folder is read-only, they go to `%LOCALAPPDATA%\Red-Beam\takeoffs`. **The PDF itself is never modified.** Quantities are computed from each sheet's current scale, so correcting a calibration updates every measurement on that sheet.
 

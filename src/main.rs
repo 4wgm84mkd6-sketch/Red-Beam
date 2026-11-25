@@ -92,22 +92,37 @@ fn repaint(hwnd: HWND) {
 }
 
 /// Work that must run outside the `App` borrow (modal UI, device rebuild).
+/// Fill a native menu (recursively for submenus).
+unsafe fn build_menu(menu: HMENU, items: &[app::MenuItem]) {
+    for it in items {
+        let _ = if it.separator {
+            AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        } else if !it.children.is_empty() {
+            match CreatePopupMenu() {
+                Ok(sub) => {
+                    build_menu(sub, &it.children);
+                    let flags = if it.checked { MF_POPUP | MF_STRING | MF_CHECKED } else { MF_POPUP | MF_STRING };
+                    AppendMenuW(menu, flags, sub.0 as usize, &HSTRING::from(it.label.as_str()))
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            let flags = if it.checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+            AppendMenuW(menu, flags, it.id, &HSTRING::from(it.label.as_str()))
+        };
+    }
+}
+
 /// Native popup menu at the cursor; returns the chosen command id (0 = none).
 fn popup_menu(hwnd: HWND, items: &[app::MenuItem]) -> usize {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return 0 };
-        for it in items {
-            let _ = if it.separator {
-                AppendMenuW(menu, MF_SEPARATOR, 0, None)
-            } else {
-                let flags = if it.checked { MF_STRING | MF_CHECKED } else { MF_STRING };
-                AppendMenuW(menu, flags, it.id, &HSTRING::from(it.label.as_str()))
-            };
-        }
+        build_menu(menu, items);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, None, hwnd, None);
+        // Destroys submenus too.
         let _ = DestroyMenu(menu);
         cmd.0 as usize
     }
