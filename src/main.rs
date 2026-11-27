@@ -10,6 +10,7 @@ mod gfx;
 mod markup;
 mod pdfium;
 mod settings;
+mod sheets;
 mod snap;
 mod takeoff;
 mod update;

@@ -138,6 +138,8 @@ pub enum PromptFor {
     Slope { id: u64 },
     WallHeight { id: u64 },
     MarkupText { id: u64 },
+    Find,
+    GoTo,
 }
 
 pub struct Prompt {
@@ -1758,6 +1760,8 @@ impl App {
                 }
             }
             PromptFor::MarkupText { id } => self.set_markup_text(id, p.text.clone()),
+            PromptFor::Find => self.run_find(p.text.clone()),
+            PromptFor::GoTo => self.goto_sheet(p.text.clone()),
             PromptFor::RenameLayer(i) => {
                 let new = p.text.trim().to_string();
                 let taken = self.takeoff.layers.iter().enumerate().any(|(j, l)| j != i && l.name == new);

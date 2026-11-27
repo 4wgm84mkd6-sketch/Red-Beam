@@ -173,6 +173,21 @@ pub struct Lib {
     new_text_obj: unsafe extern "system" fn(Doc, *const c_char, f32) -> Obj,
     text_set_text: unsafe extern "system" fn(Obj, *const u16) -> c_int,
     save_as_copy: unsafe extern "system" fn(Doc, *mut FileWrite, u32) -> c_int,
+    // Text and bookmarks
+    text_load_page: unsafe extern "system" fn(Page) -> *mut c_void,
+    text_close_page: unsafe extern "system" fn(*mut c_void),
+    text_count_chars: unsafe extern "system" fn(*mut c_void) -> c_int,
+    text_get_unicode: unsafe extern "system" fn(*mut c_void, c_int) -> u32,
+    text_get_char_box: unsafe extern "system" fn(*mut c_void, c_int, *mut f64, *mut f64, *mut f64, *mut f64) -> c_int,
+    text_get_font_size: unsafe extern "system" fn(*mut c_void, c_int) -> f64,
+    bm_first_child: unsafe extern "system" fn(Doc, *mut c_void) -> *mut c_void,
+    bm_next_sibling: unsafe extern "system" fn(Doc, *mut c_void) -> *mut c_void,
+    bm_get_title: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> u32,
+    bm_get_dest: unsafe extern "system" fn(Doc, *mut c_void) -> *mut c_void,
+    bm_get_action: unsafe extern "system" fn(*mut c_void) -> *mut c_void,
+    action_get_dest: unsafe extern "system" fn(Doc, *mut c_void) -> *mut c_void,
+    dest_page_index: unsafe extern "system" fn(Doc, *mut c_void) -> c_int,
+    get_page_label: unsafe extern "system" fn(Doc, c_int, *mut c_void, u32) -> u32,
 }
 unsafe impl Send for Lib {}
 unsafe impl Sync for Lib {}
@@ -272,6 +287,20 @@ fn load_lib() -> Result<Lib, String> {
             new_text_obj: sym!("FPDFPageObj_NewTextObj"),
             text_set_text: sym!("FPDFText_SetText"),
             save_as_copy: sym!("FPDF_SaveAsCopy"),
+            text_load_page: sym!("FPDFText_LoadPage"),
+            text_close_page: sym!("FPDFText_ClosePage"),
+            text_count_chars: sym!("FPDFText_CountChars"),
+            text_get_unicode: sym!("FPDFText_GetUnicode"),
+            text_get_char_box: sym!("FPDFText_GetCharBox"),
+            text_get_font_size: sym!("FPDFText_GetFontSize"),
+            bm_first_child: sym!("FPDFBookmark_GetFirstChild"),
+            bm_next_sibling: sym!("FPDFBookmark_GetNextSibling"),
+            bm_get_title: sym!("FPDFBookmark_GetTitle"),
+            bm_get_dest: sym!("FPDFBookmark_GetDest"),
+            bm_get_action: sym!("FPDFBookmark_GetAction"),
+            action_get_dest: sym!("FPDFAction_GetDest"),
+            dest_page_index: sym!("FPDFDest_GetDestPageIndex"),
+            get_page_label: sym!("FPDF_GetPageLabel"),
         };
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (lib.init_library)();
@@ -584,7 +613,125 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<
     Ok(written)
 }
 
+/// UTF-16LE bytes (with trailing NUL) from a PDFium "get string" call.
+fn utf16_bytes_to_string(buf: &[u8]) -> String {
+    let u: Vec<u16> = buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&u).trim_end_matches('\0').trim().to_string()
+}
+
 impl Document {
+    /// A label per page: the most specific bookmark pointing at it (Revit
+    /// exports bookmark every sheet, e.g. "A101 - FLOOR PLAN"), else the
+    /// PDF page label, else "".
+    pub fn labels(&self, pages: usize) -> Vec<String> {
+        let lib = self.lib;
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(usize, String)> = vec![(0, String::new()); pages];
+        unsafe {
+            // Depth-first walk with an explicit stack (and a size guard).
+            let mut stack: Vec<(*mut c_void, usize)> = vec![((lib.bm_first_child)(self.doc, std::ptr::null_mut()), 1)];
+            let mut seen = 0;
+            while let Some((bm, depth)) = stack.pop() {
+                if bm.is_null() || seen > 20_000 {
+                    continue;
+                }
+                seen += 1;
+                stack.push(((lib.bm_next_sibling)(self.doc, bm), depth));
+                stack.push(((lib.bm_first_child)(self.doc, bm), depth + 1));
+                let n = (lib.bm_get_title)(bm, std::ptr::null_mut(), 0);
+                if n < 2 {
+                    continue;
+                }
+                let mut buf = vec![0u8; n as usize];
+                (lib.bm_get_title)(bm, buf.as_mut_ptr() as *mut c_void, n);
+                let title = utf16_bytes_to_string(&buf);
+                let mut dest = (lib.bm_get_dest)(self.doc, bm);
+                if dest.is_null() {
+                    let act = (lib.bm_get_action)(bm);
+                    if !act.is_null() {
+                        dest = (lib.action_get_dest)(self.doc, act);
+                    }
+                }
+                if dest.is_null() {
+                    continue;
+                }
+                let p = (lib.dest_page_index)(self.doc, dest);
+                if p >= 0 && (p as usize) < pages && depth > out[p as usize].0 {
+                    out[p as usize] = (depth, title);
+                }
+            }
+            for (i, slot) in out.iter_mut().enumerate() {
+                if slot.1.is_empty() {
+                    let n = (lib.get_page_label)(self.doc, i as c_int, std::ptr::null_mut(), 0);
+                    if n >= 2 {
+                        let mut buf = vec![0u8; n as usize];
+                        (lib.get_page_label)(self.doc, i as c_int, buf.as_mut_ptr() as *mut c_void, n);
+                        slot.1 = utf16_bytes_to_string(&buf);
+                    }
+                }
+            }
+        }
+        out.into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// Words on a page with boxes in page DIPs. `Ok(None)` if cancelled.
+    pub fn words(&mut self, page: u32, page_size: (f32, f32), cancel: &AtomicBool) -> Result<Option<Vec<crate::sheets::Word>>, String> {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let p = self.page(page)?;
+            let lib = self.lib;
+            let to_dip = page_to_dip(lib, p, page_size);
+            let tp = (lib.text_load_page)(p);
+            if tp.is_null() {
+                return Ok(Some(Vec::new()));
+            }
+            let n = (lib.text_count_chars)(tp).max(0);
+            let mut words = Vec::new();
+            let mut cur = String::new();
+            let mut bx = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            let mut size = 0f32;
+            let mut last_right = f32::MIN;
+            let flush = |cur: &mut String, bx: &mut [f32; 4], size: &mut f32, words: &mut Vec<crate::sheets::Word>| {
+                if !cur.trim().is_empty() {
+                    words.push(crate::sheets::Word { text: std::mem::take(cur), rect: *bx, size: *size });
+                }
+                cur.clear();
+                *bx = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+                *size = 0.0;
+            };
+            for i in 0..n {
+                if i % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+                    (lib.text_close_page)(tp);
+                    return Ok(None);
+                }
+                let c = char::from_u32((lib.text_get_unicode)(tp, i)).unwrap_or(' ');
+                // Words break at spaces, line ends and "/" (detail callouts
+                // like 5/A-501), and at big gaps between characters.
+                if c.is_whitespace() || c == '/' || c == '\0' {
+                    flush(&mut cur, &mut bx, &mut size, &mut words);
+                    continue;
+                }
+                let (mut l, mut r, mut b, mut t) = (0f64, 0f64, 0f64, 0f64);
+                if (lib.text_get_char_box)(tp, i, &mut l, &mut r, &mut b, &mut t) == 0 {
+                    continue;
+                }
+                let pts = [to_dip.apply(l as f32, b as f32), to_dip.apply(r as f32, t as f32)];
+                let rect = [pts[0][0].min(pts[1][0]), pts[0][1].min(pts[1][1]), pts[0][0].max(pts[1][0]), pts[0][1].max(pts[1][1])];
+                let fs = (lib.text_get_font_size)(tp, i) as f32 * PT_TO_DIP;
+                if !cur.is_empty() && (rect[0] - last_right > fs * 0.8 || rect[1] > bx[3] || rect[3] < bx[1]) {
+                    flush(&mut cur, &mut bx, &mut size, &mut words);
+                }
+                cur.push(c);
+                bx = [bx[0].min(rect[0]), bx[1].min(rect[1]), bx[2].max(rect[2]), bx[3].max(rect[3])];
+                size = size.max(fs);
+                last_right = rect[2];
+            }
+            flush(&mut cur, &mut bx, &mut size, &mut words);
+            (lib.text_close_page)(tp);
+            Ok(Some(words))
+        }
+    }
+
     /// All straight segments of the page's line work in page DIPs (curves
     /// contribute their chords), for snapping. `Ok(None)` if cancelled.
     pub fn line_work(&mut self, page: u32, page_size: (f32, f32), cancel: &AtomicBool) -> Result<Option<Vec<[[f32; 2]; 2]>>, String> {

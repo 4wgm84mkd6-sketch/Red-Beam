@@ -17,6 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
 
+mod find;
 mod markups;
 mod panel;
 mod tools;
@@ -98,7 +99,9 @@ C T K A L R E H\tMarkup: cloud, text, callout, arrow, line, rect, ellipse, highl
 Enter / dbl-click\tFinish polyline, area or count\n\
 Shift (while measuring)\tStraight lines (0\u{00B0}/45\u{00B0}/90\u{00B0})\n\
 Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
-Ctrl+B\tSide panel: pages, recent files, settings\n\
+Ctrl+B\tSide panel: pages, files, markups, find, settings\n\
+Ctrl+F  /  F3\tFind text in the set / next result (Shift+F3 previous)\n\
+Ctrl+G\tGo to sheet by number or name\n\
 Ctrl+K\tCompare with an earlier revision\n\
 Tab\tCompare: overlay \u{2192} old \u{2192} new\n\
 ,  /  .\tCompare: previous / next detected change\n\
@@ -184,6 +187,8 @@ struct Doc {
     name: String,
     pages: Vec<(f32, f32)>,
     current: u32,
+    /// Sheet number / title per sheet (bookmarks, labels, title block).
+    names: Vec<crate::sheets::SheetName>,
 }
 
 struct Fonts {
@@ -235,9 +240,13 @@ pub struct App {
     bases: HashMap<(u64, u32), Cached>,
     /// Pages-panel thumbnails keyed by (document, sheet).
     thumbs: HashMap<(u64, u32), Cached>,
+    /// Words per (document, sheet) for search, names and links.
+    texts: HashMap<(u64, u32), Vec<crate::sheets::Word>>,
+    text_failed: HashSet<(u64, u32)>,
+    find: Option<find::FindState>,
     settings: Settings,
-    /// Scroll offset per panel tab (Pages, Files, Markups, Settings).
-    panel_scroll: [f32; 4],
+    /// Scroll offset per panel tab (Pages, Files, Markups, Find, Settings).
+    panel_scroll: [f32; 5],
     /// Sharp renders of recently seen views (any sheet near the current one),
     /// least recently added first.
     details: Vec<Cached>,
@@ -487,7 +496,10 @@ impl App {
             blend,
             bases: HashMap::new(),
             thumbs: HashMap::new(),
-            panel_scroll: [0.0; 4],
+            texts: HashMap::new(),
+            text_failed: HashSet::new(),
+            find: None,
+            panel_scroll: [0.0; 5],
             details: Vec::new(),
             detail_budget,
             posted: Vec::new(),
@@ -749,6 +761,10 @@ impl App {
         if let Some(id) = id {
             self.bases.retain(|k, _| k.0 != id);
             self.thumbs.retain(|k, _| k.0 != id);
+            self.texts.retain(|k, _| k.0 != id);
+            if self.doc.as_ref().is_some_and(|d| d.id == id) {
+                self.find = None;
+            }
             self.details.retain(|d| d.job.doc_id != id);
         }
     }
@@ -1107,6 +1123,11 @@ impl App {
         }
         // 5. Thumbnails for the visible part of the Pages panel.
         jobs.extend(self.thumb_jobs());
+        // 6. Text of every sheet (names, search, links): this sheet first.
+        let text = self.text_jobs();
+        let (now, later): (Vec<Job>, Vec<Job>) = text.into_iter().partition(|j| !j.prefetch);
+        jobs.splice(0..0, now);
+        jobs.extend(later);
         jobs.retain(|j| !self.failed.contains(&j.key()));
         self.worker.set_jobs(jobs);
     }
@@ -1129,11 +1150,13 @@ impl App {
     fn on_results(&mut self) {
         while let Ok(msg) = self.worker.rx.try_recv() {
             match msg {
-                Msg::Opened { doc_id, path, pages } => {
+                Msg::Opened { doc_id, path, pages, labels } => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let names: Vec<crate::sheets::SheetName> =
+                        (0..pages.len()).map(|i| labels.get(i).map(|l| crate::sheets::parse_label(l)).unwrap_or_default()).collect();
                     if let Some(c) = self.cmp.as_mut().filter(|c| c.opening.as_ref().map(|o| o.0) == Some(doc_id)) {
                         c.opening = None;
-                        c.doc = Some(Doc { id: doc_id, path, name, pages, current: 0 });
+                        c.doc = Some(Doc { id: doc_id, path, name, pages, current: 0, names });
                         self.sync_docs();
                         self.update_jobs(true);
                         self.invalidate();
@@ -1157,6 +1180,7 @@ impl App {
                         path,
                         name: name.clone(),
                         pages,
+                        names,
                         current: restore.as_ref().map(|r| r.page.min(n.saturating_sub(1))).unwrap_or(0),
                     });
                     unsafe {
@@ -1208,6 +1232,7 @@ impl App {
                         (JobKind::Geometry, _) => "line work",
                         (JobKind::Thumb, _) => "thumbnail",
                         (JobKind::Diff, _) => "changes",
+                        (JobKind::Text, _) => "text",
                         (JobKind::Detail, false) => "sharp view",
                         (JobKind::Detail, true) => "sharp view (next sheet)",
                         (JobKind::Base, _) => "whole sheet",
@@ -1248,7 +1273,7 @@ impl App {
                             self.bases.insert((job.doc_id, job.page), Cached { job, bmp });
                         }
                         JobKind::Detail => self.insert_detail(Cached { job, bmp }),
-                        JobKind::Geometry | JobKind::Diff => {}
+                        JobKind::Geometry | JobKind::Diff | JobKind::Text => {}
                         JobKind::Thumb => {
                             self.thumbs.insert((job.doc_id, job.page), Cached { job, bmp });
                         }
@@ -1267,10 +1292,20 @@ impl App {
                             JobKind::Geometry => "line work",
                             JobKind::Thumb => "thumbnail",
                             JobKind::Diff => "change detection",
+                            JobKind::Text => "text",
                         }
                     ));
                     self.render_log.truncate(8);
                     self.invalidate();
+                }
+                Msg::Text { job, words } => {
+                    self.worker.ack(&job.key());
+                    match words {
+                        Ok(w) => self.on_text(job.doc_id, job.page, w),
+                        Err(_) => {
+                            self.text_failed.insert((job.doc_id, job.page));
+                        }
+                    }
                 }
                 Msg::Changes { job, changes, ms } => {
                     self.worker.ack(&job.key());
@@ -1623,11 +1658,18 @@ impl App {
         };
         if let Some(doc) = &self.doc {
             let page_txt = if self.goto_buf.is_empty() {
-                format!("Sheet {} / {}", doc.current + 1, doc.pages.len())
+{
+                    let label = self.sheet_label(doc.current);
+                    if label.is_empty() {
+                        format!("Sheet {} / {}", doc.current + 1, doc.pages.len())
+                    } else {
+                        format!("{} / {}  {label}", doc.current + 1, doc.pages.len())
+                    }
+                }
             } else {
                 format!("Go to sheet: {}\u{258F}", self.goto_buf)
             };
-            seg(&page_txt, 150.0 * s, TEXT);
+            seg(&page_txt, 260.0 * s, TEXT);
             seg(&format!("{:.0}%", self.zoom_percent()), 70.0 * s, TEXT);
             let (pw, ph) = doc.pages[doc.current as usize];
             seg(&format!("{:.0}\u{2033} \u{00D7} {:.0}\u{2033}", pw / 96.0, ph / 96.0), 90.0 * s, TEXT_DIM);
@@ -1747,6 +1789,8 @@ impl App {
                 (None, _, _) => self.paint_empty(),
             }
             self.paint_changes();
+            self.paint_find_hits();
+            self.paint_links();
             self.paint_takeoff();
             self.paint_markups();
             self.paint_snap_marker();
@@ -1821,6 +1865,10 @@ impl App {
             self.pan_by(0.0, (ch / 8.0).round());
         } else if k == VK_DOWN {
             self.pan_by(0.0, -(ch / 8.0).round());
+        } else if ctrl && ch_(b'F') {
+            self.ask_find();
+        } else if ctrl && ch_(b'G') {
+            self.ask_goto();
         } else if ctrl && ch_(b'B') {
             self.toggle_panel();
         } else if ctrl && ch_(b'K') {
@@ -1843,7 +1891,8 @@ impl App {
         } else if k == VK_F4 {
             self.toggle_engine();
         } else if k == VK_F3 {
-            self.cycle_workers();
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            self.go_to_hit(if shift { -1 } else { 1 });
         } else if k == VK_F2 {
             self.show_perf = !self.show_perf;
             self.invalidate();
@@ -1867,21 +1916,6 @@ impl App {
             return false;
         }
         true
-    }
-
-    /// F3: switch between 1, 2 and 3 render workers (for A/B testing on a
-    /// given machine). Cached images stay; the document is reloaded by the
-    /// new workers in the background.
-    fn cycle_workers(&mut self) {
-        if self.worker.engine == Engine::Pdfium {
-            self.render_log.push_front("PDFium uses a single render thread (F4 switches engine)".into());
-            self.show_perf = true;
-            self.invalidate();
-            return;
-        }
-        let n = self.worker.size % 3 + 1;
-        self.restart_pool(n, Engine::Windows);
-        self.render_log.push_front(format!("switched to {n} worker{}", if n == 1 { "" } else { "s" }));
     }
 
     /// F4: switch PDF engine. Already-rendered images stay on screen.
@@ -1997,6 +2031,8 @@ impl App {
             IDC_ARROW
         } else if let Some(c) = self.edit_cursor(x, y) {
             c
+        } else if self.tool == Tool::Select && self.link_at(x, y).is_some() {
+            IDC_HAND
         } else if self.doc.is_some() && self.tool != Tool::Select && self.takeoff_sheet().is_some() {
             IDC_CROSS
         } else if self.doc.is_some() {
@@ -2172,7 +2208,10 @@ impl App {
                     if let Some((dx, dy)) = self.down_at.take() {
                         // A click (not a drag) with the Select tool selects.
                         if msg == WM_LBUTTONUP && (x - dx).abs() <= 3 && (y - dy).abs() <= 3 {
-                            self.select_at(x as f32, y as f32);
+                            match self.link_at(x as f32, y as f32) {
+                                Some(target) => self.go_to_page(target as i64),
+                                None => self.select_at(x as f32, y as f32),
+                            }
                         }
                     }
                     // Tools capture the mouse on press; always let go.

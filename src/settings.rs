@@ -45,6 +45,7 @@ pub enum PanelTab {
     Pages,
     Files,
     Markups,
+    Find,
     Settings,
 }
 

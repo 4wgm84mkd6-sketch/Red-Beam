@@ -14,7 +14,7 @@ use crate::takeoff::Units;
 use crate::view::RectF;
 use crate::worker::{Engine, Job, JobKind};
 
-const PANEL_W: f32 = 300.0;
+const PANEL_W: f32 = 330.0;
 const TAB_H: f32 = 38.0;
 /// Thumbnails render at this long-edge size (crisp up to ~150% UI scale).
 const THUMB_PX: f32 = 360.0;
@@ -53,16 +53,17 @@ impl App {
         self.settings.panel_open && x < self.left_inset() && y < ch
     }
 
-    fn tab_rects(&self) -> [(PanelTab, RectF, &'static str); 4] {
+    fn tab_rects(&self) -> [(PanelTab, RectF, &'static str); 5] {
         let s = self.s();
         let w = self.left_inset();
-        let tw = (w - 16.0 * s) / 4.0;
+        let tw = (w - 16.0 * s) / 5.0;
         let r = |i: f32| RectF::new(8.0 * s + tw * i, 6.0 * s, 8.0 * s + tw * (i + 1.0) - 2.0 * s, TAB_H * s);
         [
             (PanelTab::Pages, r(0.0), "Pages"),
             (PanelTab::Files, r(1.0), "Files"),
             (PanelTab::Markups, r(2.0), "Markups"),
-            (PanelTab::Settings, r(3.0), "Settings"),
+            (PanelTab::Find, r(3.0), "Find"),
+            (PanelTab::Settings, r(4.0), "Settings"),
         ]
     }
 
@@ -76,7 +77,8 @@ impl App {
             PanelTab::Pages => 0,
             PanelTab::Files => 1,
             PanelTab::Markups => 2,
-            PanelTab::Settings => 3,
+            PanelTab::Find => 3,
+            PanelTab::Settings => 4,
         }
     }
 
@@ -180,6 +182,7 @@ impl App {
             PanelTab::Pages => self.thumb_rects().1,
             PanelTab::Files => self.file_rows().2,
             PanelTab::Markups => self.markup_rows(&self.content_rect(), self.scroll()).1,
+            PanelTab::Find => self.find_content_height(&self.content_rect(), self.scroll()),
             PanelTab::Settings => self.setting_rows().1,
         }
     }
@@ -268,6 +271,10 @@ impl App {
             PanelTab::Markups => {
                 let (c, sc) = (self.content_rect(), self.scroll());
                 self.markups_tab_click(&c, sc, x, y);
+            }
+            PanelTab::Find => {
+                let (c, sc) = (self.content_rect(), self.scroll());
+                self.find_tab_click(&c, sc, x, y);
             }
             PanelTab::Settings => {
                 if let Some((id, ..)) = self.setting_rows().0.into_iter().find(|(.., r)| r.contains_pt(x, y)) {
@@ -376,6 +383,7 @@ impl App {
             PanelTab::Pages => self.paint_pages_tab(&c),
             PanelTab::Files => self.paint_files_tab(&c),
             PanelTab::Markups => self.paint_markups_tab(&c, self.scroll()),
+            PanelTab::Find => self.paint_find_tab(&c, self.scroll()),
             PanelTab::Settings => self.paint_settings_tab(&c),
         }
         unsafe {
@@ -420,7 +428,9 @@ impl App {
             }
             let label = RectF::new(c.l, r.b + 4.0 * s, c.r, r.b + 22.0 * s);
             let n_items = self.takeoff.items.iter().filter(|m| m.sheet == p).count();
-            let text = if n_items > 0 { format!("{}   \u{00B7} {n_items} takeoff", p + 1) } else { format!("{}", p + 1) };
+            let name = self.sheet_label(p);
+            let base = if name.is_empty() { format!("{}", p + 1) } else { format!("{}  {name}", p + 1) };
+            let text = if n_items > 0 { format!("{base}  \u{00B7} {n_items} takeoff") } else { base };
             self.text(&text, &self.fonts.ui_center, &label, if current { TEXT } else { TEXT_DIM });
         }
     }

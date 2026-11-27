@@ -69,6 +69,8 @@ pub enum JobKind {
     Thumb,
     /// Find changed regions between this sheet and `pair` (old revision).
     Diff,
+    /// Extract the sheet's words (search, sheet names, links).
+    Text,
 }
 
 /// A changed region between two revisions (page DIPs of the new sheet).
@@ -121,7 +123,9 @@ impl Job {
 }
 
 pub enum Msg {
-    Opened { doc_id: u64, path: PathBuf, pages: Vec<(f32, f32)> },
+    /// `labels`: per-page bookmark titles or page labels ("" if none).
+    Opened { doc_id: u64, path: PathBuf, pages: Vec<(f32, f32)>, labels: Vec<String> },
+    Text { job: Job, words: std::result::Result<Vec<crate::sheets::Word>, String> },
     OpenFailed { doc_id: u64, path: PathBuf, error: String },
     /// `texture` keeps the shared resource alive until the UI has opened it.
     /// `parallel` = renders running at the moment this one started (incl. itself).
@@ -562,16 +566,19 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                 // load their own copy so they can render in parallel.
                 let res: std::result::Result<(DocHandle, Vec<(f32, f32)>), String> = match &wgpu {
                     Err(e) => Err(format!("GPU renderer init failed: {}", e.message())),
-                    Ok(_) if use_pdfium => pdfium::Document::open(&path)
-                        .map(|(doc, sizes)| (DocHandle::Pdfium { doc, sizes: sizes.clone() }, sizes)),
+                    Ok(_) if use_pdfium => pdfium::Document::open(&path).map(|(doc, sizes)| (DocHandle::Pdfium { doc, sizes: sizes.clone() }, sizes)),
                     Ok(_) => load(&path, true)
                         .map(|(doc, sizes)| (DocHandle::Windows { doc, pages: Vec::new() }, sizes))
                         .map_err(|e| e.message().to_string()),
                 };
                 let msg = match res {
                     Ok((handle, pages)) => {
+                        let labels = match &handle {
+                            DocHandle::Pdfium { doc, .. } => doc.labels(pages.len()),
+                            DocHandle::Windows { .. } => Vec::new(),
+                        };
                         docs.insert(doc_id, handle);
-                        Msg::Opened { doc_id, path, pages }
+                        Msg::Opened { doc_id, path, pages, labels }
                     }
                     Err(error) => Msg::OpenFailed { doc_id, path, error },
                 };
@@ -586,7 +593,22 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                 // Line-work extraction for snapping (PDFium only).
                 let mut snap: Option<std::result::Result<SnapIndex, String>> = None;
                 let mut diff: Option<std::result::Result<Vec<Change>, String>> = None;
-                let result = if job.kind == JobKind::Diff {
+                let mut text: Option<std::result::Result<Vec<crate::sheets::Word>, String>> = None;
+                let result = if job.kind == JobKind::Text {
+                    text = match docs.get_mut(&job.doc_id) {
+                        Some(DocHandle::Pdfium { doc, sizes }) => {
+                            let size = sizes.get(job.page as usize).copied().unwrap_or((1.0, 1.0));
+                            match doc.words(job.page, size, &cancel) {
+                                Ok(Some(w)) => Some(Ok(w)),
+                                Ok(None) => None,
+                                Err(e) => Some(Err(e)),
+                            }
+                        }
+                        Some(DocHandle::Windows { .. }) => Some(Err("text search needs the PDFium engine (F4)".into())),
+                        None => None,
+                    };
+                    Ok(None)
+                } else if job.kind == JobKind::Diff {
                     diff = match diff_job(&mut docs, &job, &cancel) {
                         Ok(Some(c)) => Some(Ok(c)),
                         Ok(None) => None,
@@ -629,7 +651,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                     }
                 }
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
-                let cancelled = matches!(result, Ok(None)) && snap.is_none() && diff.is_none();
+                let cancelled = matches!(result, Ok(None)) && snap.is_none() && diff.is_none() && text.is_none();
                 {
                     let mut s = shared.m.lock().unwrap();
                     s.in_progress.remove(&job.key());
@@ -651,6 +673,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                 }
                 let msg = match (result, snap) {
                     _ if diff.is_some() => Msg::Changes { job, changes: diff.unwrap_or(Ok(Vec::new())), ms },
+                    _ if text.is_some() => Msg::Text { job, words: text.unwrap_or(Ok(Vec::new())) },
                     (_, Some(index)) => Msg::Snap { job, index: index.map(Sendable), ms },
                     (result, None) => match result {
                     Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel },
