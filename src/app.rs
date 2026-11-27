@@ -20,6 +20,7 @@ use windows_numerics::Matrix3x2;
 mod find;
 mod markups;
 mod panel;
+mod tabs;
 mod tools;
 
 pub use tools::{ExportKind, MenuItem, MenuKind};
@@ -100,10 +101,12 @@ Enter / dbl-click\tFinish polyline, area or count\n\
 Shift (while measuring)\tStraight lines (0\u{00B0}/45\u{00B0}/90\u{00B0})\n\
 Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
 Ctrl+B\tSide panel: pages, files, markups, find, settings\n\
+Ctrl+Tab / Ctrl+W\tNext tab / close tab\n\
 Ctrl+F  /  F3\tFind text in the set / next result (Shift+F3 previous)\n\
 Ctrl+G\tGo to sheet by number or name\n\
 Ctrl+P\tPrint (with markups and takeoffs)\n\
 Ctrl+K\tCompare with an earlier revision\n\
+Ctrl+Shift+K\tSplit view: two sheets of this set side by side\n\
 Tab\tCompare: overlay \u{2192} old \u{2192} new\n\
 ,  /  .\tCompare: previous / next detected change\n\
 [  /  ]\tCompare: shift the old sheet pairing\n\
@@ -127,6 +130,7 @@ enum Btn {
     CmpOverlay,
     CmpOld,
     CmpNew,
+    CmpSide,
     ChgPrev,
     ChgNext,
 }
@@ -138,6 +142,8 @@ enum CmpMode {
     Overlay,
     Old,
     New,
+    /// Old on the left, new on the right, zoom and pan locked together.
+    Side,
 }
 
 /// An earlier revision opened for comparison. Its sheets pair with the
@@ -301,6 +307,14 @@ pub struct App {
     down_at: Option<(i32, i32)>,
     /// Toolbar shows markup tools instead of takeoff tools.
     markup_mode: bool,
+    /// Open documents; the active one's slot is None (its state is live).
+    tabs: Vec<Option<tabs::TabState>>,
+    active_tab: usize,
+    /// Horizontal shift applied to the view while handling input in the
+    /// right pane of the side-by-side view.
+    view_shift: f32,
+    /// A drag started in the right pane (keeps the mapping until release).
+    right_pane: Option<bool>,
     selected_markup: Option<u64>,
     mdraft: Option<markups::MDraft>,
     /// Where a stamp goes once picked from the menu.
@@ -322,6 +336,79 @@ pub struct App {
     pub pending_update_prompt: Option<u32>,
     pub quit_for_update: bool,
     pub device_lost: bool,
+}
+
+impl App {
+    /// Old and new sheets side by side?
+    fn side_mode(&self) -> bool {
+        self.cmp_mode() == Some(CmpMode::Side) && self.cmp_pair().is_some()
+    }
+
+    /// Width of one pane in side-by-side view.
+    fn pane_w(&self) -> f32 {
+        ((self.canvas().0 - self.left_inset()) / 2.0).round()
+    }
+
+    /// Width that "fit" fills: one pane in side-by-side view.
+    fn fit_width_avail(&self, cw: f32) -> f32 {
+        if self.side_mode() { self.pane_w() } else { cw - self.left_inset() }
+    }
+
+    /// Is client x in the right pane of the side-by-side view?
+    fn in_right_pane(&self, x: f32) -> bool {
+        self.side_mode() && x >= self.left_inset() + self.pane_w()
+    }
+
+    /// Old sheet in the left pane, new sheet (with takeoffs, markups,
+    /// links and search hits) in the right pane, sharing one view.
+    fn paint_side(&mut self) {
+        let (Some((old_id, op)), Some(cur)) = (self.cmp_pair().map(|(d, p)| (d.id, p)), self.doc.as_ref().map(|d| d.current)) else { return };
+        let (cw, ch) = self.canvas();
+        let (l, pw) = (self.left_inset(), self.pane_w());
+        let s = self.s();
+        let ctx = self.gfx.ctx.clone();
+        let left = RectF::new(l, 0.0, l + pw, ch);
+        let right = RectF::new(l + pw, 0.0, cw, ch);
+        unsafe {
+            ctx.PushAxisAlignedClip(&d2r(&left), D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        if let Some((old, _)) = self.cmp_pair() {
+            self.paint_page(old, op);
+        }
+        self.paint_changes();
+        unsafe {
+            ctx.PopAxisAlignedClip();
+            ctx.PushAxisAlignedClip(&d2r(&right), D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        self.view.ox += pw;
+        if let Some(doc) = self.doc.as_ref() {
+            self.paint_page(doc, cur);
+        }
+        self.paint_changes();
+        self.paint_find_hits();
+        self.paint_links();
+        self.paint_takeoff();
+        self.paint_markups();
+        self.paint_snap_marker();
+        self.view.ox -= pw;
+        unsafe {
+            ctx.PopAxisAlignedClip();
+        }
+        // Divider and pane labels.
+        self.fill(&RectF::new(l + pw - 1.0, 0.0, l + pw + 1.0, ch), 0x000000, 0.8);
+        let top = self.top_inset();
+        let old_name = self.cmp.as_ref().and_then(|c| c.doc.as_ref()).map(|d| d.name.clone()).unwrap_or_default();
+        let _ = old_id;
+        for (r, text, color) in [
+            (RectF::new(l + 8.0 * s, top + 4.0 * s, l + pw - 8.0 * s, top + 26.0 * s), format!("OLD \u{00B7} {old_name} \u{00B7} sheet {}", op + 1), 0xe53935),
+            (RectF::new(l + pw + 8.0 * s, top + 4.0 * s, cw - 8.0 * s, top + 26.0 * s), format!("NEW \u{00B7} sheet {}  {}", cur + 1, self.sheet_label(cur)), 0x1e88e5),
+        ] {
+            let w = (text.chars().count() as f32 * 7.2 * s + 20.0 * s).min(r.w());
+            let box_ = RectF::new(r.l, r.t, r.l + w, r.b);
+            self.fill(&box_, color, 0.9);
+            self.text(&text, &self.fonts.label, &box_, 0xffffff);
+        }
+    }
 }
 
 impl Drop for App {
@@ -539,6 +626,10 @@ impl App {
             tool_hover: None,
             down_at: None,
             markup_mode: false,
+            tabs: vec![None],
+            active_tab: 0,
+            view_shift: 0.0,
+            right_pane: None,
             selected_markup: None,
             mdraft: None,
             stamp_at: None,
@@ -584,13 +675,13 @@ impl App {
     }
     /// Space reserved at the top of the canvas for the takeoff toolbar.
     fn top_inset(&self) -> f32 {
-        if self.doc.is_some() { (44.0 * self.s()).round() } else { 0.0 }
+        self.tabbar_h() + if self.doc.is_some() { (44.0 * self.s()).round() } else { 0.0 }
     }
 
     fn fit_zoom(&self) -> f32 {
         let (cw, ch) = self.canvas();
         match self.page_size() {
-            Some((pw, ph)) => View::fit_page(cw - self.left_inset(), ch - self.top_inset(), pw, ph, self.margin()).zoom,
+            Some((pw, ph)) => View::fit_page(self.fit_width_avail(cw), ch - self.top_inset(), pw, ph, self.margin()).zoom,
             None => 1.0,
         }
     }
@@ -622,9 +713,10 @@ impl App {
         let Some((pw, ph)) = self.page_size() else { return };
         let (cw, ch) = self.canvas();
         let (top, left) = (self.top_inset(), self.left_inset());
+        let aw = self.fit_width_avail(cw);
         match mode {
-            FitMode::Page => self.view = View::fit_page(cw - left, ch - top, pw, ph, self.margin()),
-            FitMode::Width => self.view = View::fit_width(cw - left, ch - top, pw, ph, self.margin()),
+            FitMode::Page => self.view = View::fit_page(aw, ch - top, pw, ph, self.margin()),
+            FitMode::Width => self.view = View::fit_width(aw, ch - top, pw, ph, self.margin()),
             FitMode::None => {}
         }
         if mode != FitMode::None {
@@ -636,7 +728,8 @@ impl App {
 
     fn zoom_center(&mut self, factor: f32) {
         let (cw, ch) = self.canvas();
-        self.zoom_at(cw * 0.5, ch * 0.5, factor);
+        let x = if self.side_mode() { self.left_inset() + self.pane_w() * 0.5 } else { cw * 0.5 };
+        self.zoom_at(x, ch * 0.5, factor);
     }
 
     /// Start (or extend) an animated zoom about a screen point. Repeated wheel
@@ -649,7 +742,7 @@ impl App {
         let from = self.anim.as_ref().map(|a| a.target).unwrap_or(self.view.zoom);
         let target = (from * factor).clamp(mn, mx);
         let last = self.anim.as_ref().map(|a| a.last).unwrap_or_else(|| Instant::now() - Duration::from_millis(8));
-        self.anim = Some(ZoomAnim { target, ax: x, ay: y, last });
+        self.anim = Some(ZoomAnim { target, ax: x - self.view_shift, ay: y, last });
         self.fit = FitMode::None;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_SETTLE);
@@ -695,6 +788,9 @@ impl App {
     // ------------------------------------------------------------- documents
 
     pub fn open(&mut self, path: PathBuf) {
+        if !self.prepare_open(&path) {
+            return;
+        }
         // Return to the sheet last viewed in this file.
         let last = self.settings.last_page(&path);
         if self.restore.is_none() && last > 0 {
@@ -711,6 +807,15 @@ impl App {
     /// Tell the render workers which documents to keep loaded.
     fn sync_docs(&self) {
         let mut docs = Vec::new();
+        // Parked tabs stay loaded so switching is instant.
+        for t in self.tabs.iter().flatten() {
+            if let Some(d) = &t.doc {
+                docs.push((d.id, d.path.clone()));
+            }
+            if let Some(d) = t.cmp.as_ref().and_then(|c| c.doc.as_ref()) {
+                docs.push((d.id, d.path.clone()));
+            }
+        }
         if let Some(d) = &self.doc {
             docs.push((d.id, d.path.clone()));
         }
@@ -731,6 +836,19 @@ impl App {
     // --------------------------------------------------------------- compare
 
     pub fn start_compare(&mut self, path: PathBuf) {
+        self.start_compare_mode(path, CmpMode::Overlay);
+    }
+
+    /// Ctrl+Shift+K: split the current set side by side (pick the left
+    /// sheet with [ and ]).
+    fn split_current(&mut self) {
+        if let Some(p) = self.doc.as_ref().map(|d| d.path.clone()) {
+            self.start_compare_mode(p, CmpMode::Side);
+            self.status = Some("Split view: choose the left sheet with [ and ]".into());
+        }
+    }
+
+    fn start_compare_mode(&mut self, path: PathBuf, mode: CmpMode) {
         if self.doc.is_none() {
             self.pending_error = Some("Open the current drawing set first, then compare it with an earlier revision.".into());
             return;
@@ -742,7 +860,7 @@ impl App {
             doc: None,
             opening: Some((id, path)),
             offset: 0,
-            mode: CmpMode::Overlay,
+            mode,
             changes: HashMap::new(),
             diff_failed: HashSet::new(),
             change_ix: None,
@@ -839,7 +957,7 @@ impl App {
         let Some(doc) = &self.doc else { return Vec::new() };
         let new = (doc, doc.current);
         match (self.cmp_mode(), self.cmp_pair()) {
-            (Some(CmpMode::Overlay), Some(old)) => vec![old, new],
+            (Some(CmpMode::Overlay | CmpMode::Side), Some(old)) => vec![old, new],
             (Some(CmpMode::Old), Some(old)) => vec![old],
             _ => vec![new],
         }
@@ -1599,7 +1717,8 @@ impl App {
         if self.cmp.as_ref().is_some_and(|c| c.doc.is_some()) {
             specs.push((Btn::CmpOverlay, "Overlay", 66.0, 4.0));
             specs.push((Btn::CmpOld, "Old", 44.0, 4.0));
-            specs.push((Btn::CmpNew, "New", 44.0, 8.0));
+            specs.push((Btn::CmpNew, "New", 44.0, 4.0));
+            specs.push((Btn::CmpSide, "Side by side", 96.0, 8.0));
             specs.push((Btn::ChgPrev, "\u{25C0} Change", 76.0, 4.0));
             specs.push((Btn::ChgNext, "Change \u{25B6}", 76.0, 4.0));
         }
@@ -1645,7 +1764,8 @@ impl App {
             let highlight = (*b == Btn::Update && matches!(self.update, UpdState::Available(_)))
                 || (*b == Btn::CmpOverlay && mode == Some(CmpMode::Overlay))
                 || (*b == Btn::CmpOld && mode == Some(CmpMode::Old))
-                || (*b == Btn::CmpNew && mode == Some(CmpMode::New));
+                || (*b == Btn::CmpNew && mode == Some(CmpMode::New))
+                || (*b == Btn::CmpSide && mode == Some(CmpMode::Side));
             let bg = if self.hover == Some(*b) || highlight { ACCENT } else { BTN_BG };
             self.fill(r, bg, 1.0);
             self.text(label, &self.fonts.ui_center, r, TEXT);
@@ -1683,6 +1803,7 @@ impl App {
                         CmpMode::Overlay => "red = old only \u{00B7} blue = new only \u{00B7} black = unchanged",
                         CmpMode::Old => "showing OLD revision",
                         CmpMode::New => "showing NEW revision",
+                        CmpMode::Side => "side by side: OLD left, NEW right",
                     };
                     let found = match (self.cur_changes(), c.change_ix) {
                         (Some(ch), _) if ch.is_empty() => "no changes found".to_string(),
@@ -1785,20 +1906,25 @@ impl App {
             ctx.SetTransform(&Matrix3x2::identity());
             ctx.Clear(Some(&rgb(self.settings.background.color(), 1.0)));
             ctx.PushAxisAlignedClip(&d2r(&RectF::new(0.0, 0.0, cw, ch)), D2D1_ANTIALIAS_MODE_ALIASED);
-            match (&self.doc, self.cmp_mode(), self.cmp_pair()) {
-                (Some(_), Some(CmpMode::Overlay), Some(_)) if overlay => self.paint_overlay(),
-                (Some(_), Some(CmpMode::Old), Some((old, op))) => self.paint_page(old, op),
-                (Some(doc), _, _) => self.paint_page(doc, doc.current),
-                (None, _, _) => self.paint_empty(),
+            if self.side_mode() {
+                self.paint_side();
+            } else {
+                match (&self.doc, self.cmp_mode(), self.cmp_pair()) {
+                    (Some(_), Some(CmpMode::Overlay), Some(_)) if overlay => self.paint_overlay(),
+                    (Some(_), Some(CmpMode::Old), Some((old, op))) => self.paint_page(old, op),
+                    (Some(doc), _, _) => self.paint_page(doc, doc.current),
+                    (None, _, _) => self.paint_empty(),
+                }
+                self.paint_changes();
+                self.paint_find_hits();
+                self.paint_links();
+                self.paint_takeoff();
+                self.paint_markups();
+                self.paint_snap_marker();
             }
-            self.paint_changes();
-            self.paint_find_hits();
-            self.paint_links();
-            self.paint_takeoff();
-            self.paint_markups();
-            self.paint_snap_marker();
             ctx.PopAxisAlignedClip();
             self.paint_tools_ui();
+            self.paint_tabs();
             self.paint_panel();
             self.paint_bar();
             if self.show_help {
@@ -1835,6 +1961,15 @@ impl App {
         let k = VIRTUAL_KEY(vk);
         let ch_ = |c: u8| vk == c as u16;
         if self.tools_key(k, ctrl) {
+            return true;
+        }
+        if ctrl && k == VK_TAB {
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            self.cycle_tab(if shift { -1 } else { 1 });
+            return true;
+        }
+        if ctrl && ch_(b'W') {
+            self.close_tab(self.active_tab);
             return true;
         }
         if ctrl && ch_(b'O') {
@@ -1878,12 +2013,15 @@ impl App {
             self.ask_goto();
         } else if ctrl && ch_(b'B') {
             self.toggle_panel();
+        } else if ctrl && ch_(b'K') && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 {
+            self.split_current();
         } else if ctrl && ch_(b'K') {
             self.press(Btn::Compare);
         } else if k == VK_TAB && self.cmp_mode().is_some() {
             let next = match self.cmp_mode() {
                 Some(CmpMode::Overlay) => CmpMode::Old,
                 Some(CmpMode::Old) => CmpMode::New,
+                Some(CmpMode::New) => CmpMode::Side,
                 _ => CmpMode::Overlay,
             };
             self.set_cmp_mode(next);
@@ -2008,6 +2146,7 @@ impl App {
             Btn::CmpOverlay => self.set_cmp_mode(CmpMode::Overlay),
             Btn::CmpOld => self.set_cmp_mode(CmpMode::Old),
             Btn::CmpNew => self.set_cmp_mode(CmpMode::New),
+            Btn::CmpSide => self.set_cmp_mode(CmpMode::Side),
             Btn::ChgPrev => self.go_to_change(-1),
             Btn::ChgNext => self.go_to_change(1),
             Btn::Update => match self.update {
@@ -2079,6 +2218,52 @@ impl App {
 
     /// Window-message handler. `None` means "let DefWindowProc handle it".
     pub fn handle(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<isize> {
+        // In side-by-side view the right pane shows the same view shifted by
+        // one pane width: handle input there with the view shifted, so
+        // measuring, editing and zooming map to the right page points.
+        let mouse = matches!(
+            msg,
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_RBUTTONUP | WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_SETCURSOR
+        );
+        if !mouse || !self.side_mode() || self.view_shift != 0.0 {
+            return self.handle_inner(hwnd, msg, wp, lp);
+        }
+        let x = match msg {
+            WM_MOUSEWHEEL => {
+                let mut pt = POINT { x: lo(lp), y: hi(lp) };
+                unsafe {
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                }
+                pt.x as f32
+            }
+            WM_SETCURSOR => self.mouse.0 as f32,
+            _ => lo(lp) as f32,
+        };
+        let right = match (msg, self.right_pane) {
+            (WM_LBUTTONDOWN | WM_MBUTTONDOWN, _) => {
+                let r = self.in_right_pane(x);
+                self.right_pane = Some(r);
+                r
+            }
+            (_, Some(r)) if self.drag.is_some() || self.edit.is_some() || self.mdraft.is_some() => r,
+            _ => self.in_right_pane(x),
+        };
+        if matches!(msg, WM_LBUTTONUP | WM_MBUTTONUP) {
+            self.right_pane = None;
+        }
+        if !right {
+            return self.handle_inner(hwnd, msg, wp, lp);
+        }
+        let pw = self.pane_w();
+        self.view.ox += pw;
+        self.view_shift = pw;
+        let r = self.handle_inner(hwnd, msg, wp, lp);
+        self.view.ox -= pw;
+        self.view_shift = 0.0;
+        r
+    }
+
+    fn handle_inner(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<isize> {
         unsafe {
             match msg {
                 WM_PAINT => {
@@ -2130,6 +2315,15 @@ impl App {
                                 self.press(b);
                             }
                         }
+                    } else if let Some(t) = self.tab_hit(fx, fy) {
+                        if left {
+                            self.tab_click(t);
+                        } else {
+                            // Middle-click closes a tab.
+                            if let tabs::TabHit::Tab(i) | tabs::TabHit::Close(i) = t {
+                                self.close_tab(i);
+                            }
+                        }
                     } else if self.over_panel(fx, fy) {
                         if left {
                             self.panel_click(fx, fy);
@@ -2163,7 +2357,7 @@ impl App {
                     let (x, y) = (lo(lp), hi(lp));
                     if !self.tools_dblclick(x as f32, y as f32) && !self.over_tool_ui(x as f32, y as f32) && !self.in_bar(y as f32) {
                         // Treat as a normal press for the Select tool / toolbar.
-                        return self.handle(hwnd, WM_LBUTTONDOWN, wp, lp);
+                        return self.handle_inner(hwnd, WM_LBUTTONDOWN, wp, lp);
                     }
                     Some(0)
                 }
@@ -2193,7 +2387,11 @@ impl App {
                             self.tool_hover = th;
                             self.invalidate();
                         }
-                        if !self.pending_pts.is_empty() || self.tool != Tool::Select || self.over_panel(x as f32, y as f32) {
+                        if !self.pending_pts.is_empty()
+                            || self.tool != Tool::Select
+                            || self.over_panel(x as f32, y as f32)
+                            || (y as f32) < self.tabbar_h() + 2.0
+                        {
                             self.invalidate();
                         }
                     }

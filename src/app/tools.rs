@@ -420,7 +420,8 @@ impl App {
             return Vec::new();
         }
         let s = self.s();
-        let (top, bot) = (8.0 * s, 40.0 * s);
+        let off = self.tabbar_h();
+        let (top, bot) = (off + 8.0 * s, off + 40.0 * s);
         let scale = match self.takeoff_sheet().and_then(|p| self.takeoff.scale(p)) {
             Some(sc) => format!("Scale: {} \u{25BE}", sc.label),
             None => "Scale: not set \u{25BE}".into(),
@@ -475,13 +476,14 @@ impl App {
         }
         let s = self.s();
         let (cw, ch) = self.canvas();
-        Some(RectF::new(cw - 360.0 * s, 52.0 * s, cw - 8.0 * s, ch - 8.0 * s))
+        Some(RectF::new(cw - 360.0 * s, self.tabbar_h() + 52.0 * s, cw - 8.0 * s, ch - 8.0 * s))
     }
 
     /// Is (x, y) over takeoff UI (so canvas tools should ignore it)?
     pub(super) fn over_tool_ui(&self, x: f32, y: f32) -> bool {
         self.prompt.is_some()
             || self.over_panel(x, y)
+            || (y < self.tabbar_h() && x >= self.left_inset())
             || self.toolbar_rect().is_some_and(|r| r.contains_pt(x, y))
             || self.qty_panel_rect().is_some_and(|r| r.contains_pt(x, y))
     }
