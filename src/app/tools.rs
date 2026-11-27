@@ -218,7 +218,7 @@ impl App {
             Some(t) => (t, Some(side)),
             None => match fallback.as_ref().and_then(|f| Takeoff::load(f).map(|t| (t, f.clone()))) {
                 Some((t, f)) => (t, Some(f)),
-                None => (Takeoff::new(), None),
+                None => (Takeoff { units: self.settings.units_default, ..Takeoff::new() }, None),
             },
         };
         self.takeoff = t;
@@ -238,7 +238,7 @@ impl App {
 
     /// Autosave next to the PDF; fall back to the app-data folder when the
     /// drawing's folder is read-only. The PDF itself is never modified.
-    fn save_takeoff(&mut self) {
+    pub(super) fn save_takeoff(&mut self) {
         let Some(doc) = &self.doc else { return };
         let side = Takeoff::sidecar_path(&doc.path);
         let target = self.takeoff_path.clone().unwrap_or(side);
@@ -363,7 +363,7 @@ impl App {
             (TBtn::Quantities, "Quantities".into(), 90.0, 4.0),
             (TBtn::Export, "Export".into(), 64.0, 0.0),
         ];
-        let mut x = 8.0 * s;
+        let mut x = self.left_inset() + 8.0 * s;
         specs
             .into_iter()
             .map(|(b, label, w, gap)| {
@@ -393,6 +393,7 @@ impl App {
     /// Is (x, y) over takeoff UI (so canvas tools should ignore it)?
     pub(super) fn over_tool_ui(&self, x: f32, y: f32) -> bool {
         self.prompt.is_some()
+            || self.over_panel(x, y)
             || self.toolbar_rect().is_some_and(|r| r.contains_pt(x, y))
             || self.qty_panel_rect().is_some_and(|r| r.contains_pt(x, y))
     }

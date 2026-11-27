@@ -65,6 +65,8 @@ pub enum JobKind {
     Detail,
     /// Extract the sheet's line work and build a snap index.
     Geometry,
+    /// Small whole-page image for the Pages panel.
+    Thumb,
 }
 
 #[derive(Clone, Debug)]

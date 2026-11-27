@@ -7,6 +7,7 @@ compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.
 mod app;
 mod gfx;
 mod pdfium;
+mod settings;
 mod snap;
 mod takeoff;
 mod update;
@@ -332,8 +333,13 @@ fn main() -> Result<()> {
                 None => file = Some(PathBuf::from(a)),
             }
         }
-        if let Some(p) = file {
-            with_app(|a| a.open_at(p, page));
+        match file {
+            Some(p) => {
+                with_app(|a| a.open_at(p, page));
+            }
+            None => {
+                with_app(|a| a.reopen_last());
+            }
         }
 
         let mut msg = MSG::default();

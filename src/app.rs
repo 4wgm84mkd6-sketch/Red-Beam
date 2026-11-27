@@ -17,12 +17,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
 
+mod panel;
 mod tools;
 
 pub use tools::{MenuItem, MenuKind};
 use tools::{EditDrag, Prompt, TBtn, Tool, Undo};
 
 use crate::gfx::{self, Gfx};
+use crate::settings::Settings;
 use crate::snap::SnapIndex;
 use crate::takeoff::{Measure, Takeoff, DEFAULT_LAYER};
 use crate::update::{self, UpdateMsg, WM_APP_UPDATE};
@@ -62,7 +64,6 @@ const MAX_DETAILS: usize = 24;
 const KEEP_RADIUS: i64 = 3;
 
 // Palette (0xRRGGBB)
-const CANVAS: u32 = 0x3b3e43;
 const BAR_BG: u32 = 0x1e2023;
 const BTN_BG: u32 = 0x2e3136;
 const ACCENT: u32 = 0xc62828;
@@ -92,6 +93,7 @@ Ctrl+C / V / D\tCopy, paste at cursor, duplicate\n\
 Enter / dbl-click\tFinish polyline, area or count\n\
 Shift (while measuring)\tStraight lines (0\u{00B0}/45\u{00B0}/90\u{00B0})\n\
 Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
+Ctrl+B\tSide panel: pages, recent files, settings\n\
 Ctrl+K\tCompare with an earlier revision\n\
 Tab\tCompare: overlay \u{2192} old \u{2192} new\n\
 [  /  ]\tCompare: shift the old sheet pairing\n\
@@ -111,6 +113,7 @@ enum Btn {
     Help,
     Update,
     Compare,
+    Panel,
     CmpOverlay,
     CmpOld,
     CmpNew,
@@ -172,6 +175,8 @@ struct Doc {
 
 struct Fonts {
     perf: IDWriteTextFormat,
+    /// Small one-line secondary text (file folders).
+    small: IDWriteTextFormat,
     /// Measurement labels.
     label: IDWriteTextFormat,
     ui: IDWriteTextFormat,
@@ -213,6 +218,11 @@ pub struct App {
 
     /// Whole-sheet images keyed by (document, sheet).
     bases: HashMap<(u64, u32), Cached>,
+    /// Pages-panel thumbnails keyed by (document, sheet).
+    thumbs: HashMap<(u64, u32), Cached>,
+    settings: Settings,
+    /// Scroll offset per panel tab (Pages, Files, Settings).
+    panel_scroll: [f32; 3],
     /// Sharp renders of recently seen views (any sheet near the current one),
     /// least recently added first.
     details: Vec<Cached>,
@@ -276,6 +286,25 @@ pub struct App {
     pub pending_update_prompt: Option<u32>,
     pub quit_for_update: bool,
     pub device_lost: bool,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.settings.save();
+    }
+}
+
+impl App {
+    /// Open the most recently used file (setting: reopen last file).
+    pub fn reopen_last(&mut self) {
+        if !self.settings.reopen_last {
+            return;
+        }
+        if let Some(r) = self.settings.recent.first().filter(|r| r.path.exists()) {
+            let path = r.path.clone();
+            self.open(path);
+        }
+    }
 }
 
 fn rgb(c: u32, a: f32) -> D2D1_COLOR_F {
@@ -377,7 +406,9 @@ fn make_fonts(dw: &IDWriteFactory, s: f32) -> Result<Fonts> {
         perf.SetIncrementalTabStop(150.0 * s)?;
         let label = mk(12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
         one_line(&label, DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        Ok(Fonts { perf, label, ui, ui_center, ui_right, title, body })
+        let small = mk(11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+        one_line(&small, DWRITE_TEXT_ALIGNMENT_LEADING)?;
+        Ok(Fonts { perf, small, label, ui, ui_center, ui_right, title, body })
     }
 }
 
@@ -386,12 +417,13 @@ impl App {
         let gfx = Gfx::new(hwnd)?;
         // Field data: Windows.Data.Pdf got slower, not faster, with parallel
         // renders, so both engines default to a single render thread.
-        let engine = if crate::pdfium::available() { Engine::Pdfium } else { Engine::Windows };
+        let settings = Settings::load();
+        let engine = if crate::pdfium::available() && settings.use_pdfium { Engine::Pdfium } else { Engine::Windows };
         let worker = Pool::start(&gfx.gpu, hwnd, 1, engine);
         let detail_budget = ((gfx.dedicated_vram_mb / 6).clamp(256, 4096)) << 20;
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
-        let fonts = make_fonts(&dwrite, dpi as f32 / 96.0)?;
+        let fonts = make_fonts(&dwrite, dpi as f32 / 96.0 * settings.ui_scale)?;
         let brush = unsafe { gfx.ctx.CreateSolidColorBrush(&rgb(TEXT, 1.0), None)? };
         let tint_old = make_tint(&gfx.ctx, Tint::Red)?;
         let tint_new = make_tint(&gfx.ctx, Tint::Blue)?;
@@ -405,7 +437,9 @@ impl App {
             let _ = GetClientRect(hwnd, &mut rc);
         }
         let (upd_tx, upd_rx) = channel();
-        update::spawn_check(hwnd, upd_tx.clone(), false);
+        if settings.check_updates {
+            update::spawn_check(hwnd, upd_tx.clone(), false);
+        }
         Ok(App {
             worker,
             gfx,
@@ -425,6 +459,8 @@ impl App {
             tint_new,
             blend,
             bases: HashMap::new(),
+            thumbs: HashMap::new(),
+            panel_scroll: [0.0; 3],
             details: Vec::new(),
             detail_budget,
             posted: Vec::new(),
@@ -451,7 +487,7 @@ impl App {
             layer: DEFAULT_LAYER.into(),
             edit: None,
             clip: None,
-            snap_on: true,
+            snap_on: settings.snap_default,
             snaps: HashMap::new(),
             snap_failed: HashSet::new(),
             last_depth: None,
@@ -463,7 +499,8 @@ impl App {
             down_at: None,
             pending_menu: None,
             pending_export: false,
-            update: UpdState::Checking,
+            update: if settings.check_updates { UpdState::Checking } else { UpdState::Idle },
+            settings,
             upd_tx,
             upd_rx,
             pending_error: None,
@@ -477,7 +514,7 @@ impl App {
     // ---------------------------------------------------------------- helpers
 
     fn s(&self) -> f32 {
-        self.dpi as f32 / 96.0
+        self.dpi as f32 / 96.0 * self.settings.ui_scale
     }
     fn bar_h(&self) -> f32 {
         (36.0 * self.s()).round()
@@ -504,7 +541,7 @@ impl App {
     fn fit_zoom(&self) -> f32 {
         let (cw, ch) = self.canvas();
         match self.page_size() {
-            Some((pw, ph)) => View::fit_page(cw, ch - self.top_inset(), pw, ph, self.margin()).zoom,
+            Some((pw, ph)) => View::fit_page(cw - self.left_inset(), ch - self.top_inset(), pw, ph, self.margin()).zoom,
             None => 1.0,
         }
     }
@@ -535,14 +572,15 @@ impl App {
         self.anim = None;
         let Some((pw, ph)) = self.page_size() else { return };
         let (cw, ch) = self.canvas();
-        let top = self.top_inset();
+        let (top, left) = (self.top_inset(), self.left_inset());
         match mode {
-            FitMode::Page => self.view = View::fit_page(cw, ch - top, pw, ph, self.margin()),
-            FitMode::Width => self.view = View::fit_width(cw, ch - top, pw, ph, self.margin()),
+            FitMode::Page => self.view = View::fit_page(cw - left, ch - top, pw, ph, self.margin()),
+            FitMode::Width => self.view = View::fit_width(cw - left, ch - top, pw, ph, self.margin()),
             FitMode::None => {}
         }
         if mode != FitMode::None {
             self.view.oy += top;
+            self.view.ox += left;
         }
         self.view_changed();
     }
@@ -608,6 +646,11 @@ impl App {
     // ------------------------------------------------------------- documents
 
     pub fn open(&mut self, path: PathBuf) {
+        // Return to the sheet last viewed in this file.
+        let last = self.settings.last_page(&path);
+        if self.restore.is_none() && last > 0 {
+            self.restore = Some(Restore { path: path.clone(), page: last, view: View::default(), fit: FitMode::Page });
+        }
         let id = self.next_doc_id;
         self.next_doc_id += 1;
         self.opening = Some((id, path));
@@ -663,6 +706,7 @@ impl App {
     fn drop_doc_images(&mut self, id: Option<u64>) {
         if let Some(id) = id {
             self.bases.retain(|k, _| k.0 != id);
+            self.thumbs.retain(|k, _| k.0 != id);
             self.details.retain(|d| d.job.doc_id != id);
         }
     }
@@ -800,6 +844,10 @@ impl App {
         self.anim = None;
         self.pending_pts.clear();
         self.selected = None;
+        if let Some(path) = self.doc.as_ref().map(|d| d.path.clone()) {
+            self.settings.set_recent_page(&path, p);
+        }
+        self.ensure_thumb_visible();
         let same_size = (old.0 - new.0).abs() < 0.5 && (old.1 - new.1).abs() < 0.5;
         if !same_size || self.fit != FitMode::None {
             // Same-size sheets keep the zoomed location, so flipping between
@@ -959,6 +1007,8 @@ impl App {
                 }
             }
         }
+        // 5. Thumbnails for the visible part of the Pages panel.
+        jobs.extend(self.thumb_jobs());
         jobs.retain(|j| !self.failed.contains(&j.key()));
         self.worker.set_jobs(jobs);
     }
@@ -1027,6 +1077,12 @@ impl App {
                         self.status = Some("Document has no pages".into());
                     }
                     self.load_takeoff();
+                    if let Some(d) = &self.doc {
+                        let (p, c) = (d.path.clone(), d.current);
+                        self.settings.touch_recent(&p, c);
+                        self.settings.save();
+                    }
+                    self.ensure_thumb_visible();
                     self.sync_docs();
                     self.update_jobs(true);
                 }
@@ -1052,6 +1108,7 @@ impl App {
                     self.worker.ack(&job.key());
                     let what = match (job.kind, job.prefetch) {
                         (JobKind::Geometry, _) => "line work",
+                        (JobKind::Thumb, _) => "thumbnail",
                         (JobKind::Detail, false) => "sharp view",
                         (JobKind::Detail, true) => "sharp view (next sheet)",
                         (JobKind::Base, _) => "whole sheet",
@@ -1093,6 +1150,9 @@ impl App {
                         }
                         JobKind::Detail => self.insert_detail(Cached { job, bmp }),
                         JobKind::Geometry => {}
+                        JobKind::Thumb => {
+                            self.thumbs.insert((job.doc_id, job.page), Cached { job, bmp });
+                        }
                     }
                     // A finished sharp view may unlock neighbour prefetch.
                     self.update_jobs(false);
@@ -1106,6 +1166,7 @@ impl App {
                             JobKind::Base => "whole sheet",
                             JobKind::Detail => "sharp view",
                             JobKind::Geometry => "line work",
+                            JobKind::Thumb => "thumbnail",
                         }
                     ));
                     self.render_log.truncate(8);
@@ -1307,10 +1368,11 @@ impl App {
     fn paint_empty(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
+        let l = self.left_inset();
         let cy = ch * 0.42;
         let logo = (112.0 * s).round();
-        self.draw_logo(((cw - logo) / 2.0).round(), cy - 50.0 * s - logo, logo);
-        self.text("Red-Beam", &self.fonts.title, &RectF::new(0.0, cy - 40.0 * s, cw, cy + 20.0 * s), TEXT);
+        self.draw_logo((l + (cw - l - logo) / 2.0).round(), cy - 50.0 * s - logo, logo);
+        self.text("Red-Beam", &self.fonts.title, &RectF::new(l, cy - 40.0 * s, cw, cy + 20.0 * s), TEXT);
         let sub = match &self.opening {
             Some((_, path)) => format!(
                 "Opening {}\u{2026}",
@@ -1318,15 +1380,15 @@ impl App {
             ),
             None => "Open a PDF with Ctrl+O, or drag one onto this window.   F1 for shortcuts.".into(),
         };
-        self.text(&sub, &self.fonts.ui_center, &RectF::new(0.0, cy + 24.0 * s, cw, cy + 50.0 * s), TEXT_DIM);
+        self.text(&sub, &self.fonts.ui_center, &RectF::new(l, cy + 24.0 * s, cw, cy + 50.0 * s), TEXT_DIM);
         let gpu = format!(
             "GPU: {}{}",
             self.gfx.adapter_name,
             if self.gfx.gpu.warp { "  (software fallback \u{2014} no hardware GPU found)" } else { "" }
         );
-        self.text(&gpu, &self.fonts.ui_center, &RectF::new(0.0, cy + 54.0 * s, cw, cy + 78.0 * s), TEXT_DIM);
+        self.text(&gpu, &self.fonts.ui_center, &RectF::new(l, cy + 54.0 * s, cw, cy + 78.0 * s), TEXT_DIM);
         let ver = format!("Red-Beam {}", update::build_label());
-        self.text(&ver, &self.fonts.ui_center, &RectF::new(0.0, cy + 80.0 * s, cw, cy + 104.0 * s), TEXT_DIM);
+        self.text(&ver, &self.fonts.ui_center, &RectF::new(l, cy + 80.0 * s, cw, cy + 104.0 * s), TEXT_DIM);
     }
 
     fn button_layout(&self) -> Vec<(Btn, RectF, &'static str)> {
@@ -1334,6 +1396,7 @@ impl App {
         let (_, h) = self.client;
         let (top, bot) = (h - self.bar_h() + 5.0 * s, h - 5.0 * s);
         let mut specs: Vec<(Btn, &str, f32, f32)> = vec![
+            (Btn::Panel, "\u{2630}", 34.0, 4.0),
             (Btn::Open, "Open", 56.0, 12.0),
             (Btn::Prev, "\u{25C0}", 32.0, 4.0),
             (Btn::Next, "\u{25B6}", 32.0, 12.0),
@@ -1515,7 +1578,7 @@ impl App {
         unsafe {
             ctx.BeginDraw();
             ctx.SetTransform(&Matrix3x2::identity());
-            ctx.Clear(Some(&rgb(CANVAS, 1.0)));
+            ctx.Clear(Some(&rgb(self.settings.background.color(), 1.0)));
             ctx.PushAxisAlignedClip(&d2r(&RectF::new(0.0, 0.0, cw, ch)), D2D1_ANTIALIAS_MODE_ALIASED);
             match (&self.doc, self.cmp_mode(), self.cmp_pair()) {
                 (Some(_), Some(CmpMode::Overlay), Some(_)) if overlay => self.paint_overlay(),
@@ -1527,6 +1590,7 @@ impl App {
             self.paint_snap_marker();
             ctx.PopAxisAlignedClip();
             self.paint_tools_ui();
+            self.paint_panel();
             self.paint_bar();
             if self.show_help {
                 self.paint_help();
@@ -1595,6 +1659,8 @@ impl App {
             self.pan_by(0.0, (ch / 8.0).round());
         } else if k == VK_DOWN {
             self.pan_by(0.0, -(ch / 8.0).round());
+        } else if ctrl && ch_(b'B') {
+            self.toggle_panel();
         } else if ctrl && ch_(b'K') {
             self.press(Btn::Compare);
         } else if k == VK_TAB && self.cmp_mode().is_some() {
@@ -1667,6 +1733,9 @@ impl App {
         self.bases.clear();
         self.details.clear();
         self.restart_pool(1, next);
+        self.thumbs.clear();
+        self.settings.use_pdfium = next == Engine::Pdfium;
+        self.settings.save();
         self.render_log.push_front(format!("switched to {} engine", next.name()));
     }
 
@@ -1728,6 +1797,7 @@ impl App {
                     }
                 }
             }
+            Btn::Panel => self.toggle_panel(),
             Btn::CmpOverlay => self.set_cmp_mode(CmpMode::Overlay),
             Btn::CmpOld => self.set_cmp_mode(CmpMode::Old),
             Btn::CmpNew => self.set_cmp_mode(CmpMode::New),
@@ -1815,11 +1885,17 @@ impl App {
                     let mut pt = POINT { x: lo(lp), y: hi(lp) };
                     let _ = ScreenToClient(hwnd, &mut pt);
                     let step = 90.0 * self.s();
-                    if msg == WM_MOUSEHWHEEL {
+                    let (shift, ctrl) = (keys & 0x0004 != 0, keys & 0x0008 != 0);
+                    // Settings: wheel zooms (Ctrl+wheel scrolls), or wheel
+                    // scrolls (Ctrl+wheel zooms).
+                    let zoom = self.settings.wheel_zooms != ctrl;
+                    if self.over_panel(pt.x as f32, pt.y as f32) {
+                        self.panel_wheel(delta);
+                    } else if msg == WM_MOUSEHWHEEL {
                         self.pan_by(-delta * step, 0.0);
-                    } else if keys & 0x0004 != 0 {
+                    } else if shift {
                         self.pan_by(delta * step, 0.0);
-                    } else if keys & 0x0008 != 0 {
+                    } else if !zoom {
                         self.pan_by(0.0, delta * step);
                     } else {
                         let (cw, ch) = self.canvas();
@@ -1842,6 +1918,10 @@ impl App {
                             if let Some(b) = self.hit_button(fx, fy) {
                                 self.press(b);
                             }
+                        }
+                    } else if self.over_panel(fx, fy) {
+                        if left {
+                            self.panel_click(fx, fy);
                         }
                     } else if self.doc.is_some() {
                         if left {
@@ -1898,7 +1978,7 @@ impl App {
                             self.tool_hover = th;
                             self.invalidate();
                         }
-                        if !self.pending_pts.is_empty() || self.tool != Tool::Select {
+                        if !self.pending_pts.is_empty() || self.tool != Tool::Select || self.over_panel(x as f32, y as f32) {
                             self.invalidate();
                         }
                     }
