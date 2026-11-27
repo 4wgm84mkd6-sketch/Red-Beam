@@ -331,6 +331,7 @@ impl App {
                     w,
                     h,
                     scale,
+                    pair: None,
                 }
             })
             .filter(|j| !self.failed.contains(&j.key()))

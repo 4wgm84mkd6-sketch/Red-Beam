@@ -5,6 +5,7 @@
 compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.Data.Pdf).");
 
 mod app;
+mod diff;
 mod gfx;
 mod pdfium;
 mod settings;

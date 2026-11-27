@@ -29,7 +29,7 @@ use crate::snap::SnapIndex;
 use crate::takeoff::{Measure, Takeoff, DEFAULT_LAYER};
 use crate::update::{self, UpdateMsg, WM_APP_UPDATE};
 use crate::view::{FitMode, RectF, View};
-use crate::worker::{Engine, Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
+use crate::worker::{Change, Engine, Job, JobKey, JobKind, Msg, Pool, WM_APP_RESULT};
 
 pub const WM_APP_OPEN: u32 = WM_APP + 2;
 pub const WM_APP_COMPARE: u32 = WM_APP + 4;
@@ -96,6 +96,7 @@ Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
 Ctrl+B\tSide panel: pages, recent files, settings\n\
 Ctrl+K\tCompare with an earlier revision\n\
 Tab\tCompare: overlay \u{2192} old \u{2192} new\n\
+,  /  .\tCompare: previous / next detected change\n\
 [  /  ]\tCompare: shift the old sheet pairing\n\
 F2\tPerformance readout\n\
 F4\tSwitch PDF engine (PDFium / Windows)\n\
@@ -117,6 +118,8 @@ enum Btn {
     CmpOverlay,
     CmpOld,
     CmpNew,
+    ChgPrev,
+    ChgNext,
 }
 
 /// What is shown while comparing revisions.
@@ -135,6 +138,11 @@ struct Compare {
     opening: Option<(u64, PathBuf)>,
     offset: i64,
     mode: CmpMode,
+    /// Detected changes per (old sheet, new sheet).
+    changes: HashMap<(u32, u32), Vec<Change>>,
+    diff_failed: HashSet<(u32, u32)>,
+    /// Change being viewed (Next/Prev).
+    change_ix: Option<usize>,
 }
 
 /// Offscreen layers + tint effects for the overlay.
@@ -689,7 +697,15 @@ impl App {
         let id = self.next_doc_id;
         self.next_doc_id += 1;
         self.drop_doc_images(self.cmp.as_ref().and_then(|c| c.doc.as_ref()).map(|d| d.id));
-        self.cmp = Some(Compare { doc: None, opening: Some((id, path)), offset: 0, mode: CmpMode::Overlay });
+        self.cmp = Some(Compare {
+            doc: None,
+            opening: Some((id, path)),
+            offset: 0,
+            mode: CmpMode::Overlay,
+            changes: HashMap::new(),
+            diff_failed: HashSet::new(),
+            change_ix: None,
+        });
         self.sync_docs();
         self.invalidate();
     }
@@ -719,8 +735,41 @@ impl App {
         }
     }
 
+    /// Changes found between the paired sheets, if computed.
+    fn cur_changes(&self) -> Option<&Vec<Change>> {
+        let (_, op) = self.cmp_pair()?;
+        let cur = self.doc.as_ref()?.current;
+        self.cmp.as_ref()?.changes.get(&(op, cur))
+    }
+
+    /// Zoom to change `i` of the current sheet pair (wraps around).
+    fn go_to_change(&mut self, step: i64) {
+        let Some(n) = self.cur_changes().map(|c| c.len()).filter(|n| *n > 0) else { return };
+        let ix = match self.cmp.as_ref().and_then(|c| c.change_ix) {
+            Some(i) => (i as i64 + step).rem_euclid(n as i64) as usize,
+            None if step < 0 => n - 1,
+            None => 0,
+        };
+        let r = self.cur_changes().unwrap()[ix].rect;
+        if let Some(c) = self.cmp.as_mut() {
+            c.change_ix = Some(ix);
+        }
+        let (cw, ch) = self.canvas();
+        let (left, top) = (self.left_inset(), self.top_inset());
+        let (aw, ah) = (cw - left, ch - top);
+        let (mn, mx) = self.zoom_limits();
+        let zoom = (aw * 0.45 / r.w().max(1.0)).min(ah * 0.45 / r.h().max(1.0)).clamp(mn.max(self.fit_zoom()), (6.0 * self.s()).min(mx));
+        let (cx, cy) = ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        self.anim = None;
+        self.fit = FitMode::None;
+        self.view = View { zoom, ox: left + aw / 2.0 - cx * zoom, oy: top + ah / 2.0 - cy * zoom };
+        self.view_changed();
+        self.update_jobs(true);
+    }
+
     fn shift_cmp(&mut self, by: i64) {
         if let Some(c) = self.cmp.as_mut() {
+            c.change_ix = None;
             c.offset += by;
             self.update_jobs(true);
             self.invalidate();
@@ -844,6 +893,9 @@ impl App {
         self.anim = None;
         self.pending_pts.clear();
         self.selected = None;
+        if let Some(c) = self.cmp.as_mut() {
+            c.change_ix = None;
+        }
         if let Some(path) = self.doc.as_ref().map(|d| d.path.clone()) {
             self.settings.set_recent_page(&path, p);
         }
@@ -875,6 +927,7 @@ impl App {
             w,
             h,
             scale,
+            pair: None,
         }
     }
 
@@ -922,6 +975,7 @@ impl App {
                     w: (w as u32).clamp(1, max as u32),
                     h: (h as u32).clamp(1, max as u32),
                     scale: self.view.zoom,
+                    pair: None,
                 });
             }
         }
@@ -954,6 +1008,23 @@ impl App {
         let mut jobs: Vec<Job> = Vec::new();
         // 1. Sharp renders of what is on screen (every visible layer).
         jobs.extend(self.posted.iter().cloned());
+        // 1a. Changes between the compared revisions of this sheet.
+        if let (Some(c), Some((old, op))) = (self.cmp.as_ref(), self.cmp_pair()) {
+            let key = (op, doc.current);
+            if !c.changes.contains_key(&key) && !c.diff_failed.contains(&key) && self.worker.engine == Engine::Pdfium {
+                jobs.push(Job {
+                    doc_id: doc.id,
+                    page: doc.current,
+                    kind: JobKind::Diff,
+                    prefetch: false,
+                    src: RectF::default(),
+                    w: 0,
+                    h: 0,
+                    scale: 0.0,
+                    pair: Some((old.id, op)),
+                });
+            }
+        }
         // 1b. Line work for snapping, when a takeoff tool wants it.
         if self.wants_snap() && self.worker.engine == Engine::Pdfium {
             let key = (doc.id, doc.current);
@@ -967,6 +1038,7 @@ impl App {
                     w: 0,
                     h: 0,
                     scale: 0.0,
+                    pair: None,
                 });
             }
         }
@@ -1109,6 +1181,7 @@ impl App {
                     let what = match (job.kind, job.prefetch) {
                         (JobKind::Geometry, _) => "line work",
                         (JobKind::Thumb, _) => "thumbnail",
+                        (JobKind::Diff, _) => "changes",
                         (JobKind::Detail, false) => "sharp view",
                         (JobKind::Detail, true) => "sharp view (next sheet)",
                         (JobKind::Base, _) => "whole sheet",
@@ -1149,7 +1222,7 @@ impl App {
                             self.bases.insert((job.doc_id, job.page), Cached { job, bmp });
                         }
                         JobKind::Detail => self.insert_detail(Cached { job, bmp }),
-                        JobKind::Geometry => {}
+                        JobKind::Geometry | JobKind::Diff => {}
                         JobKind::Thumb => {
                             self.thumbs.insert((job.doc_id, job.page), Cached { job, bmp });
                         }
@@ -1167,9 +1240,28 @@ impl App {
                             JobKind::Detail => "sharp view",
                             JobKind::Geometry => "line work",
                             JobKind::Thumb => "thumbnail",
+                            JobKind::Diff => "change detection",
                         }
                     ));
                     self.render_log.truncate(8);
+                    self.invalidate();
+                }
+                Msg::Changes { job, changes, ms } => {
+                    self.worker.ack(&job.key());
+                    let Some((old_id, op)) = job.pair else { continue };
+                    let Some(c) = self.cmp.as_mut().filter(|c| c.doc.as_ref().map(|d| d.id) == Some(old_id)) else { continue };
+                    let key = (op, job.page);
+                    match changes {
+                        Ok(list) => {
+                            self.render_log.push_front(format!("sheet {}\tchange detection: {} found  {ms:.0} ms", job.page + 1, list.len()));
+                            self.render_log.truncate(8);
+                            c.changes.insert(key, list);
+                        }
+                        Err(e) => {
+                            c.diff_failed.insert(key);
+                            self.status = Some(format!("Change detection unavailable: {e}"));
+                        }
+                    }
                     self.invalidate();
                 }
                 Msg::Snap { job, index, ms } => {
@@ -1273,6 +1365,40 @@ impl App {
         ds.sort_by(|a, b| badness(b).total_cmp(&badness(a)));
         for d in ds {
             self.draw_cached(d);
+        }
+    }
+
+    /// Revision clouds around detected changes while comparing.
+    fn paint_changes(&self) {
+        let Some(list) = self.cur_changes() else { return };
+        let s = self.s();
+        let current = self.cmp.as_ref().and_then(|c| c.change_ix);
+        let pad = 8.0 * s;
+        for (i, c) in list.iter().enumerate() {
+            let r = self.view.page_to_screen(&c.rect);
+            let r = RectF::new(r.l - pad, r.t - pad, r.r + pad, r.b + pad);
+            let cur = current == Some(i);
+            // Same colours as the overlay: blue = added, red = removed,
+            // magenta = both.
+            let total = (c.added + c.removed).max(1) as f32;
+            let (color, sign) = if c.added as f32 / total > 0.85 {
+                (0x1e88e5, "+")
+            } else if c.removed as f32 / total > 0.85 {
+                (0xe53935, "\u{2212}")
+            } else {
+                (0xd81b60, "\u{00B1}")
+            };
+            self.draw_cloud(&r, color, if cur { 3.5 * s } else { 2.0 * s });
+            // Number tag at the top-left.
+            let tag = RectF::new(r.l - 4.0 * s, r.t - 22.0 * s, r.l + 40.0 * s, r.t - 2.0 * s);
+            self.fill(&tag, color, 1.0);
+            if cur {
+                unsafe {
+                    self.brush.SetColor(&rgb(0xffffff, 1.0));
+                    self.gfx.ctx.DrawRectangle(&d2r(&tag), &self.brush, 2.0 * s, None);
+                }
+            }
+            self.text(&format!("{}{}", i + 1, sign), &self.fonts.label, &tag, 0xffffff);
         }
     }
 
@@ -1409,7 +1535,9 @@ impl App {
         if self.cmp.as_ref().is_some_and(|c| c.doc.is_some()) {
             specs.push((Btn::CmpOverlay, "Overlay", 66.0, 4.0));
             specs.push((Btn::CmpOld, "Old", 44.0, 4.0));
-            specs.push((Btn::CmpNew, "New", 44.0, 4.0));
+            specs.push((Btn::CmpNew, "New", 44.0, 8.0));
+            specs.push((Btn::ChgPrev, "\u{25C0} Change", 76.0, 4.0));
+            specs.push((Btn::ChgNext, "Change \u{25B6}", 76.0, 4.0));
         }
         specs.last_mut().unwrap().3 = 12.0;
         specs.push((Btn::Help, "?", 30.0, 12.0));
@@ -1485,7 +1613,13 @@ impl App {
                         CmpMode::Old => "showing OLD revision",
                         CmpMode::New => "showing NEW revision",
                     };
-                    seg(&format!("{legend}   |   vs {} sheet {}", old.name, op + 1), 2000.0 * s, TEXT);
+                    let found = match (self.cur_changes(), c.change_ix) {
+                        (Some(ch), _) if ch.is_empty() => "no changes found".to_string(),
+                        (Some(ch), Some(i)) => format!("change {} of {}", i + 1, ch.len()),
+                        (Some(ch), None) => format!("{} change{} (, .)", ch.len(), if ch.len() == 1 { "" } else { "s" }),
+                        (None, _) => "finding changes\u{2026}".into(),
+                    };
+                    seg(&format!("{found}   |   {legend}   |   vs {} sheet {}", old.name, op + 1), 2000.0 * s, TEXT);
                 }
                 (Some(_), None) => seg("no matching sheet in the old revision \u{2014} use [ / ] to pair", 2000.0 * s, TEXT_DIM),
                 (None, _) => seg(&doc.name, 2000.0 * s, TEXT_DIM),
@@ -1586,6 +1720,7 @@ impl App {
                 (Some(doc), _, _) => self.paint_page(doc, doc.current),
                 (None, _, _) => self.paint_empty(),
             }
+            self.paint_changes();
             self.paint_takeoff();
             self.paint_snap_marker();
             ctx.PopAxisAlignedClip();
@@ -1670,6 +1805,10 @@ impl App {
                 _ => CmpMode::Overlay,
             };
             self.set_cmp_mode(next);
+        } else if k == VK_OEM_PERIOD && self.cmp.is_some() {
+            self.go_to_change(1);
+        } else if k == VK_OEM_COMMA && self.cmp.is_some() {
+            self.go_to_change(-1);
         } else if k == VK_OEM_4 && self.cmp.is_some() {
             self.shift_cmp(-1);
         } else if k == VK_OEM_6 && self.cmp.is_some() {
@@ -1801,6 +1940,8 @@ impl App {
             Btn::CmpOverlay => self.set_cmp_mode(CmpMode::Overlay),
             Btn::CmpOld => self.set_cmp_mode(CmpMode::Old),
             Btn::CmpNew => self.set_cmp_mode(CmpMode::New),
+            Btn::ChgPrev => self.go_to_change(-1),
+            Btn::ChgNext => self.go_to_change(1),
             Btn::Update => match self.update {
                 UpdState::Available(b) => self.pending_update_prompt = Some(b),
                 UpdState::Checking | UpdState::Downloading(_) => {}

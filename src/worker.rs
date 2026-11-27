@@ -67,6 +67,16 @@ pub enum JobKind {
     Geometry,
     /// Small whole-page image for the Pages panel.
     Thumb,
+    /// Find changed regions between this sheet and `pair` (old revision).
+    Diff,
+}
+
+/// A changed region between two revisions (page DIPs of the new sheet).
+#[derive(Clone, Copy, Debug)]
+pub struct Change {
+    pub rect: RectF,
+    pub added: u32,
+    pub removed: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -82,10 +92,12 @@ pub struct Job {
     pub h: u32,
     /// Pixels per page DIP.
     pub scale: f32,
+    /// Second (document, sheet) for a Diff job.
+    pub pair: Option<(u64, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct JobKey(u64, u32, bool, [u32; 4], u32, u32);
+pub struct JobKey(u64, u32, u8, [u32; 4], u32, u32, Option<(u64, u32)>);
 
 impl Job {
     /// Work that is not the sharp render of the view on screen.
@@ -99,10 +111,11 @@ impl Job {
         JobKey(
             self.doc_id,
             self.page,
-            self.kind == JobKind::Base,
+            self.kind as u8,
             [self.src.l.to_bits(), self.src.t.to_bits(), self.src.r.to_bits(), self.src.b.to_bits()],
             self.w,
             self.h,
+            self.pair,
         )
     }
 }
@@ -118,6 +131,8 @@ pub enum Msg {
     Cancelled { job: Job, ms: f32 },
     /// PDFium could not be loaded; the pool fell back to the Windows engine.
     EngineFallback(String),
+    /// Changes between two revisions of a sheet (or why there are none).
+    Changes { job: Job, changes: std::result::Result<Vec<Change>, String>, ms: f32 },
     /// Snap index for a sheet (or why there isn't one).
     Snap { job: Job, index: std::result::Result<Sendable<SnapIndex>, String>, ms: f32 },
 }
@@ -426,6 +441,55 @@ impl WorkerGpu {
     }
 }
 
+/// Render both revisions of a sheet at the same scale and find what
+/// changed. `Ok(None)` if cancelled.
+fn diff_job(docs: &mut HashMap<u64, DocHandle>, job: &Job, cancel: &AtomicBool) -> std::result::Result<Option<Vec<Change>>, String> {
+    let Some((old_id, old_page)) = job.pair else { return Err("no revision to compare".into()) };
+    let size = |d: &HashMap<u64, DocHandle>, id: u64, page: u32| match d.get(&id) {
+        Some(DocHandle::Pdfium { sizes, .. }) => sizes.get(page as usize).copied().ok_or("sheet missing"),
+        Some(DocHandle::Windows { .. }) => Err("change detection needs the PDFium engine (F4)"),
+        None => Err("document not loaded"),
+    };
+    let (sn, so) = (size(docs, job.doc_id, job.page)?, size(docs, old_id, old_page)?);
+    // Both sheets aligned at the top-left, as in the overlay; ~2500 px on
+    // the long edge is enough to catch changed text and linework.
+    let (pw, ph) = (sn.0.max(so.0), sn.1.max(so.1));
+    let scale = 2500.0 / pw.max(ph);
+    let (w, h) = ((pw * scale).ceil() as u32, (ph * scale).ceil() as u32);
+    let mut render = |id: u64, page: u32, page_size: (f32, f32)| -> std::result::Result<Option<Vec<u8>>, String> {
+        let j = Job {
+            doc_id: id,
+            page,
+            kind: JobKind::Base,
+            prefetch: false,
+            src: RectF::new(0.0, 0.0, w as f32 / scale, h as f32 / scale),
+            w,
+            h,
+            scale,
+            pair: None,
+        };
+        match docs.get_mut(&id) {
+            Some(DocHandle::Pdfium { doc, .. }) => doc.render(&j, page_size, cancel),
+            _ => Err("document not loaded".into()),
+        }
+    };
+    let Some(new_px) = render(job.doc_id, job.page, sn)? else { return Ok(None) };
+    let Some(old_px) = render(old_id, old_page, so)? else { return Ok(None) };
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(Some(
+        crate::diff::find_changes(&old_px, &new_px, w, h)
+            .into_iter()
+            .map(|r| Change {
+                rect: RectF::new(r.x0 as f32 / scale, r.y0 as f32 / scale, r.x1 as f32 / scale, r.y1 as f32 / scale),
+                added: r.added,
+                removed: r.removed,
+            })
+            .collect(),
+    ))
+}
+
 /// A loaded document, per engine.
 enum DocHandle {
     Windows { doc: PdfDocument, pages: Vec<(u32, PdfPage)> },
@@ -521,7 +585,15 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                 let t0 = Instant::now();
                 // Line-work extraction for snapping (PDFium only).
                 let mut snap: Option<std::result::Result<SnapIndex, String>> = None;
-                let result = if job.kind == JobKind::Geometry {
+                let mut diff: Option<std::result::Result<Vec<Change>, String>> = None;
+                let result = if job.kind == JobKind::Diff {
+                    diff = match diff_job(&mut docs, &job, &cancel) {
+                        Ok(Some(c)) => Some(Ok(c)),
+                        Ok(None) => None,
+                        Err(e) => Some(Err(e)),
+                    };
+                    Ok(None)
+                } else if job.kind == JobKind::Geometry {
                     match docs.get_mut(&job.doc_id) {
                         Some(DocHandle::Pdfium { doc, sizes }) => {
                             let size = sizes.get(job.page as usize).copied().unwrap_or((1.0, 1.0));
@@ -557,7 +629,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                     }
                 }
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
-                let cancelled = matches!(result, Ok(None)) && snap.is_none();
+                let cancelled = matches!(result, Ok(None)) && snap.is_none() && diff.is_none();
                 {
                     let mut s = shared.m.lock().unwrap();
                     s.in_progress.remove(&job.key());
@@ -578,6 +650,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                     shared.cv.notify_all();
                 }
                 let msg = match (result, snap) {
+                    _ if diff.is_some() => Msg::Changes { job, changes: diff.unwrap_or(Ok(Vec::new())), ms },
                     (_, Some(index)) => Msg::Snap { job, index: index.map(Sendable), ms },
                     (result, None) => match result {
                     Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel },

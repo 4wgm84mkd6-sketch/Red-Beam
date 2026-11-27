@@ -1794,6 +1794,43 @@ impl App {
         }
     }
 
+    /// Revision cloud around a screen rectangle: outward scallops along a
+    /// clockwise path.
+    pub(super) fn draw_cloud(&self, r: &RectF, color: u32, width: f32) {
+        let s = self.s();
+        let scallop = 16.0 * s;
+        unsafe {
+            let Ok(factory) = self.gfx.ctx.GetFactory() else { return };
+            let Ok(geom) = factory.CreatePathGeometry() else { return };
+            let Ok(sink) = geom.Open() else { return };
+            let corners = [[r.l, r.t], [r.r, r.t], [r.r, r.b], [r.l, r.b]];
+            sink.BeginFigure(v2(corners[0]), D2D1_FIGURE_BEGIN_HOLLOW);
+            for i in 0..4 {
+                let (a, b) = (corners[i], corners[(i + 1) % 4]);
+                let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+                let n = (len / scallop).round().max(1.0) as usize;
+                let step = len / n as f32;
+                for k in 1..=n {
+                    let t = k as f32 / n as f32;
+                    let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                    sink.AddArc(&D2D1_ARC_SEGMENT {
+                        point: v2(p),
+                        size: D2D_SIZE_F { width: step / 2.0, height: step / 2.0 },
+                        rotationAngle: 0.0,
+                        sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                        arcSize: D2D1_ARC_SIZE_SMALL,
+                    });
+                }
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            if sink.Close().is_err() {
+                return;
+            }
+            self.brush.SetColor(&rgb(color, 1.0));
+            self.gfx.ctx.DrawGeometry(&geom, &self.brush, width, None);
+        }
+    }
+
     /// The Red-Beam logo (same design as the app icon) at (x, y), `size` px.
     pub(super) fn draw_logo(&self, x: f32, y: f32, size: f32) {
         let k = size / 1024.0;
