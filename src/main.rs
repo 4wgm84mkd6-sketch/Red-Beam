@@ -7,6 +7,7 @@ compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.
 mod app;
 mod gfx;
 mod pdfium;
+mod snap;
 mod takeoff;
 mod update;
 mod view;
@@ -279,7 +280,18 @@ fn main() -> Result<()> {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            // Icon resource 1 (assets/redbeam.ico, embedded by build.rs).
+            hIcon: LoadIconW(Some(hinst.into()), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
+            hIconSm: LoadImageW(
+                Some(hinst.into()),
+                PCWSTR(std::ptr::without_provenance(1)),
+                IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+                LR_DEFAULTCOLOR,
+            )
+            .map(|h| HICON(h.0))
+            .unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             style: CS_DBLCLKS,
             lpszClassName: class,

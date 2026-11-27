@@ -23,6 +23,7 @@ pub use tools::{MenuItem, MenuKind};
 use tools::{EditDrag, Prompt, TBtn, Tool, Undo};
 
 use crate::gfx::{self, Gfx};
+use crate::snap::SnapIndex;
 use crate::takeoff::{Measure, Takeoff, DEFAULT_LAYER};
 use crate::update::{self, UpdateMsg, WM_APP_UPDATE};
 use crate::view::{FitMode, RectF, View};
@@ -81,7 +82,9 @@ W\tFit width\n\
 Ctrl+1\tActual size (100%)\n\
 + / \u{2212}\tZoom in / out\n\
 Arrow keys\tPan\n\
-L / Y / A / C\tTakeoff: length / polyline / area / count\n\
+L / Y / A / U / C\tTakeoff: length / polyline / area / volume / count\n\
+X\tCut-out in the selected area\n\
+S\tSnap to line work on/off (hold Alt to place freely)\n\
 V  or  Esc\tSelect: drag to move, drag handles to reshape\n\
   \tDrag a label for a leader \u{00B7} right-click for properties\n\
   \tDouble-click an edge to add a point \u{00B7} Del deletes\n\
@@ -248,6 +251,12 @@ pub struct App {
     edit: Option<EditDrag>,
     /// Copied measurement (Ctrl+C / Ctrl+V).
     clip: Option<Measure>,
+    snap_on: bool,
+    /// Snap indexes of the open set's sheets, keyed by (document, sheet).
+    snaps: HashMap<(u64, u32), SnapIndex>,
+    snap_failed: HashSet<(u64, u32)>,
+    /// Last depth typed for volumes, offered again next time.
+    last_depth: Option<String>,
     selected: Option<u64>,
     undo: Vec<Undo>,
     prompt: Option<Prompt>,
@@ -442,6 +451,10 @@ impl App {
             layer: DEFAULT_LAYER.into(),
             edit: None,
             clip: None,
+            snap_on: true,
+            snaps: HashMap::new(),
+            snap_failed: HashSet::new(),
+            last_depth: None,
             selected: None,
             undo: Vec::new(),
             prompt: None,
@@ -882,6 +895,8 @@ impl App {
         let keep = |id: u64, page: u32| near.iter().any(|&(d, c)| d == id && (page as i64 - c).abs() <= KEEP_RADIUS);
         self.bases.retain(|&(id, p), _| keep(id, p));
         self.details.retain(|d| keep(d.job.doc_id, d.job.page));
+        let main_id = doc.id;
+        self.snaps.retain(|&(id, p), _| id == main_id && (p as i64 - cur).abs() <= KEEP_RADIUS);
 
         if with_detail && self.anim.is_none() {
             let posted: Vec<Job> = self.layers().iter().filter_map(|(d, p)| self.desired_detail(d, *p, false)).collect();
@@ -891,6 +906,22 @@ impl App {
         let mut jobs: Vec<Job> = Vec::new();
         // 1. Sharp renders of what is on screen (every visible layer).
         jobs.extend(self.posted.iter().cloned());
+        // 1b. Line work for snapping, when a takeoff tool wants it.
+        if self.wants_snap() && self.worker.engine == Engine::Pdfium {
+            let key = (doc.id, doc.current);
+            if !self.snaps.contains_key(&key) && !self.snap_failed.contains(&key) {
+                jobs.push(Job {
+                    doc_id: doc.id,
+                    page: doc.current,
+                    kind: JobKind::Geometry,
+                    prefetch: false,
+                    src: RectF::default(),
+                    w: 0,
+                    h: 0,
+                    scale: 0.0,
+                });
+            }
+        }
         // 2. Whole-sheet images of the visible layers.
         for (d, p) in &layers {
             if !self.bases.contains_key(&(d.id, *p)) {
@@ -1020,6 +1051,7 @@ impl App {
                 Msg::Rendered { job, handle, texture, ms, parallel } => {
                     self.worker.ack(&job.key());
                     let what = match (job.kind, job.prefetch) {
+                        (JobKind::Geometry, _) => "line work",
                         (JobKind::Detail, false) => "sharp view",
                         (JobKind::Detail, true) => "sharp view (next sheet)",
                         (JobKind::Base, _) => "whole sheet",
@@ -1060,6 +1092,7 @@ impl App {
                             self.bases.insert((job.doc_id, job.page), Cached { job, bmp });
                         }
                         JobKind::Detail => self.insert_detail(Cached { job, bmp }),
+                        JobKind::Geometry => {}
                     }
                     // A finished sharp view may unlock neighbour prefetch.
                     self.update_jobs(false);
@@ -1069,9 +1102,35 @@ impl App {
                     self.render_log.push_front(format!(
                         "sheet {}\t{} cancelled after {ms:.0} ms (no longer needed)",
                         job.page + 1,
-                        if job.kind == JobKind::Base { "whole sheet" } else { "sharp view" }
+                        match job.kind {
+                            JobKind::Base => "whole sheet",
+                            JobKind::Detail => "sharp view",
+                            JobKind::Geometry => "line work",
+                        }
                     ));
                     self.render_log.truncate(8);
+                    self.invalidate();
+                }
+                Msg::Snap { job, index, ms } => {
+                    self.worker.ack(&job.key());
+                    let key = (job.doc_id, job.page);
+                    match index {
+                        Ok(idx) => {
+                            let idx = idx.0;
+                            self.render_log.push_front(format!(
+                                "sheet {}\tline work for snapping: {} points{}  {ms:.0} ms",
+                                job.page + 1,
+                                idx.vertex_count,
+                                if idx.truncated { " (very dense: corners only)" } else { "" }
+                            ));
+                            self.render_log.truncate(8);
+                            self.snaps.insert(key, idx);
+                        }
+                        Err(e) => {
+                            self.snap_failed.insert(key);
+                            self.status = Some(format!("Snapping unavailable: {e}"));
+                        }
+                    }
                     self.invalidate();
                 }
                 Msg::EngineFallback(why) => {
@@ -1248,7 +1307,9 @@ impl App {
     fn paint_empty(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
-        let cy = ch * 0.38;
+        let cy = ch * 0.42;
+        let logo = (112.0 * s).round();
+        self.draw_logo(((cw - logo) / 2.0).round(), cy - 50.0 * s - logo, logo);
         self.text("Red-Beam", &self.fonts.title, &RectF::new(0.0, cy - 40.0 * s, cw, cy + 20.0 * s), TEXT);
         let sub = match &self.opening {
             Some((_, path)) => format!(
@@ -1290,7 +1351,8 @@ impl App {
         specs.last_mut().unwrap().3 = 12.0;
         specs.push((Btn::Help, "?", 30.0, 12.0));
         specs.push((Btn::Update, self.update_label(), 104.0, 0.0));
-        let mut x = 6.0 * s;
+        // Room for the logo at the far left.
+        let mut x = 38.0 * s;
         specs
             .iter()
             .map(|&(b, label, w, gap)| {
@@ -1320,6 +1382,8 @@ impl App {
         let bar = RectF::new(0.0, h - self.bar_h(), w, h);
         self.fill(&bar, BAR_BG, 1.0);
         self.fill(&RectF::new(0.0, bar.t, w, bar.t + 1.0), 0x000000, 0.8);
+        let logo = (26.0 * s).round();
+        self.draw_logo((7.0 * s).round(), (bar.t + (bar.h() - logo) / 2.0).round(), logo);
         let buttons = self.button_layout();
         for (b, r, label) in &buttons {
             let mode = self.cmp_mode();
@@ -1460,6 +1524,7 @@ impl App {
                 (None, _, _) => self.paint_empty(),
             }
             self.paint_takeoff();
+            self.paint_snap_marker();
             ctx.PopAxisAlignedClip();
             self.paint_tools_ui();
             self.paint_bar();
@@ -1612,6 +1677,7 @@ impl App {
         std::thread::spawn(move || drop(old));
         self.posted.clear();
         self.failed.clear();
+        self.snap_failed.clear();
         self.status = None;
         self.render_log.clear();
         self.sync_docs();
@@ -1832,7 +1898,7 @@ impl App {
                             self.tool_hover = th;
                             self.invalidate();
                         }
-                        if !self.pending_pts.is_empty() {
+                        if !self.pending_pts.is_empty() || self.tool != Tool::Select {
                             self.invalidate();
                         }
                     }

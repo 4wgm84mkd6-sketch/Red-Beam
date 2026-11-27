@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{IDC_HAND, IDC_SIZEALL};
 use windows_numerics::Vector2;
 
 use super::{d2r, rgb, App, CmpMode, ACCENT, BTN_BG, TEXT, TEXT_DIM};
+use crate::snap::SnapKind;
 use crate::takeoff::{self, EndStyle, Kind, Layer, Measure, Qty, Scale, Takeoff, Units, DEFAULT_LAYER, SCALES};
 use crate::view::RectF;
 
@@ -24,6 +25,22 @@ pub enum Tool {
     /// Two clicks, then type the real distance.
     Calibrate,
     Measure(Kind),
+    /// Area that then asks for a depth (volume).
+    Volume,
+    /// Outline a cut-out inside area measurement `id`.
+    Cutout(u64),
+}
+
+impl Tool {
+    /// The kind of shape being drawn.
+    fn kind(self) -> Option<Kind> {
+        match self {
+            Tool::Measure(k) => Some(k),
+            Tool::Volume | Tool::Cutout(_) => Some(Kind::Area),
+            Tool::Calibrate => Some(Kind::Length),
+            Tool::Select => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,6 +48,8 @@ pub enum TBtn {
     Select,
     Scale,
     Tool(Kind),
+    Volume,
+    Snap,
     Group,
     Layer,
     Units,
@@ -44,8 +63,9 @@ pub enum MenuKind {
     Group,
     Layer,
     Units,
-    /// Right-click on a measurement (and maybe one of its points).
-    Context { id: u64, vertex: Option<usize> },
+    /// Right-click on a measurement: maybe on one of its points
+    /// (ring 0 = outline, ring k = cut-out k-1) or inside a cut-out.
+    Context { id: u64, vertex: Option<(usize, usize)>, hole: Option<usize> },
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +77,8 @@ pub enum PromptFor {
     /// New layer; also move measurement `assign` onto it.
     NewLayer { assign: Option<u64> },
     RenameLayer(usize),
+    /// Depth / thickness for an area's volume.
+    Depth { id: u64 },
 }
 
 pub struct Prompt {
@@ -81,8 +103,9 @@ pub enum Undo {
 pub enum EditDrag {
     /// Whole measurement.
     Move { orig: Measure, start: [f32; 2], moved: bool },
-    /// One point (corner, end or count marker).
-    Vertex { orig: Measure, index: usize, moved: bool },
+    /// One point (corner, end or count marker) of ring `ring`
+    /// (0 = outline, k = cut-out k-1).
+    Vertex { orig: Measure, ring: usize, index: usize, moved: bool },
     /// The label, which then gets a leader back to the measurement.
     Label { orig: Measure, start: [f32; 2], moved: bool },
 }
@@ -99,6 +122,10 @@ const CMD_RESET_LABEL: usize = 906;
 const CMD_DELETE_POINT: usize = 907;
 const CMD_DUPLICATE: usize = 908;
 const CMD_DELETE: usize = 909;
+const CMD_ADD_CUTOUT: usize = 910;
+const CMD_REMOVE_CUTOUT: usize = 911;
+const CMD_SET_DEPTH: usize = 912;
+const CMD_CLEAR_DEPTH: usize = 913;
 const CMD_SET_GROUP: usize = 1000;
 const CMD_SET_LAYER: usize = 2000;
 const CMD_ENDS: usize = 3000;
@@ -140,10 +167,35 @@ fn hits(m: &Measure, p: [f32; 2], tol: f32) -> bool {
         Kind::Count => m.points.iter().any(|q| takeoff::dist(*q, p) as f32 <= tol * 1.6),
         Kind::Length | Kind::Polyline => m.points.windows(2).any(|w| takeoff::seg_dist2(p, w[0], w[1]) <= tol2),
         Kind::Area => {
-            takeoff::point_in_polygon(p, &m.points)
-                || (0..m.points.len()).any(|i| takeoff::seg_dist2(p, m.points[i], m.points[(i + 1) % m.points.len()]) <= tol2)
+            let on_edge = |ring: &[[f32; 2]]| {
+                (0..ring.len()).any(|i| takeoff::seg_dist2(p, ring[i], ring[(i + 1) % ring.len()]) <= tol2)
+            };
+            (takeoff::point_in_polygon(p, &m.points) && !m.holes.iter().any(|h| takeoff::point_in_polygon(p, h)))
+                || on_edge(&m.points)
+                || m.holes.iter().any(|h| on_edge(h))
         }
     }
+}
+
+/// Ring `r` of a measurement: 0 = outline, k = cut-out k-1.
+fn ring(m: &Measure, r: usize) -> &[[f32; 2]] {
+    if r == 0 {
+        &m.points
+    } else {
+        &m.holes[r - 1]
+    }
+}
+
+fn ring_mut(m: &mut Measure, r: usize) -> &mut Vec<[f32; 2]> {
+    if r == 0 {
+        &mut m.points
+    } else {
+        &mut m.holes[r - 1]
+    }
+}
+
+fn ring_count(m: &Measure) -> usize {
+    1 + m.holes.len()
 }
 
 impl App {
@@ -202,10 +254,65 @@ impl App {
     fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.pending_pts.clear();
-        if tool != Tool::Select {
+        if !matches!(tool, Tool::Select | Tool::Cutout(_)) {
             self.selected = None;
         }
+        self.update_jobs(false);
         self.invalidate();
+    }
+
+    /// Start outlining a cut-out in the selected area.
+    fn start_cutout(&mut self) {
+        match self.selected_measure() {
+            Some(m) if m.kind == Kind::Area && self.editable(m) => {
+                let id = m.id;
+                self.set_tool(Tool::Cutout(id));
+                self.status = Some("Cut-out: click its corners inside the area, then Enter".into());
+            }
+            _ => self.status = Some("Select an area first, then press X (or right-click \u{2192} Add cut-out)".into()),
+        }
+        self.invalidate();
+    }
+
+    fn ask_depth(&mut self, id: u64) {
+        let current = self.takeoff.items.iter().find(|m| m.id == id).and_then(|m| m.depth_in);
+        let text = match (current, &self.last_depth) {
+            (Some(d), _) => takeoff::fmt_len(d, Units::FeetInches),
+            (None, Some(t)) => t.clone(),
+            (None, None) => String::new(),
+        };
+        self.prompt = Some(Prompt {
+            title: "Depth / thickness".into(),
+            hint: "e.g. 6\", 4 1/2\", 1'-0\" or 150mm \u{2014} volume shows in CY (m\u{00B3} in metric)".into(),
+            text,
+            purpose: PromptFor::Depth { id },
+        });
+    }
+
+    fn toggle_snap(&mut self) {
+        self.snap_on = !self.snap_on;
+        self.status = Some(if self.snap_on { "Snapping on (hold Alt to place freely)" } else { "Snapping off" }.into());
+        self.update_jobs(false);
+        self.invalidate();
+    }
+
+    /// Snap a page point to the sheet's line work (unless Alt is held).
+    pub(super) fn snap_pt(&self, p: [f32; 2]) -> ([f32; 2], Option<SnapKind>) {
+        let alt = unsafe { GetKeyState(VK_MENU.0 as i32) < 0 };
+        if !self.snap_on || alt {
+            return (p, None);
+        }
+        let Some(idx) = self.doc.as_ref().and_then(|d| self.snaps.get(&(d.id, d.current))) else { return (p, None) };
+        let tol = 9.0 * self.s() / self.view.zoom;
+        match idx.snap(p, tol) {
+            Some((q, k)) => (q, Some(k)),
+            None => (p, None),
+        }
+    }
+
+    /// Does the current tool want snapping data for this sheet?
+    pub(super) fn wants_snap(&self) -> bool {
+        self.snap_on && self.takeoff_sheet().is_some() && (self.tool != Tool::Select || self.selected.is_some())
     }
 
     fn selected_measure(&self) -> Option<&Measure> {
@@ -247,12 +354,14 @@ impl App {
             (TBtn::Tool(Kind::Length), "Length".into(), 64.0, 4.0),
             (TBtn::Tool(Kind::Polyline), "Polyline".into(), 72.0, 4.0),
             (TBtn::Tool(Kind::Area), "Area".into(), 52.0, 4.0),
+            (TBtn::Volume, "Volume".into(), 64.0, 4.0),
             (TBtn::Tool(Kind::Count), "Count".into(), 58.0, 8.0),
+            (TBtn::Snap, if self.snap_on { "Snap \u{2713}".into() } else { "Snap".into() }, 64.0, 8.0),
             (TBtn::Group, format!("Group: {} \u{25BE}", self.group), 150.0, 4.0),
             (TBtn::Layer, format!("Layer: {} \u{25BE}", self.layer), 140.0, 4.0),
             (TBtn::Units, format!("{units} \u{25BE}"), 72.0, 8.0),
             (TBtn::Quantities, "Quantities".into(), 90.0, 4.0),
-            (TBtn::Export, "Export CSV".into(), 92.0, 0.0),
+            (TBtn::Export, "Export".into(), 64.0, 0.0),
         ];
         let mut x = 8.0 * s;
         specs
@@ -296,6 +405,8 @@ impl App {
         match b {
             TBtn::Select => self.set_tool(Tool::Select),
             TBtn::Tool(k) => self.set_tool(Tool::Measure(k)),
+            TBtn::Volume => self.set_tool(Tool::Volume),
+            TBtn::Snap => self.toggle_snap(),
             TBtn::Scale => self.pending_menu = Some(MenuKind::Scale),
             TBtn::Group => self.pending_menu = Some(MenuKind::Group),
             TBtn::Layer => self.pending_menu = Some(MenuKind::Layer),
@@ -391,7 +502,7 @@ impl App {
                 item(CMD_BASE + 1, "Decimal feet (12.52') and SF", self.takeoff.units == Units::DecimalFeet),
                 item(CMD_BASE + 2, "Metric (m and m\u{00B2})", self.takeoff.units == Units::Metric),
             ],
-            MenuKind::Context { id, vertex } => {
+            MenuKind::Context { id, vertex, hole } => {
                 let Some(m) = self.takeoff.items.iter().find(|m| m.id == id) else { return Vec::new() };
                 let mut groups: Vec<MenuItem> = self
                     .takeoff
@@ -419,9 +530,27 @@ impl App {
                 if m.label_offset.is_some() {
                     v.push(item(CMD_RESET_LABEL, "Put label back on the measurement", false));
                 }
-                if vertex.is_some() && m.points.len() > m.kind.min_points() {
-                    let what = if m.kind == Kind::Count { "Remove this marker" } else { "Delete this point" };
-                    v.push(item(CMD_DELETE_POINT, what, false));
+                if m.kind == Kind::Area {
+                    v.push(sep());
+                    v.push(item(CMD_ADD_CUTOUT, "Add cut-out\tX", false));
+                    if hole.is_some() {
+                        v.push(item(CMD_REMOVE_CUTOUT, "Remove this cut-out", false));
+                    }
+                    let depth = match m.depth_in {
+                        Some(d) => format!("Depth / thickness: {}\u{2026}", takeoff::fmt_len(d, self.takeoff.units)),
+                        None => "Set depth for volume\u{2026}".into(),
+                    };
+                    v.push(item(CMD_SET_DEPTH, depth, false));
+                    if m.depth_in.is_some() {
+                        v.push(item(CMD_CLEAR_DEPTH, "Remove depth (area only)", false));
+                    }
+                }
+                if let Some((r, _)) = vertex {
+                    let min = if r == 0 { m.kind.min_points() } else { 3 };
+                    if ring(m, r).len() > min {
+                        let what = if m.kind == Kind::Count { "Remove this marker" } else { "Delete this point" };
+                        v.push(item(CMD_DELETE_POINT, what, false));
+                    }
                 }
                 v.push(sep());
                 v.push(item(CMD_DUPLICATE, "Duplicate\tCtrl+D", false));
@@ -476,7 +605,7 @@ impl App {
                 };
                 self.save_takeoff();
             }
-            MenuKind::Context { id, vertex } => self.context_menu(id, vertex, cmd),
+            MenuKind::Context { id, vertex, hole } => self.context_menu(id, vertex, hole, cmd),
         }
         self.invalidate();
     }
@@ -562,9 +691,14 @@ impl App {
         self.save_takeoff();
     }
 
-    fn context_menu(&mut self, id: u64, vertex: Option<usize>, cmd: usize) {
+    fn context_menu(&mut self, id: u64, vertex: Option<(usize, usize)>, hole: Option<usize>, cmd: usize) {
         let Some(before) = self.takeoff.items.iter().find(|m| m.id == id).cloned() else { return };
         match cmd {
+            CMD_ADD_CUTOUT => {
+                self.selected = Some(id);
+                return self.start_cutout();
+            }
+            CMD_SET_DEPTH => return self.ask_depth(id),
             CMD_NEW_GROUP => return self.ask_new_group(Some(id)),
             CMD_NEW_LAYER => return self.ask_new_layer(Some(id)),
             CMD_DUPLICATE => {
@@ -596,9 +730,19 @@ impl App {
         } else if cmd == CMD_RESET_LABEL {
             m.label_offset = None;
         } else if cmd == CMD_DELETE_POINT {
-            if let Some(v) = vertex.filter(|v| *v < m.points.len() && m.points.len() > m.kind.min_points()) {
-                m.points.remove(v);
+            if let Some((r, v)) = vertex.filter(|(r, _)| *r < ring_count(m)) {
+                let min = if r == 0 { m.kind.min_points() } else { 3 };
+                let pts = ring_mut(m, r);
+                if v < pts.len() && pts.len() > min {
+                    pts.remove(v);
+                }
             }
+        } else if cmd == CMD_REMOVE_CUTOUT {
+            if let Some(h) = hole.filter(|h| *h < m.holes.len()) {
+                m.holes.remove(h);
+            }
+        } else if cmd == CMD_CLEAR_DEPTH {
+            m.depth_in = None;
         } else {
             return;
         }
@@ -656,12 +800,17 @@ impl App {
         unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
     }
 
-    /// The point a click at (x, y) would place, with Shift = ortho.
+    /// The point a click at (x, y) would place: Shift = ortho, otherwise
+    /// snapped to the drawing's line work when snapping is on.
     fn place_pt(&self, x: f32, y: f32) -> [f32; 2] {
+        self.place_pt_kind(x, y).0
+    }
+
+    fn place_pt_kind(&self, x: f32, y: f32) -> ([f32; 2], Option<SnapKind>) {
         let p = self.page_pt(x, y);
         match (Self::shift_down(), self.pending_pts.last()) {
-            (true, Some(&last)) => takeoff::ortho(last, p),
-            _ => p,
+            (true, Some(&last)) => (takeoff::ortho(last, p), None),
+            _ => self.snap_pt(p),
         }
     }
 
@@ -686,10 +835,10 @@ impl App {
                 self.invalidate();
                 true
             }
-            Tool::Measure(kind) => {
+            Tool::Measure(_) | Tool::Volume | Tool::Cutout(_) => {
                 let p = self.place_pt(x, y);
                 self.pending_pts.push(p);
-                if kind == Kind::Length && self.pending_pts.len() == 2 {
+                if self.tool == Tool::Measure(Kind::Length) && self.pending_pts.len() == 2 {
                     self.finish_measure();
                 }
                 self.invalidate();
@@ -702,7 +851,7 @@ impl App {
     /// point, so finish. With the Select tool on a selected polyline/area
     /// edge: insert a point there.
     pub(super) fn tools_dblclick(&mut self, x: f32, y: f32) -> bool {
-        if matches!(self.tool, Tool::Measure(_)) && !self.pending_pts.is_empty() {
+        if matches!(self.tool, Tool::Measure(_) | Tool::Volume | Tool::Cutout(_)) && !self.pending_pts.is_empty() {
             self.finish_measure();
             return true;
         }
@@ -714,11 +863,14 @@ impl App {
         let Some(m) = self.selected_measure().filter(|m| matches!(m.kind, Kind::Polyline | Kind::Area | Kind::Length)) else {
             return false;
         };
-        let n = m.points.len();
-        let segs = if m.kind == Kind::Area { n } else { n - 1 };
-        let Some(i) = (0..segs).find(|&i| takeoff::seg_dist2(p, m.points[i], m.points[(i + 1) % n]) <= tol * tol) else {
-            return false;
-        };
+        let closed = m.kind == Kind::Area;
+        let hit = (0..ring_count(m)).find_map(|r| {
+            let pts = ring(m, r);
+            let n = pts.len();
+            let segs = if closed { n } else { n - 1 };
+            (0..segs).find(|&i| takeoff::seg_dist2(p, pts[i], pts[(i + 1) % n]) <= tol * tol).map(|i| (r, i))
+        });
+        let Some((r, i)) = hit else { return false };
         let before = m.clone();
         let id = m.id;
         if let Some(m) = self.takeoff.get_mut(id) {
@@ -726,7 +878,7 @@ impl App {
                 // A length with a bend becomes a polyline.
                 m.kind = Kind::Polyline;
             }
-            m.points.insert(i + 1, p);
+            ring_mut(m, r).insert(i + 1, p);
         }
         self.undo.push(Undo::Modified(before));
         self.save_takeoff();
@@ -735,11 +887,28 @@ impl App {
     }
 
     pub(super) fn finish_measure(&mut self) {
-        let (Tool::Measure(kind), Some(sheet)) = (self.tool, self.takeoff_sheet()) else { return };
+        let (Some(kind), Some(sheet)) = (self.tool.kind(), self.takeoff_sheet()) else { return };
+        if self.tool == Tool::Calibrate {
+            return;
+        }
         let mut pts = std::mem::take(&mut self.pending_pts);
         // A double-click can leave a duplicate final point.
         pts.dedup_by(|a, b| takeoff::dist(*a, *b) < 0.01);
         if pts.len() < kind.min_points() {
+            self.invalidate();
+            return;
+        }
+        if let Tool::Cutout(id) = self.tool {
+            if let Some(before) = self.takeoff.items.iter().find(|m| m.id == id).cloned() {
+                if let Some(m) = self.takeoff.get_mut(id) {
+                    m.holes.push(pts);
+                }
+                self.undo.push(Undo::Modified(before));
+                self.save_takeoff();
+            }
+            self.status = None;
+            self.tool = Tool::Select;
+            self.selected = Some(id);
             self.invalidate();
             return;
         }
@@ -754,6 +923,9 @@ impl App {
             self.status = Some("This sheet has no scale \u{2014} set one from the Scale menu".into());
         }
         self.save_takeoff();
+        if self.tool == Tool::Volume {
+            self.ask_depth(id);
+        }
         self.invalidate();
     }
 
@@ -795,14 +967,26 @@ impl App {
         }
     }
 
-    /// Point handle of the selected measurement under (x, y).
-    fn handle_at(&self, x: f32, y: f32) -> Option<usize> {
+    /// Point handle of the selected measurement under (x, y): (ring, index).
+    fn handle_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
         let m = self.selected_measure().filter(|m| self.editable(m))?;
         let r = 7.0 * self.s();
-        m.points.iter().position(|p| {
-            let q = self.to_screen(*p);
-            (q[0] - x).abs() <= r && (q[1] - y).abs() <= r
+        (0..ring_count(m)).find_map(|ri| {
+            ring(m, ri)
+                .iter()
+                .position(|p| {
+                    let q = self.to_screen(*p);
+                    (q[0] - x).abs() <= r && (q[1] - y).abs() <= r
+                })
+                .map(|i| (ri, i))
         })
+    }
+
+    /// Index of the selected area's cut-out under (x, y).
+    fn hole_at(&self, id: u64, x: f32, y: f32) -> Option<usize> {
+        let p = self.page_pt(x, y);
+        let m = self.takeoff.items.iter().find(|m| m.id == id)?;
+        m.holes.iter().position(|h| takeoff::point_in_polygon(p, h))
     }
 
     /// Topmost editable measurement whose label or body is under (x, y).
@@ -824,8 +1008,8 @@ impl App {
             return false;
         }
         let start = self.page_pt(x, y);
-        if let (Some(index), Some(m)) = (self.handle_at(x, y), self.selected_measure()) {
-            self.edit = Some(EditDrag::Vertex { orig: m.clone(), index, moved: false });
+        if let (Some((ring, index)), Some(m)) = (self.handle_at(x, y), self.selected_measure()) {
+            self.edit = Some(EditDrag::Vertex { orig: m.clone(), ring, index, moved: false });
             return true;
         }
         let Some((id, on_label)) = self.measure_at(x, y) else { return false };
@@ -848,6 +1032,7 @@ impl App {
         let shift = Self::shift_down();
         // A count's label starts just above its first marker.
         let count_lift = [0.0, -20.0 * self.s() / self.view.zoom];
+        let snapped = self.snap_pt(p).0;
         let Some(edit) = self.edit.as_mut() else { return false };
         // Work out the edited measurement, or None if still within the
         // click slop (so a plain click doesn't nudge anything).
@@ -857,24 +1042,25 @@ impl App {
                 (*moved || dx.hypot(dy) >= slop).then(|| {
                     *moved = true;
                     let mut m = orig.clone();
-                    for q in &mut m.points {
+                    for q in m.points.iter_mut().chain(m.holes.iter_mut().flatten()) {
                         q[0] += dx;
                         q[1] += dy;
                     }
                     m
                 })
             }
-            EditDrag::Vertex { orig, index, moved } => {
-                let i = *index;
-                // Shift keeps the point square to its neighbour.
-                let target = match (shift, i.checked_sub(1).and_then(|j| orig.points.get(j))) {
+            EditDrag::Vertex { orig, ring: r, index, moved } => {
+                let (r, i) = (*r, *index);
+                let pts = ring(orig, r);
+                // Shift keeps the point square to its neighbour; otherwise snap.
+                let target = match (shift, i.checked_sub(1).and_then(|j| pts.get(j))) {
                     (true, Some(prev)) if orig.kind != Kind::Count => takeoff::ortho(*prev, p),
-                    _ => p,
+                    _ => snapped,
                 };
-                (*moved || takeoff::dist(target, orig.points[i]) >= slop as f64).then(|| {
+                (*moved || takeoff::dist(target, pts[i]) >= slop as f64).then(|| {
                     *moved = true;
                     let mut m = orig.clone();
-                    m.points[i] = target;
+                    ring_mut(&mut m, r)[i] = target;
                     m
                 })
             }
@@ -924,11 +1110,16 @@ impl App {
             (Some(_), Some(id)) => id,
             _ => match self.measure_at(x, y) {
                 Some((id, _)) => id,
-                None => return false,
+                // Right-click inside a selected area's cut-out.
+                None => match self.selected.filter(|id| self.hole_at(*id, x, y).is_some()) {
+                    Some(id) => id,
+                    None => return false,
+                },
             },
         };
+        let hole = self.hole_at(id, x, y);
         self.selected = Some(id);
-        self.pending_menu = Some(MenuKind::Context { id, vertex });
+        self.pending_menu = Some(MenuKind::Context { id, vertex, hole });
         self.invalidate();
         true
     }
@@ -1069,7 +1260,15 @@ impl App {
                 self.pending_pts.clear();
                 self.invalidate();
             }
-            VK_ESCAPE if self.tool != Tool::Select => self.set_tool(Tool::Select),
+            VK_ESCAPE if self.tool != Tool::Select => {
+                let keep = match self.tool {
+                    Tool::Cutout(id) => Some(id),
+                    _ => None,
+                };
+                self.status = None;
+                self.set_tool(Tool::Select);
+                self.selected = keep;
+            }
             VK_ESCAPE if self.selected.is_some() => {
                 self.selected = None;
                 self.invalidate();
@@ -1080,6 +1279,9 @@ impl App {
             _ if letter(b'A') => self.set_tool(Tool::Measure(Kind::Area)),
             _ if letter(b'C') => self.set_tool(Tool::Measure(Kind::Count)),
             _ if letter(b'V') => self.set_tool(Tool::Select),
+            _ if letter(b'U') => self.set_tool(Tool::Volume),
+            _ if letter(b'X') => self.start_cutout(),
+            _ if letter(b'S') => self.toggle_snap(),
             _ if letter(b'Q') => {
                 self.show_qty = !self.show_qty;
                 self.invalidate();
@@ -1142,6 +1344,27 @@ impl App {
                 }
                 self.save_takeoff();
             }
+            PromptFor::Depth { id } => match takeoff::parse_len(&p.text) {
+                Some(d) => {
+                    if let Some(before) = self.takeoff.items.iter().find(|m| m.id == id).cloned() {
+                        if let Some(m) = self.takeoff.get_mut(id) {
+                            m.depth_in = Some(d);
+                        }
+                        // Fold the area into the undo step that created it, if any.
+                        self.undo.push(Undo::Modified(before));
+                        self.last_depth = Some(p.text.trim().to_string());
+                        self.save_takeoff();
+                    }
+                }
+                None if p.text.trim().is_empty() => {}
+                None => {
+                    self.prompt = Some(Prompt {
+                        hint: format!("Couldn't read \u{201C}{}\u{201D}. Try 6\", 4 1/2\", 0.5' or 150mm", p.text),
+                        text: String::new(),
+                        ..p
+                    });
+                }
+            },
             PromptFor::RenameLayer(i) => {
                 let new = p.text.trim().to_string();
                 let taken = self.takeoff.layers.iter().enumerate().any(|(j, l)| j != i && l.name == new);
@@ -1184,19 +1407,39 @@ impl App {
     }
 
     fn geometry(&self, screen: &[[f32; 2]], closed: bool) -> Option<ID2D1PathGeometry> {
-        if screen.len() < 2 {
+        self.geometry_rings(&[screen.to_vec()], closed)
+    }
+
+    /// Path with one figure per ring; with the default alternate fill mode,
+    /// inner rings (cut-outs) are left unfilled.
+    fn geometry_rings(&self, rings: &[Vec<[f32; 2]>], closed: bool) -> Option<ID2D1PathGeometry> {
+        if rings.first().is_none_or(|r| r.len() < 2) {
             return None;
         }
         unsafe {
             let factory = self.gfx.ctx.GetFactory().ok()?;
             let geom = factory.CreatePathGeometry().ok()?;
             let sink = geom.Open().ok()?;
-            let pts: Vec<Vector2> = screen.iter().map(|p| v2(*p)).collect();
-            sink.BeginFigure(pts[0], if closed { D2D1_FIGURE_BEGIN_FILLED } else { D2D1_FIGURE_BEGIN_HOLLOW });
-            sink.AddLines(&pts[1..]);
-            sink.EndFigure(if closed { D2D1_FIGURE_END_CLOSED } else { D2D1_FIGURE_END_OPEN });
+            for r in rings.iter().filter(|r| r.len() >= 2) {
+                let pts: Vec<Vector2> = r.iter().map(|p| v2(*p)).collect();
+                sink.BeginFigure(pts[0], if closed { D2D1_FIGURE_BEGIN_FILLED } else { D2D1_FIGURE_BEGIN_HOLLOW });
+                sink.AddLines(&pts[1..]);
+                sink.EndFigure(if closed { D2D1_FIGURE_END_CLOSED } else { D2D1_FIGURE_END_OPEN });
+            }
             sink.Close().ok()?;
             Some(geom)
+        }
+    }
+
+    /// An area with its cut-outs.
+    fn area_shape(&self, m: &Measure, color: u32, fill_alpha: f32, width: f32) {
+        let rings: Vec<Vec<[f32; 2]>> = (0..ring_count(m)).map(|r| ring(m, r).iter().map(|p| self.to_screen(*p)).collect()).collect();
+        let Some(geom) = self.geometry_rings(&rings, true) else { return };
+        unsafe {
+            self.brush.SetColor(&rgb(color, fill_alpha));
+            self.gfx.ctx.FillGeometry(&geom, &self.brush, None);
+            self.brush.SetColor(&rgb(color, 1.0));
+            self.gfx.ctx.DrawGeometry(&geom, &self.brush, width, None);
         }
     }
 
@@ -1280,6 +1523,42 @@ impl App {
         }
     }
 
+    /// The Red-Beam logo (same design as the app icon) at (x, y), `size` px.
+    pub(super) fn draw_logo(&self, x: f32, y: f32, size: f32) {
+        let k = size / 1024.0;
+        let pt = |px: f32, py: f32| [x + px * k, y + py * k];
+        unsafe {
+            let tile = D2D1_ROUNDED_RECT {
+                rect: d2r(&RectF::new(x + 24.0 * k, y + 24.0 * k, x + 1000.0 * k, y + 1000.0 * k)),
+                radiusX: 200.0 * k,
+                radiusY: 200.0 * k,
+            };
+            self.brush.SetColor(&rgb(0x2a2e33, 1.0));
+            self.gfx.ctx.FillRoundedRectangle(&tile, &self.brush);
+        }
+        let (fl_l, fl_r, web_l, web_r, top, top_b, bot_t, bot) = (212.0, 812.0, 432.0, 592.0, 196.0, 356.0, 668.0, 828.0);
+        let beam = |d: f32| -> Vec<[f32; 2]> {
+            [
+                (fl_l, top), (fl_r, top), (fl_r, top_b), (web_r, top_b), (web_r, bot_t), (fl_r, bot_t),
+                (fl_r, bot), (fl_l, bot), (fl_l, bot_t), (web_l, bot_t), (web_l, top_b), (fl_l, top_b),
+            ]
+            .iter()
+            .map(|(a, b)| pt(a + d, b + d))
+            .collect()
+        };
+        for (shape, color) in [(beam(48.0), 0x781412), (beam(0.0), 0xe53935)] {
+            if let Some(g) = self.geometry(&shape, true) {
+                unsafe {
+                    self.brush.SetColor(&rgb(color, 1.0));
+                    self.gfx.ctx.FillGeometry(&g, &self.brush, None);
+                }
+            }
+        }
+        // Highlight on the top flange.
+        let hl = RectF::new(pt(fl_l, top)[0], pt(fl_l, top)[1], pt(fl_r, top + 34.0)[0], pt(fl_r, top + 34.0)[1]);
+        self.fill(&hl, 0xff7864, 1.0);
+    }
+
     /// Measurements on the current sheet, plus the one being drawn.
     pub(super) fn paint_takeoff(&self) {
         let Some(sheet) = self.takeoff_sheet() else { return };
@@ -1297,7 +1576,7 @@ impl App {
                         self.dot(*c, if sel { 8.0 * s } else { 6.0 * s }, color, true);
                     }
                 }
-                Kind::Area => self.polygon(&m.points, true, color, if sel { 0.30 } else { 0.18 }, w),
+                Kind::Area => self.area_shape(m, color, if sel { 0.30 } else { 0.18 }, w),
                 Kind::Length | Kind::Polyline => {
                     self.polygon(&m.points, false, color, 0.0, w);
                     let n = screen.len();
@@ -1317,10 +1596,11 @@ impl App {
                 }
             }
             self.draw_label(m, color, sel);
-            // Editing handles on the selected measurement.
+            // Editing handles on the selected measurement (outline and cut-outs).
             if sel && self.editable(m) {
                 let h = 4.5 * s;
-                for c in &screen {
+                let all: Vec<[f32; 2]> = (0..ring_count(m)).flat_map(|r| ring(m, r).to_vec()).map(|p| self.to_screen(p)).collect();
+                for c in &all {
                     let r = RectF::new(c[0] - h, c[1] - h, c[0] + h, c[1] + h);
                     self.fill(&r, 0xffffff, 1.0);
                     unsafe {
@@ -1341,9 +1621,10 @@ impl App {
         if !(calibrating && pts.len() == 2) {
             pts.push(self.place_pt(mx, my));
         }
-        let (kind, color) = match self.tool {
-            Tool::Measure(k) => (k, self.takeoff.group_color(&self.group)),
-            _ => (Kind::Length, ACCENT),
+        let kind = self.tool.kind().unwrap_or(Kind::Length);
+        let color = match self.tool {
+            Tool::Measure(_) | Tool::Volume => self.takeoff.group_color(&self.group),
+            _ => ACCENT,
         };
         let at = [mx, my - 22.0 * s];
         match kind {
@@ -1379,15 +1660,50 @@ impl App {
             ends: EndStyle::None,
             label_offset: None,
             leader: EndStyle::None,
+            holes: Vec::new(),
+            depth_in: None,
         };
         let mut readout = takeoff::fmt_qty(tmp.qty(scale), units);
         if let Qty::Area { perimeter, .. } = tmp.qty(scale) {
             readout = format!("{readout}  \u{00B7}  perim {}", takeoff::fmt_len(perimeter, units));
         }
+        if let Tool::Cutout(_) = self.tool {
+            readout = format!("cut-out \u{2212}{readout}");
+        }
         if kind != Kind::Length {
             readout.push_str("  \u{2014} Enter / double-click to finish");
         }
         self.readout(&readout, at, color);
+    }
+
+    /// Marker showing what the cursor will snap to.
+    pub(super) fn paint_snap_marker(&self) {
+        let editing_vertex = matches!(self.edit, Some(EditDrag::Vertex { .. }));
+        if self.tool == Tool::Select && !editing_vertex || self.prompt.is_some() {
+            return;
+        }
+        let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
+        if self.in_bar(my) || self.over_tool_ui(mx, my) {
+            return;
+        }
+        let (p, kind) = if editing_vertex { self.snap_pt(self.page_pt(mx, my)) } else { self.place_pt_kind(mx, my) };
+        let Some(kind) = kind else { return };
+        let c = self.to_screen(p);
+        let s = self.s();
+        let h = 6.0 * s;
+        let color = 0x00c853;
+        unsafe {
+            self.brush.SetColor(&rgb(color, 1.0));
+            match kind {
+                SnapKind::Endpoint => {
+                    self.gfx.ctx.DrawRectangle(&d2r(&RectF::new(c[0] - h, c[1] - h, c[0] + h, c[1] + h)), &self.brush, 2.0 * s, None);
+                }
+                SnapKind::OnLine => {
+                    self.line([c[0] - h, c[1] - h], [c[0] + h, c[1] + h], color, 2.0 * s);
+                    self.line([c[0] - h, c[1] + h], [c[0] + h, c[1] - h], color, 2.0 * s);
+                }
+            }
+        }
     }
 
     /// Tool palette, quantities panel and prompt (screen-space UI).
@@ -1399,6 +1715,8 @@ impl App {
                 let active = match b {
                     TBtn::Select => self.tool == Tool::Select,
                     TBtn::Tool(k) => self.tool == Tool::Measure(k),
+                    TBtn::Volume => self.tool == Tool::Volume,
+                    TBtn::Snap => self.snap_on,
                     TBtn::Scale => self.tool == Tool::Calibrate,
                     TBtn::Quantities => self.show_qty,
                     _ => false,
@@ -1463,7 +1781,8 @@ impl App {
             line(&mut y, "No measurements yet.", TEXT_DIM, 0.0);
             line(&mut y, "1. Scale \u{25BE}: pick the sheet scale or calibrate", TEXT_DIM, 0.0);
             line(&mut y, "2. Group \u{25BE}: name what you're measuring", TEXT_DIM, 0.0);
-            line(&mut y, "3. Length (L), Polyline (Y), Area (A), Count (C)", TEXT_DIM, 0.0);
+            line(&mut y, "3. Length (L), Polyline (Y), Area (A), Volume (U), Count (C)", TEXT_DIM, 0.0);
+            line(&mut y, "Snap (S) locks onto line ends and lines; Alt = free", TEXT_DIM, 0.0);
             line(&mut y, "Select (V): drag to move, drag handles to reshape,", TEXT_DIM, 0.0);
             line(&mut y, "drag labels for leaders, right-click for properties", TEXT_DIM, 0.0);
             return;
@@ -1475,13 +1794,15 @@ impl App {
                 continue;
             }
             let (mut len, mut area, mut per, mut count, mut sheets) = (0.0, 0.0, 0.0, 0usize, std::collections::BTreeSet::new());
+            let mut vol = 0.0;
             for m in &items {
                 sheets.insert(m.sheet + 1);
                 match m.qty(self.takeoff.scale(m.sheet)) {
                     Qty::Length(l) => len += l,
-                    Qty::Area { area: a, perimeter } => {
+                    Qty::Area { area: a, perimeter, volume } => {
                         area += a;
                         per += perimeter;
+                        vol += volume.unwrap_or(0.0);
                     }
                     Qty::Count(n) => count += n,
                     Qty::Unscaled => unscaled += 1,
@@ -1498,6 +1819,9 @@ impl App {
             if area > 0.0 {
                 line(&mut y, &format!("Area\t{}", takeoff::fmt_area(area, units)), TEXT, 16.0 * s);
                 line(&mut y, &format!("Perimeter\t{}", takeoff::fmt_len(per, units)), TEXT_DIM, 16.0 * s);
+            }
+            if vol > 0.0 {
+                line(&mut y, &format!("Volume\t{}", takeoff::fmt_volume(vol, units)), TEXT, 16.0 * s);
             }
             if count > 0 {
                 line(&mut y, &format!("Count\t{count} ea"), TEXT, 16.0 * s);

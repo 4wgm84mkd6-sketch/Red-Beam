@@ -134,6 +134,12 @@ pub struct Measure {
     /// Arrowhead where the leader meets the measurement.
     #[serde(default)]
     pub leader: EndStyle,
+    /// Cut-outs subtracted from an area (each a polygon, page DIPs).
+    #[serde(default)]
+    pub holes: Vec<Vec<[f32; 2]>>,
+    /// Depth / thickness for volume (real inches), areas only.
+    #[serde(default)]
+    pub depth_in: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -303,8 +309,10 @@ pub fn point_in_polygon(p: [f32; 2], pts: &[[f32; 2]]) -> bool {
 pub enum Qty {
     /// Real inches.
     Length(f64),
-    /// Real square inches, with perimeter in real inches.
-    Area { area: f64, perimeter: f64 },
+    /// Net real square inches (cut-outs subtracted), perimeter in real
+    /// inches including cut-out edges, and volume in real cubic inches when
+    /// a depth is set.
+    Area { area: f64, perimeter: f64, volume: Option<f64> },
     Count(usize),
     /// Sheet has no scale yet.
     Unscaled,
@@ -319,7 +327,11 @@ impl Measure {
         let k = s.real_in_per_dip;
         match self.kind {
             Kind::Length | Kind::Polyline => Qty::Length(path_len(&self.points) * k),
-            Kind::Area => Qty::Area { area: area(&self.points) * k * k, perimeter: perimeter(&self.points) * k },
+            Kind::Area => {
+                let net = (area(&self.points) - self.holes.iter().map(|h| area(h)).sum::<f64>()).max(0.0) * k * k;
+                let per = (perimeter(&self.points) + self.holes.iter().map(|h| perimeter(h)).sum::<f64>()) * k;
+                Qty::Area { area: net, perimeter: per, volume: self.depth_in.map(|d| net * d) }
+            }
             Kind::Count => unreachable!(),
         }
     }
@@ -389,9 +401,18 @@ pub fn fmt_area(sq_in: f64, units: Units) -> String {
     }
 }
 
+/// Format real cubic inches: cubic yards (concrete, fill) or m³.
+pub fn fmt_volume(cu_in: f64, units: Units) -> String {
+    match units {
+        Units::FeetInches | Units::DecimalFeet => format!("{} CY", group_thousands(cu_in / 46_656.0, 2)),
+        Units::Metric => format!("{} m\u{00B3}", group_thousands(cu_in * 0.0254f64.powi(3), 3)),
+    }
+}
+
 pub fn fmt_qty(q: Qty, units: Units) -> String {
     match q {
         Qty::Length(l) => fmt_len(l, units),
+        Qty::Area { area, volume: Some(v), .. } => format!("{} \u{00B7} {}", fmt_area(area, units), fmt_volume(v, units)),
         Qty::Area { area, .. } => fmt_area(area, units),
         Qty::Count(n) => format!("{n} ea"),
         Qty::Unscaled => "no scale".into(),
@@ -536,7 +557,19 @@ impl Takeoff {
         let id = self.next_id;
         let ends = if matches!(kind, Kind::Length | Kind::Polyline) { self.default_ends } else { EndStyle::None };
         let leader = self.default_leader;
-        self.items.push(Measure { id, sheet, kind, points, group, layer, ends, label_offset: None, leader });
+        self.items.push(Measure {
+            id,
+            sheet,
+            kind,
+            points,
+            group,
+            layer,
+            ends,
+            label_offset: None,
+            leader,
+            holes: Vec::new(),
+            depth_in: None,
+        });
         id
     }
 
@@ -546,7 +579,7 @@ impl Takeoff {
         let mut c = m.clone();
         c.id = self.next_id;
         c.sheet = sheet;
-        for p in &mut c.points {
+        for p in c.points.iter_mut().chain(c.holes.iter_mut().flatten()) {
             p[0] += offset[0];
             p[1] += offset[1];
         }
@@ -601,6 +634,14 @@ impl Takeoff {
             Units::Metric => format!("{:.3}", inches * 0.0254),
             _ => format!("{:.2}", inches / 12.0),
         };
+        let vol_unit = match units {
+            Units::Metric => "m3",
+            _ => "cy",
+        };
+        let vol_num = |cu: f64| match units {
+            Units::Metric => format!("{:.3}", cu * 0.0254f64.powi(3)),
+            _ => format!("{:.2}", cu / 46_656.0),
+        };
         let area_num = |sq: f64| match units {
             Units::Metric => format!("{:.3}", sq * 0.0254 * 0.0254),
             _ => format!("{:.2}", sq / 144.0),
@@ -612,26 +653,32 @@ impl Takeoff {
                 s.to_string()
             }
         };
-        let mut out = String::from("Group,Layer,Sheet,Type,Quantity,Unit,Perimeter,Perimeter unit,Display,Scale,Counted\n");
+        let mut out =
+            String::from("Group,Layer,Sheet,Type,Quantity,Unit,Perimeter,Perimeter unit,Volume,Volume unit,Display,Scale,Counted\n");
         let mut items: Vec<&Measure> = self.items.iter().collect();
         items.sort_by(|a, b| (&a.group, a.sheet, a.id).cmp(&(&b.group, b.sheet, b.id)));
-        // (length in, area sq in, perimeter in, count)
-        let mut totals: BTreeMap<&str, (f64, f64, f64, usize)> = BTreeMap::new();
-        let mut hidden = (0f64, 0f64, 0f64, 0usize);
+        // (length in, area sq in, perimeter in, count, volume cu in)
+        let mut totals: BTreeMap<&str, (f64, f64, f64, usize, f64)> = BTreeMap::new();
+        let mut hidden = (0f64, 0f64, 0f64, 0usize, 0f64);
         for m in &items {
             let scale = self.scale(m.sheet);
             let q = m.qty(scale);
             let counted = self.layer_visible(&m.layer);
             // Items on hidden layers are listed but left out of the totals.
             let t = if counted { totals.entry(m.group.as_str()).or_default() } else { &mut hidden };
+            let mut vol = (String::new(), "");
             let (qty, unit, per, per_unit) = match q {
                 Qty::Length(l) => {
                     t.0 += l;
                     (len_num(l), len_unit, String::new(), "")
                 }
-                Qty::Area { area, perimeter } => {
+                Qty::Area { area, perimeter, volume } => {
                     t.1 += area;
                     t.2 += perimeter;
+                    if let Some(v) = volume {
+                        t.4 += v;
+                        vol = (vol_num(v), vol_unit);
+                    }
                     (area_num(area), area_unit, len_num(perimeter), len_unit)
                 }
                 Qty::Count(n) => {
@@ -641,7 +688,7 @@ impl Takeoff {
                 Qty::Unscaled => (String::new(), "no scale", String::new(), ""),
             };
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 esc(&m.group),
                 esc(&m.layer),
                 esc(&sheet_names(m.sheet)),
@@ -650,14 +697,25 @@ impl Takeoff {
                 unit,
                 per,
                 per_unit,
+                vol.0,
+                vol.1,
                 esc(&fmt_qty(q, units)),
                 esc(&scale.map(|s| s.label.clone()).unwrap_or_default()),
                 if counted { "yes" } else { "no (hidden layer)" }
             ));
         }
-        out.push_str("\nTOTALS (visible layers)\nGroup,Length,Length unit,Area,Area unit,Perimeter,Perimeter unit,Count\n");
-        for (g, (l, a, p, c)) in totals {
-            out.push_str(&format!("{},{},{len_unit},{},{area_unit},{},{len_unit},{c}\n", esc(g), len_num(l), area_num(a), len_num(p)));
+        out.push_str(
+            "\nTOTALS (visible layers)\nGroup,Length,Length unit,Area,Area unit,Perimeter,Perimeter unit,Volume,Volume unit,Count\n",
+        );
+        for (g, (l, a, p, c, v)) in totals {
+            out.push_str(&format!(
+                "{},{},{len_unit},{},{area_unit},{},{len_unit},{},{vol_unit},{c}\n",
+                esc(g),
+                len_num(l),
+                area_num(a),
+                len_num(p),
+                vol_num(v)
+            ));
         }
         out
     }
@@ -721,15 +779,31 @@ mod tests {
             ends: EndStyle::None,
             label_offset: None,
             leader: EndStyle::None,
+            holes: Vec::new(),
+            depth_in: None,
         };
         let m = mk(Kind::Length, vec![[0.0, 0.0], [96.0, 0.0]]);
         assert_eq!(m.qty(Some(&s)), Qty::Length(96.0));
         // A 2" x 1" paper rectangle at 1/8" scale is 16' x 8' = 128 SF, perimeter 48'.
         let mut r = mk(Kind::Area, vec![[0.0, 0.0], [192.0, 0.0], [192.0, 96.0], [0.0, 96.0]]);
         match r.qty(Some(&s)) {
-            Qty::Area { area, perimeter } => {
+            Qty::Area { area, perimeter, volume: None } => {
                 assert!((area / 144.0 - 128.0).abs() < 1e-9);
                 assert!((perimeter / 12.0 - 48.0).abs() < 1e-9);
+            }
+            q => panic!("{q:?}"),
+        }
+        // Cut out a 4' x 4' shaft (0.5" x 0.5" paper) and pour it 6" thick.
+        let mut c = r.clone();
+        c.holes.push(vec![[48.0, 24.0], [96.0, 24.0], [96.0, 72.0], [48.0, 72.0]]);
+        c.depth_in = Some(6.0);
+        match c.qty(Some(&s)) {
+            Qty::Area { area, perimeter, volume: Some(v) } => {
+                assert!((area / 144.0 - 112.0).abs() < 1e-9, "{}", area / 144.0);
+                assert!((perimeter / 12.0 - 64.0).abs() < 1e-9);
+                // 112 SF x 0.5 ft = 56 CF = 2.074 CY
+                assert!((v / 1728.0 - 56.0).abs() < 1e-9);
+                assert_eq!(fmt_qty(c.qty(Some(&s)), Units::FeetInches), "112.0 SF \u{00B7} 2.07 CY");
             }
             q => panic!("{q:?}"),
         }
@@ -769,7 +843,7 @@ mod tests {
         assert!(csv.contains("Flooring,Base,Sheet 2,Length,,no scale"), "{csv}");
         assert!(csv.contains("Flooring,Alt 1,Sheet 1,Area,32.00,sf"), "{csv}");
         assert!(csv.contains("no (hidden layer)"), "{csv}");
-        assert!(csv.contains("Flooring,0.00,ft,128.00,sf,48.00,ft,3"), "{csv}");
+        assert!(csv.contains("Flooring,0.00,ft,128.00,sf,48.00,ft,0.00,cy,3"), "{csv}");
         assert_eq!(t.visible_items().count(), 4);
         let src = t.items.iter().find(|m| m.id == a).unwrap().clone();
         let d = t.duplicate(&src, 2, [5.0, 5.0]);

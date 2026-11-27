@@ -28,6 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::gfx::{self, bitmap_props, GpuChoice};
 use crate::pdfium;
+use crate::snap::SnapIndex;
 use crate::view::RectF;
 
 pub const WM_APP_RESULT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
@@ -62,6 +63,8 @@ pub enum JobKind {
     Base,
     /// A region at exact screen resolution: pixel-sharp when settled.
     Detail,
+    /// Extract the sheet's line work and build a snap index.
+    Geometry,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +116,8 @@ pub enum Msg {
     Cancelled { job: Job, ms: f32 },
     /// PDFium could not be loaded; the pool fell back to the Windows engine.
     EngineFallback(String),
+    /// Snap index for a sheet (or why there isn't one).
+    Snap { job: Job, index: std::result::Result<Sendable<SnapIndex>, String>, ms: f32 },
 }
 
 #[derive(Default)]
@@ -512,10 +517,36 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
             }
             Task::Render(job, parallel, cancel) => {
                 let t0 = Instant::now();
-                let result = match (&wgpu, docs.get_mut(&job.doc_id)) {
-                    (Err(e), _) => Err(e.clone()),
-                    (Ok(_), None) => Ok(None), // document was unloaded meanwhile
-                    (Ok(g), Some(d)) => render_job(g, d, &job, &cancel),
+                // Line-work extraction for snapping (PDFium only).
+                let mut snap: Option<std::result::Result<SnapIndex, String>> = None;
+                let result = if job.kind == JobKind::Geometry {
+                    match docs.get_mut(&job.doc_id) {
+                        Some(DocHandle::Pdfium { doc, sizes }) => {
+                            let size = sizes.get(job.page as usize).copied().unwrap_or((1.0, 1.0));
+                            match doc.line_work(job.page, size, &cancel) {
+                                Ok(Some(segs)) => {
+                                    snap = Some(Ok(SnapIndex::build(&segs, 8.0)));
+                                    Ok(None)
+                                }
+                                Ok(None) => Ok(None),
+                                Err(e) => {
+                                    snap = Some(Err(e));
+                                    Ok(None)
+                                }
+                            }
+                        }
+                        Some(DocHandle::Windows { .. }) => {
+                            snap = Some(Err("snapping needs the PDFium engine (F4)".into()));
+                            Ok(None)
+                        }
+                        None => Ok(None),
+                    }
+                } else {
+                    match (&wgpu, docs.get_mut(&job.doc_id)) {
+                        (Err(e), _) => Err(e.clone()),
+                        (Ok(_), None) => Ok(None), // document was unloaded meanwhile
+                        (Ok(g), Some(d)) => render_job(g, d, &job, &cancel),
+                    }
                 };
                 // GPU reset (driver update / TDR): rebuild this worker's device.
                 if let Err(e) = &result {
@@ -524,7 +555,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                     }
                 }
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
-                let cancelled = matches!(result, Ok(None));
+                let cancelled = matches!(result, Ok(None)) && snap.is_none();
                 {
                     let mut s = shared.m.lock().unwrap();
                     s.in_progress.remove(&job.key());
@@ -544,10 +575,13 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                     }
                     shared.cv.notify_all();
                 }
-                let msg = match result {
+                let msg = match (result, snap) {
+                    (_, Some(index)) => Msg::Snap { job, index: index.map(Sendable), ms },
+                    (result, None) => match result {
                     Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel },
                     Ok(None) => Msg::Cancelled { job, ms },
                     Err(e) => Msg::RenderFailed { job, error: e.message().to_string() },
+                    },
                 };
                 let _ = tx.send(msg);
                 notify(hwnd);

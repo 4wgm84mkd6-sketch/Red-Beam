@@ -24,11 +24,53 @@ static DLL: &[u8] = &[];
 type Doc = *mut c_void;
 type Page = *mut c_void;
 type Bitmap = *mut c_void;
+type Obj = *mut c_void;
+type Seg = *mut c_void;
+
+const OBJ_PATH: c_int = 2;
+const OBJ_FORM: c_int = 5;
+const SEG_MOVETO: c_int = 2;
+/// Stop collecting beyond this many segments (the snap index caps too).
+const MAX_SEGMENTS: usize = 5_000_000;
 
 #[repr(C)]
 struct FsSizeF {
     width: f32,
     height: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FsMatrix {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+/// Affine transform, row-vector convention: p' = p * self.
+#[derive(Clone, Copy)]
+struct Affine([f32; 6]);
+
+impl Affine {
+    /// Apply `self`, then `then`.
+    fn then(self, then: Affine) -> Affine {
+        let (a, b) = (self.0, then.0);
+        Affine([
+            a[0] * b[0] + a[1] * b[2],
+            a[0] * b[1] + a[1] * b[3],
+            a[2] * b[0] + a[3] * b[2],
+            a[2] * b[1] + a[3] * b[3],
+            a[4] * b[0] + a[5] * b[2] + b[4],
+            a[4] * b[1] + a[5] * b[3] + b[5],
+        ])
+    }
+    fn apply(self, x: f32, y: f32) -> [f32; 2] {
+        let m = self.0;
+        [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]
+    }
 }
 
 #[repr(C)]
@@ -65,6 +107,19 @@ pub struct Lib {
     render_start: unsafe extern "system" fn(Bitmap, Page, c_int, c_int, c_int, c_int, c_int, c_int, *mut Pause) -> c_int,
     render_continue: unsafe extern "system" fn(Page, *mut Pause) -> c_int,
     render_close: unsafe extern "system" fn(Page),
+    page_count_objects: unsafe extern "system" fn(Page) -> c_int,
+    page_get_object: unsafe extern "system" fn(Page, c_int) -> Obj,
+    obj_get_type: unsafe extern "system" fn(Obj) -> c_int,
+    obj_get_matrix: unsafe extern "system" fn(Obj, *mut FsMatrix) -> c_int,
+    path_count_segments: unsafe extern "system" fn(Obj) -> c_int,
+    path_get_segment: unsafe extern "system" fn(Obj, c_int) -> Seg,
+    seg_get_point: unsafe extern "system" fn(Seg, *mut f32, *mut f32) -> c_int,
+    seg_get_type: unsafe extern "system" fn(Seg) -> c_int,
+    seg_get_close: unsafe extern "system" fn(Seg) -> c_int,
+    form_count_objects: unsafe extern "system" fn(Obj) -> c_int,
+    form_get_object: unsafe extern "system" fn(Obj, u32) -> Obj,
+    page_to_device:
+        unsafe extern "system" fn(Page, c_int, c_int, c_int, c_int, c_int, f64, f64, *mut c_int, *mut c_int) -> c_int,
 }
 unsafe impl Send for Lib {}
 unsafe impl Sync for Lib {}
@@ -131,6 +186,18 @@ fn load_lib() -> Result<Lib, String> {
             render_start: sym!("FPDF_RenderPageBitmap_Start"),
             render_continue: sym!("FPDF_RenderPage_Continue"),
             render_close: sym!("FPDF_RenderPage_Close"),
+            page_count_objects: sym!("FPDFPage_CountObjects"),
+            page_get_object: sym!("FPDFPage_GetObject"),
+            obj_get_type: sym!("FPDFPageObj_GetType"),
+            obj_get_matrix: sym!("FPDFPageObj_GetMatrix"),
+            path_count_segments: sym!("FPDFPath_CountSegments"),
+            path_get_segment: sym!("FPDFPath_GetPathSegment"),
+            seg_get_point: sym!("FPDFPathSegment_GetPoint"),
+            seg_get_type: sym!("FPDFPathSegment_GetType"),
+            seg_get_close: sym!("FPDFPathSegment_GetClose"),
+            form_count_objects: sym!("FPDFFormObj_CountObjects"),
+            form_get_object: sym!("FPDFFormObj_GetObject"),
+            page_to_device: sym!("FPDF_PageToDevice"),
         };
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (lib.init_library)();
@@ -248,6 +315,85 @@ impl Document {
             }
         }
         Ok(Some(buf))
+    }
+}
+
+impl Document {
+    /// All straight segments of the page's line work in page DIPs (curves
+    /// contribute their chords), for snapping. `Ok(None)` if cancelled.
+    pub fn line_work(&mut self, page: u32, page_size: (f32, f32), cancel: &AtomicBool) -> Result<Option<Vec<[[f32; 2]; 2]>>, String> {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let p = self.page(page)?;
+            let lib = self.lib;
+            // PDF user space -> page DIPs, exactly as rendering maps it
+            // (crop box and rotation), derived from FPDF_PageToDevice at a
+            // large size for sub-pixel precision.
+            const K: f32 = 1000.0;
+            let (w, h) = ((page_size.0.round() * K) as c_int, (page_size.1.round() * K) as c_int);
+            let dev = |x: f64, y: f64| {
+                let (mut dx, mut dy) = (0, 0);
+                (lib.page_to_device)(p, 0, 0, w, h, 0, x, y, &mut dx, &mut dy);
+                [dx as f32 / K, dy as f32 / K]
+            };
+            let (o, ex, ey) = (dev(0.0, 0.0), dev(1000.0, 0.0), dev(0.0, 1000.0));
+            let to_dip = Affine([
+                (ex[0] - o[0]) / 1000.0,
+                (ex[1] - o[1]) / 1000.0,
+                (ey[0] - o[0]) / 1000.0,
+                (ey[1] - o[1]) / 1000.0,
+                o[0],
+                o[1],
+            ]);
+            let mut out: Vec<[[f32; 2]; 2]> = Vec::new();
+            // Explicit stack: (object, transform of its parent form).
+            let mut stack: Vec<(Obj, Affine)> =
+                (0..(lib.page_count_objects)(p)).rev().map(|i| ((lib.page_get_object)(p, i), to_dip)).collect();
+            let mut visited = 0usize;
+            while let Some((obj, parent)) = stack.pop() {
+                visited += 1;
+                if visited.is_multiple_of(4096) && cancel.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                if obj.is_null() || out.len() >= MAX_SEGMENTS {
+                    continue;
+                }
+                let mut m = FsMatrix { a: 1.0, d: 1.0, ..Default::default() };
+                (lib.obj_get_matrix)(obj, &mut m);
+                let mm = Affine([m.a, m.b, m.c, m.d, m.e, m.f]).then(parent);
+                match (lib.obj_get_type)(obj) {
+                    OBJ_PATH => {
+                        let (mut prev, mut start): (Option<[f32; 2]>, Option<[f32; 2]>) = (None, None);
+                        for i in 0..(lib.path_count_segments)(obj) {
+                            let seg = (lib.path_get_segment)(obj, i);
+                            let (mut x, mut y) = (0f32, 0f32);
+                            if seg.is_null() || (lib.seg_get_point)(seg, &mut x, &mut y) == 0 {
+                                continue;
+                            }
+                            let q = mm.apply(x, y);
+                            if (lib.seg_get_type)(seg) == SEG_MOVETO {
+                                start = Some(q);
+                            } else if let Some(a) = prev {
+                                out.push([a, q]);
+                            }
+                            if (lib.seg_get_close)(seg) != 0 {
+                                if let Some(s0) = start {
+                                    out.push([q, s0]);
+                                }
+                            }
+                            prev = Some(q);
+                        }
+                    }
+                    OBJ_FORM => {
+                        for i in (0..(lib.form_count_objects)(obj).max(0) as u32).rev() {
+                            stack.push(((lib.form_get_object)(obj, i), mm));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Some(out))
+        }
     }
 }
 
