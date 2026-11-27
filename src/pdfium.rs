@@ -615,7 +615,7 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<
 
 /// UTF-16LE bytes (with trailing NUL) from a PDFium "get string" call.
 fn utf16_bytes_to_string(buf: &[u8]) -> String {
-    let u: Vec<u16> = buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let u: Vec<u16> = buf.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     String::from_utf16_lossy(&u).trim_end_matches('\0').trim().to_string()
 }
 
