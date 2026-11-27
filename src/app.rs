@@ -20,7 +20,7 @@ use windows_numerics::Matrix3x2;
 mod panel;
 mod tools;
 
-pub use tools::{MenuItem, MenuKind};
+pub use tools::{ExportKind, MenuItem, MenuKind};
 use tools::{EditDrag, Prompt, TBtn, Tool, Undo};
 
 use crate::gfx::{self, Gfx};
@@ -275,7 +275,7 @@ pub struct App {
     /// Where the left button went down (click vs drag).
     down_at: Option<(i32, i32)>,
     pub pending_menu: Option<MenuKind>,
-    pub pending_export: bool,
+    pub pending_export: Option<ExportKind>,
 
     update: UpdState,
     upd_tx: Sender<UpdateMsg>,
@@ -498,7 +498,7 @@ impl App {
             tool_hover: None,
             down_at: None,
             pending_menu: None,
-            pending_export: false,
+            pending_export: None,
             update: if settings.check_updates { UpdState::Checking } else { UpdState::Idle },
             settings,
             upd_tx,

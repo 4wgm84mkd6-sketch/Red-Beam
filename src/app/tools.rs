@@ -16,6 +16,42 @@ use windows_numerics::Vector2;
 use super::{d2r, rgb, App, CmpMode, ACCENT, BTN_BG, TEXT, TEXT_DIM};
 use crate::snap::SnapKind;
 use crate::takeoff::{self, EndStyle, Kind, Layer, Measure, Qty, Scale, Takeoff, Units, DEFAULT_LAYER, SCALES};
+
+/// Which unit price a prompt edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriceKind {
+    Lf,
+    Sf,
+    Cy,
+    Ea,
+}
+
+impl PriceKind {
+    fn unit(self) -> &'static str {
+        match self {
+            PriceKind::Lf => "LF",
+            PriceKind::Sf => "SF",
+            PriceKind::Cy => "CY",
+            PriceKind::Ea => "EA",
+        }
+    }
+}
+
+/// Export formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportKind {
+    Excel,
+    Csv,
+}
+
+/// Parse a typed price: `3.25`, `$3.25`, `1,250` (blank clears).
+fn parse_money(s: &str) -> Option<Option<f64>> {
+    let t: String = s.chars().filter(|c| !matches!(c, '$' | ',' | ' ')).collect();
+    if t.is_empty() {
+        return Some(None);
+    }
+    t.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0).map(Some)
+}
 use crate::view::RectF;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +99,7 @@ pub enum MenuKind {
     Group,
     Layer,
     Units,
+    Export,
     /// Right-click on a measurement: maybe on one of its points
     /// (ring 0 = outline, ring k = cut-out k-1) or inside a cut-out.
     Context { id: u64, vertex: Option<(usize, usize)>, hole: Option<usize> },
@@ -79,6 +116,10 @@ pub enum PromptFor {
     RenameLayer(usize),
     /// Depth / thickness for an area's volume.
     Depth { id: u64 },
+    Price { group: usize, kind: PriceKind },
+    RenameGroup(usize),
+    Slope { id: u64 },
+    WallHeight { id: u64 },
 }
 
 pub struct Prompt {
@@ -97,6 +138,8 @@ pub enum Undo {
     AllScales(std::collections::BTreeMap<u32, Scale>),
     /// Items and layers before a layer rename/delete.
     Layers(Vec<Measure>, Vec<Layer>),
+    /// Items and groups before a group rename.
+    Groups(Vec<Measure>, Vec<takeoff::Group>),
 }
 
 /// A drag in progress with the Select tool.
@@ -126,6 +169,18 @@ const CMD_ADD_CUTOUT: usize = 910;
 const CMD_REMOVE_CUTOUT: usize = 911;
 const CMD_SET_DEPTH: usize = 912;
 const CMD_CLEAR_DEPTH: usize = 913;
+const CMD_SET_SLOPE: usize = 914;
+const CMD_CLEAR_SLOPE: usize = 915;
+const CMD_SET_HEIGHT: usize = 916;
+const CMD_CLEAR_HEIGHT: usize = 917;
+const CMD_EXPORT_XLSX: usize = 918;
+const CMD_EXPORT_CSV: usize = 919;
+const CMD_GROUP_ACTIVE: usize = 10_000;
+const CMD_GROUP_RENAME: usize = 11_000;
+const CMD_PRICE_LF: usize = 12_000;
+const CMD_PRICE_SF: usize = 13_000;
+const CMD_PRICE_CY: usize = 14_000;
+const CMD_PRICE_EA: usize = 15_000;
 const CMD_SET_GROUP: usize = 1000;
 const CMD_SET_LAYER: usize = 2000;
 const CMD_ENDS: usize = 3000;
@@ -420,7 +475,7 @@ impl App {
                 if self.takeoff.items.is_empty() {
                     self.pending_info = Some("There are no measurements to export yet.".into());
                 } else {
-                    self.pending_export = true;
+                    self.pending_menu = Some(MenuKind::Export);
                 }
             }
         }
@@ -449,12 +504,30 @@ impl App {
                 v
             }
             MenuKind::Group => {
+                let money = |v: Option<f64>| v.map(takeoff::fmt_money).unwrap_or_else(|| "\u{2014}".into());
                 let mut v: Vec<MenuItem> = self
                     .takeoff
                     .groups
                     .iter()
                     .enumerate()
-                    .map(|(i, g)| item(CMD_SET_GROUP + i, g.name.clone(), g.name == self.group))
+                    .map(|(i, g)| {
+                        let p = g.prices;
+                        let mut m = submenu(
+                            g.name.clone(),
+                            vec![
+                                item(CMD_GROUP_ACTIVE + i, "Measure with this group", g.name == self.group),
+                                sep(),
+                                item(CMD_PRICE_LF + i, format!("Price per LF: {}\u{2026}", money(p.per_lf)), false),
+                                item(CMD_PRICE_SF + i, format!("Price per SF (areas, walls): {}\u{2026}", money(p.per_sf)), false),
+                                item(CMD_PRICE_CY + i, format!("Price per CY: {}\u{2026}", money(p.per_cy)), false),
+                                item(CMD_PRICE_EA + i, format!("Price per EA: {}\u{2026}", money(p.per_ea)), false),
+                                sep(),
+                                item(CMD_GROUP_RENAME + i, "Rename\u{2026}", false),
+                            ],
+                        );
+                        m.checked = g.name == self.group;
+                        m
+                    })
                     .collect();
                 if !v.is_empty() {
                     v.push(sep());
@@ -498,6 +571,10 @@ impl App {
                 v.push(item(CMD_NEW_LAYER, "New layer\u{2026}", false));
                 v
             }
+            MenuKind::Export => vec![
+                item(CMD_EXPORT_XLSX, "Excel workbook (.xlsx) \u{2014} summary, costs, by sheet, items\u{2026}", false),
+                item(CMD_EXPORT_CSV, "CSV (.csv)\u{2026}", false),
+            ],
             MenuKind::Units => vec![
                 item(CMD_BASE, "Feet-inches (12'-6 1/4\") and SF", self.takeoff.units == Units::FeetInches),
                 item(CMD_BASE + 1, "Decimal feet (12.52') and SF", self.takeoff.units == Units::DecimalFeet),
@@ -528,6 +605,27 @@ impl App {
                     v.push(submenu(format!("Line ends: {}", m.ends.name()), Self::style_items(CMD_ENDS, m.ends)));
                 }
                 v.push(submenu(format!("Leader: {}", m.leader.name()), Self::style_items(CMD_LEADER, m.leader)));
+                if m.kind != Kind::Count {
+                    v.push(sep());
+                    let slope = match m.slope {
+                        Some(r) => format!("Slope: {}\u{2026}", takeoff::fmt_slope(r)),
+                        None => "Slope / pitch (roofs, ramps)\u{2026}".into(),
+                    };
+                    v.push(item(CMD_SET_SLOPE, slope, false));
+                    if m.slope.is_some() {
+                        v.push(item(CMD_CLEAR_SLOPE, "Remove slope", false));
+                    }
+                }
+                if matches!(m.kind, Kind::Length | Kind::Polyline) {
+                    let h = match m.height_in {
+                        Some(h) => format!("Wall height: {}\u{2026}", takeoff::fmt_len(h, self.takeoff.units)),
+                        None => "Wall height (adds wall area)\u{2026}".into(),
+                    };
+                    v.push(item(CMD_SET_HEIGHT, h, false));
+                    if m.height_in.is_some() {
+                        v.push(item(CMD_CLEAR_HEIGHT, "Remove wall height", false));
+                    }
+                }
                 if m.label_offset.is_some() {
                     v.push(item(CMD_RESET_LABEL, "Put label back on the measurement", false));
                 }
@@ -590,11 +688,12 @@ impl App {
                     self.save_takeoff();
                 }
             }
-            MenuKind::Group => {
-                if cmd == CMD_NEW_GROUP {
-                    self.ask_new_group(None);
-                } else if let Some(g) = self.takeoff.groups.get(cmd.wrapping_sub(CMD_SET_GROUP)) {
-                    self.group = g.name.clone();
+            MenuKind::Group => self.group_menu(cmd),
+            MenuKind::Export => {
+                self.pending_export = match cmd {
+                    CMD_EXPORT_XLSX => Some(ExportKind::Excel),
+                    CMD_EXPORT_CSV => Some(ExportKind::Csv),
+                    _ => None,
                 }
             }
             MenuKind::Layer => self.layer_menu(cmd),
@@ -609,6 +708,41 @@ impl App {
             MenuKind::Context { id, vertex, hole } => self.context_menu(id, vertex, hole, cmd),
         }
         self.invalidate();
+    }
+
+    fn group_menu(&mut self, cmd: usize) {
+        let n = self.takeoff.groups.len();
+        let idx = |base: usize| cmd.checked_sub(base).filter(|i| *i < n);
+        if cmd == CMD_NEW_GROUP {
+            self.ask_new_group(None);
+        } else if let Some(i) = idx(CMD_GROUP_ACTIVE) {
+            self.group = self.takeoff.groups[i].name.clone();
+        } else if let Some(i) = idx(CMD_GROUP_RENAME) {
+            self.prompt = Some(Prompt {
+                title: format!("Rename group \u{201C}{}\u{201D}", self.takeoff.groups[i].name),
+                hint: "New name".into(),
+                text: self.takeoff.groups[i].name.clone(),
+                purpose: PromptFor::RenameGroup(i),
+            });
+        } else {
+            for (base, kind) in [(CMD_PRICE_LF, PriceKind::Lf), (CMD_PRICE_SF, PriceKind::Sf), (CMD_PRICE_CY, PriceKind::Cy), (CMD_PRICE_EA, PriceKind::Ea)] {
+                if let Some(i) = idx(base) {
+                    let g = &self.takeoff.groups[i];
+                    let cur = match kind {
+                        PriceKind::Lf => g.prices.per_lf,
+                        PriceKind::Sf => g.prices.per_sf,
+                        PriceKind::Cy => g.prices.per_cy,
+                        PriceKind::Ea => g.prices.per_ea,
+                    };
+                    self.prompt = Some(Prompt {
+                        title: format!("{} \u{2014} price per {}", g.name, kind.unit()),
+                        hint: format!("Dollars per {} (e.g. 3.25). Leave blank to clear.", kind.unit()),
+                        text: cur.map(|v| format!("{v:.2}")).unwrap_or_default(),
+                        purpose: PromptFor::Price { group: i, kind },
+                    });
+                }
+            }
+        }
     }
 
     fn ask_new_group(&mut self, assign: Option<u64>) {
@@ -700,6 +834,26 @@ impl App {
                 return self.start_cutout();
             }
             CMD_SET_DEPTH => return self.ask_depth(id),
+            CMD_SET_SLOPE => {
+                let text = before.slope.map(takeoff::fmt_slope).unwrap_or_default();
+                self.prompt = Some(Prompt {
+                    title: "Slope / pitch".into(),
+                    hint: "Rise per 12 (6 or 6:12), a ramp ratio (1:12), degrees (26.6\u{00B0}) or percent (8.33%)".into(),
+                    text,
+                    purpose: PromptFor::Slope { id },
+                });
+                return;
+            }
+            CMD_SET_HEIGHT => {
+                let text = before.height_in.map(|h| takeoff::fmt_len(h, Units::FeetInches)).unwrap_or_default();
+                self.prompt = Some(Prompt {
+                    title: "Wall height".into(),
+                    hint: "e.g. 9'-0\", 10', 2.7m \u{2014} adds wall area (priced per SF)".into(),
+                    text,
+                    purpose: PromptFor::WallHeight { id },
+                });
+                return;
+            }
             CMD_NEW_GROUP => return self.ask_new_group(Some(id)),
             CMD_NEW_LAYER => return self.ask_new_layer(Some(id)),
             CMD_DUPLICATE => {
@@ -744,6 +898,10 @@ impl App {
             }
         } else if cmd == CMD_CLEAR_DEPTH {
             m.depth_in = None;
+        } else if cmd == CMD_CLEAR_SLOPE {
+            m.slope = None;
+        } else if cmd == CMD_CLEAR_HEIGHT {
+            m.height_in = None;
         } else {
             return;
         }
@@ -761,7 +919,32 @@ impl App {
         self.save_takeoff();
     }
 
-    pub fn export_csv(&mut self, path: PathBuf) {
+    /// Write the takeoff in the chosen format.
+    pub fn export(&mut self, kind: ExportKind, path: PathBuf) {
+        match kind {
+            ExportKind::Csv => self.export_csv(path),
+            ExportKind::Excel => {
+                let title = self
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d.path.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Takeoff".into());
+                match crate::xlsx::write(&self.takeoff, &path, &title, &|i| format!("Sheet {}", i + 1)) {
+                    Ok(()) => {
+                        self.pending_info = Some(format!(
+                            "Exported {} measurements to\n{}\n\nTabs: Summary (with unit prices and live cost formulas), By sheet, Items.",
+                            self.takeoff.items.len(),
+                            path.display()
+                        ))
+                    }
+                    Err(e) => self.pending_error = Some(format!("Could not write {}:\n{e}", path.display())),
+                }
+            }
+        }
+    }
+
+    fn export_csv(&mut self, path: PathBuf) {
         let csv = self.takeoff.to_csv(&|i| format!("Sheet {}", i + 1));
         // UTF-8 BOM so Excel shows ², ° etc. correctly.
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
@@ -775,14 +958,17 @@ impl App {
         }
     }
 
-    pub fn export_default_name(&self) -> String {
+    pub fn export_default_name(&self, kind: ExportKind) -> String {
         let stem = self
             .doc
             .as_ref()
             .and_then(|d| d.path.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "takeoff".into());
-        format!("{stem} takeoff.csv")
+        match kind {
+            ExportKind::Excel => format!("{stem} takeoff.xlsx"),
+            ExportKind::Csv => format!("{stem} takeoff.csv"),
+        }
     }
 
     // ------------------------------------------------------------- input
@@ -948,10 +1134,18 @@ impl App {
     }
 
     fn label_text(&self, m: &Measure) -> String {
-        match m.kind {
+        let scale = self.takeoff.scale(m.sheet);
+        let mut t = match m.kind {
             Kind::Count => format!("{} \u{00D7}{}", m.group, m.points.len()),
-            _ => takeoff::fmt_qty(m.qty(self.takeoff.scale(m.sheet)), self.takeoff.units),
+            _ => takeoff::fmt_qty(m.qty(scale), self.takeoff.units),
+        };
+        if let Some(w) = m.wall_area(scale) {
+            t.push_str(&format!(" \u{00B7} {} wall", takeoff::fmt_area(w, self.takeoff.units)));
         }
+        if let Some(r) = m.slope {
+            t.push_str(&format!(" @ {}", takeoff::fmt_slope(r)));
+        }
+        t
     }
 
     fn text_width(&self, text: &str) -> f32 {
@@ -1212,6 +1406,13 @@ impl App {
                 self.takeoff.scales.remove(&sheet);
             }
             Undo::AllScales(all) => self.takeoff.scales = all,
+            Undo::Groups(items, groups) => {
+                self.takeoff.items = items;
+                self.takeoff.groups = groups;
+                if !self.takeoff.groups.iter().any(|g| g.name == self.group) {
+                    self.group = self.takeoff.groups.first().map(|g| g.name.clone()).unwrap_or_else(|| "General".into());
+                }
+            }
             Undo::Layers(items, layers) => {
                 self.takeoff.items = items;
                 self.takeoff.layers = layers;
@@ -1366,6 +1567,75 @@ impl App {
                     });
                 }
             },
+            PromptFor::Price { group, kind } => match parse_money(&p.text) {
+                Some(v) => {
+                    if let Some(g) = self.takeoff.groups.get_mut(group) {
+                        let slot = match kind {
+                            PriceKind::Lf => &mut g.prices.per_lf,
+                            PriceKind::Sf => &mut g.prices.per_sf,
+                            PriceKind::Cy => &mut g.prices.per_cy,
+                            PriceKind::Ea => &mut g.prices.per_ea,
+                        };
+                        *slot = v;
+                        self.show_qty = true;
+                        self.save_takeoff();
+                    }
+                }
+                None => {
+                    self.prompt = Some(Prompt {
+                        hint: format!("Couldn't read \u{201C}{}\u{201D}. Type a number like 3.25 (blank clears)", p.text),
+                        text: String::new(),
+                        ..p
+                    })
+                }
+            },
+            PromptFor::RenameGroup(i) => {
+                let new = p.text.trim().to_string();
+                let taken = self.takeoff.groups.iter().enumerate().any(|(j, g)| j != i && g.name == new);
+                if !new.is_empty() && !taken && i < self.takeoff.groups.len() {
+                    self.undo.push(Undo::Groups(self.takeoff.items.clone(), self.takeoff.groups.clone()));
+                    let old = std::mem::replace(&mut self.takeoff.groups[i].name, new.clone());
+                    for m in self.takeoff.items.iter_mut().filter(|m| m.group == old) {
+                        m.group = new.clone();
+                    }
+                    if self.group == old {
+                        self.group = new;
+                    }
+                    self.save_takeoff();
+                }
+            }
+            PromptFor::Slope { id } => {
+                let parsed = takeoff::parse_slope(&p.text);
+                if parsed.is_none() && !p.text.trim().is_empty() {
+                    self.prompt = Some(Prompt {
+                        hint: format!("Couldn't read \u{201C}{}\u{201D}. Try 6, 6:12, 1:12, 26.6\u{00B0} or 8.33%", p.text),
+                        text: String::new(),
+                        ..p
+                    });
+                } else if let Some(before) = self.takeoff.items.iter().find(|m| m.id == id).cloned() {
+                    if let Some(m) = self.takeoff.get_mut(id) {
+                        m.slope = parsed;
+                    }
+                    self.undo.push(Undo::Modified(before));
+                    self.save_takeoff();
+                }
+            }
+            PromptFor::WallHeight { id } => {
+                let parsed = takeoff::parse_len(&p.text);
+                if parsed.is_none() && !p.text.trim().is_empty() {
+                    self.prompt = Some(Prompt {
+                        hint: format!("Couldn't read \u{201C}{}\u{201D}. Try 9'-0\", 10' or 2.7m", p.text),
+                        text: String::new(),
+                        ..p
+                    });
+                } else if let Some(before) = self.takeoff.items.iter().find(|m| m.id == id).cloned() {
+                    if let Some(m) = self.takeoff.get_mut(id) {
+                        m.height_in = parsed;
+                    }
+                    self.undo.push(Undo::Modified(before));
+                    self.save_takeoff();
+                }
+            }
             PromptFor::RenameLayer(i) => {
                 let new = p.text.trim().to_string();
                 let taken = self.takeoff.layers.iter().enumerate().any(|(j, l)| j != i && l.name == new);
@@ -1663,6 +1933,8 @@ impl App {
             leader: EndStyle::None,
             holes: Vec::new(),
             depth_in: None,
+            slope: None,
+            height_in: None,
         };
         let mut readout = takeoff::fmt_qty(tmp.qty(scale), units);
         if let Qty::Area { perimeter, .. } = tmp.qty(scale) {
@@ -1789,45 +2061,42 @@ impl App {
             return;
         }
         let mut unscaled = 0usize;
-        for g in &self.takeoff.groups {
-            let items: Vec<&Measure> = self.takeoff.visible_items().filter(|m| m.group == g.name).collect();
-            if items.is_empty() {
-                continue;
-            }
-            let (mut len, mut area, mut per, mut count, mut sheets) = (0.0, 0.0, 0.0, 0usize, std::collections::BTreeSet::new());
-            let mut vol = 0.0;
-            for m in &items {
-                sheets.insert(m.sheet + 1);
-                match m.qty(self.takeoff.scale(m.sheet)) {
-                    Qty::Length(l) => len += l,
-                    Qty::Area { area: a, perimeter, volume } => {
-                        area += a;
-                        per += perimeter;
-                        vol += volume.unwrap_or(0.0);
-                    }
-                    Qty::Count(n) => count += n,
-                    Qty::Unscaled => unscaled += 1,
-                }
-            }
+        let (mut grand, mut any_price) = (0.0, false);
+        for (g, t) in self.takeoff.group_totals() {
+            unscaled += t.unscaled;
             if y + 22.0 * s < panel.b {
                 self.fill(&RectF::new(x0, y + 5.0 * s, x0 + 10.0 * s, y + 15.0 * s), g.color, 1.0);
             }
-            let sheet_list: Vec<String> = sheets.iter().map(|n| n.to_string()).collect();
-            line(&mut y, &format!("{}   ({} items, sheets {})", g.name, items.len(), sheet_list.join(", ")), TEXT, 16.0 * s);
-            if len > 0.0 {
-                line(&mut y, &format!("Length\t{}", takeoff::fmt_len(len, units)), TEXT, 16.0 * s);
+            let sheet_list: Vec<String> = t.sheets.iter().map(|n| (n + 1).to_string()).collect();
+            line(&mut y, &format!("{}   ({} items, sheets {})", g.name, t.items, sheet_list.join(", ")), TEXT, 16.0 * s);
+            if t.len > 0.0 {
+                line(&mut y, &format!("Length\t{}", takeoff::fmt_len(t.len, units)), TEXT, 16.0 * s);
             }
-            if area > 0.0 {
-                line(&mut y, &format!("Area\t{}", takeoff::fmt_area(area, units)), TEXT, 16.0 * s);
-                line(&mut y, &format!("Perimeter\t{}", takeoff::fmt_len(per, units)), TEXT_DIM, 16.0 * s);
+            if t.wall > 0.0 {
+                line(&mut y, &format!("Wall area\t{}", takeoff::fmt_area(t.wall, units)), TEXT, 16.0 * s);
             }
-            if vol > 0.0 {
-                line(&mut y, &format!("Volume\t{}", takeoff::fmt_volume(vol, units)), TEXT, 16.0 * s);
+            if t.area > 0.0 {
+                line(&mut y, &format!("Area\t{}", takeoff::fmt_area(t.area, units)), TEXT, 16.0 * s);
+                line(&mut y, &format!("Perimeter\t{}", takeoff::fmt_len(t.perimeter, units)), TEXT_DIM, 16.0 * s);
             }
-            if count > 0 {
-                line(&mut y, &format!("Count\t{count} ea"), TEXT, 16.0 * s);
+            if t.vol > 0.0 {
+                line(&mut y, &format!("Volume\t{}", takeoff::fmt_volume(t.vol, units)), TEXT, 16.0 * s);
+            }
+            if t.count > 0 {
+                line(&mut y, &format!("Count\t{} ea", t.count), TEXT, 16.0 * s);
+            }
+            if t.priced {
+                line(&mut y, &format!("Cost\t{}", takeoff::fmt_money(t.cost)), 0x81c784, 16.0 * s);
+                grand += t.cost;
+                any_price = true;
             }
             y += 6.0 * s;
+        }
+        if any_price {
+            line(&mut y, &format!("TOTAL COST\t{}", takeoff::fmt_money(grand)), 0x81c784, 0.0);
+            y += 4.0 * s;
+        } else {
+            line(&mut y, "Add unit prices from Group \u{25BE} to see costs", TEXT_DIM, 0.0);
         }
         if unscaled > 0 {
             line(&mut y, &format!("\u{26A0} {unscaled} measurement(s) on sheets without a scale"), 0xffb74d, 0.0);

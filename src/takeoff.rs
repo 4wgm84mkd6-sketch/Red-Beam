@@ -65,6 +65,34 @@ pub struct Group {
     pub name: String,
     /// 0xRRGGBB
     pub color: u32,
+    #[serde(default)]
+    pub prices: Prices,
+}
+
+/// Unit prices for a group, in dollars per LF / SF / CY / EA. Wall areas
+/// are priced per SF.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Prices {
+    pub per_lf: Option<f64>,
+    pub per_sf: Option<f64>,
+    pub per_cy: Option<f64>,
+    pub per_ea: Option<f64>,
+}
+
+/// Totals for a set of measurements (real inches, sq in, cu in).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Totals {
+    pub len: f64,
+    pub area: f64,
+    pub perimeter: f64,
+    pub wall: f64,
+    pub vol: f64,
+    pub count: usize,
+    pub cost: f64,
+    pub priced: bool,
+    pub items: usize,
+    pub unscaled: usize,
+    pub sheets: std::collections::BTreeSet<u32>,
 }
 
 /// Arrowheads / caps for line ends and label leaders.
@@ -140,6 +168,13 @@ pub struct Measure {
     /// Depth / thickness for volume (real inches), areas only.
     #[serde(default)]
     pub depth_in: Option<f64>,
+    /// Slope as rise per 12 of run (roofs, ramps): lengths and areas are
+    /// measured in plan and multiplied up to their true sloped size.
+    #[serde(default)]
+    pub slope: Option<f64>,
+    /// Wall height (real inches) for lengths: adds a wall area.
+    #[serde(default)]
+    pub height_in: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -326,13 +361,29 @@ impl Measure {
         let Some(s) = scale else { return Qty::Unscaled };
         let k = s.real_in_per_dip;
         match self.kind {
-            Kind::Length | Kind::Polyline => Qty::Length(path_len(&self.points) * k),
+            Kind::Length | Kind::Polyline => Qty::Length(path_len(&self.points) * k * self.slope_factor()),
             Kind::Area => {
-                let net = (area(&self.points) - self.holes.iter().map(|h| area(h)).sum::<f64>()).max(0.0) * k * k;
+                let net = (area(&self.points) - self.holes.iter().map(|h| area(h)).sum::<f64>()).max(0.0)
+                    * k
+                    * k
+                    * self.slope_factor();
                 let per = (perimeter(&self.points) + self.holes.iter().map(|h| perimeter(h)).sum::<f64>()) * k;
                 Qty::Area { area: net, perimeter: per, volume: self.depth_in.map(|d| net * d) }
             }
             Kind::Count => unreachable!(),
+        }
+    }
+
+    /// True-length multiplier for a slope given as rise per 12.
+    pub fn slope_factor(&self) -> f64 {
+        self.slope.map(|r| (1.0 + (r / 12.0).powi(2)).sqrt()).unwrap_or(1.0)
+    }
+
+    /// Wall area (real sq in) for a length with a wall height.
+    pub fn wall_area(&self, scale: Option<&Scale>) -> Option<f64> {
+        match (self.qty(scale), self.height_in) {
+            (Qty::Length(l), Some(h)) => Some(l * h),
+            _ => None,
         }
     }
 
@@ -496,6 +547,42 @@ pub fn parse_len(input: &str) -> Option<f64> {
     (v > 0.0 && v.is_finite()).then_some(v)
 }
 
+/// Parse a slope into rise per 12 of run: `6` or `6:12` or `6/12` (pitch),
+/// `4:12`, `1:20` (ramp), `26.57°` / `26.57 deg`, or `8.33%`.
+pub fn parse_slope(input: &str) -> Option<f64> {
+    let s = input.trim().to_lowercase().replace(' ', "");
+    if s.is_empty() {
+        return None;
+    }
+    let v = if let Some(d) = s.strip_suffix('\u{00B0}').or_else(|| s.strip_suffix("deg")) {
+        let deg: f64 = d.parse().ok()?;
+        (deg > 0.0 && deg < 89.0).then(|| deg.to_radians().tan() * 12.0)?
+    } else if let Some(p) = s.strip_suffix('%') {
+        p.parse::<f64>().ok()? / 100.0 * 12.0
+    } else if let Some((a, b)) = s.split_once([':', '/']) {
+        let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
+        (b > 0.0).then(|| a / b * 12.0)?
+    } else {
+        s.parse().ok()?
+    };
+    (v > 0.0 && v.is_finite()).then_some(v)
+}
+
+/// `$1,234.56`
+pub fn fmt_money(v: f64) -> String {
+    format!("${}", group_thousands(v, 2))
+}
+
+/// Slope as pitch text, e.g. `6:12`.
+pub fn fmt_slope(rise: f64) -> String {
+    let r = (rise * 100.0).round() / 100.0;
+    if (r - r.round()).abs() < 1e-9 {
+        format!("{}:12", r.round())
+    } else {
+        format!("{r}:12")
+    }
+}
+
 // -------------------------------------------------------------- persistence
 
 impl Takeoff {
@@ -512,6 +599,86 @@ impl Takeoff {
         self.scales.get(&sheet)
     }
 
+    pub fn group(&self, name: &str) -> Option<&Group> {
+        self.groups.iter().find(|g| g.name == name)
+    }
+
+    /// Cost of one measurement from its group's unit prices, if priced.
+    pub fn cost(&self, m: &Measure) -> Option<f64> {
+        let p = self.group(&m.group)?.prices;
+        let scale = self.scale(m.sheet);
+        let mut cost = 0.0;
+        let mut priced = false;
+        let mut add = |qty: f64, price: Option<f64>| {
+            if let Some(pr) = price {
+                cost += qty * pr;
+                priced = true;
+            }
+        };
+        match m.qty(scale) {
+            Qty::Length(l) => add(l / 12.0, p.per_lf),
+            Qty::Area { area, volume, .. } => {
+                add(area / 144.0, p.per_sf);
+                if let Some(v) = volume {
+                    add(v / 46_656.0, p.per_cy);
+                }
+            }
+            Qty::Count(n) => add(n as f64, p.per_ea),
+            Qty::Unscaled => {}
+        }
+        if let Some(w) = m.wall_area(scale) {
+            add(w / 144.0, p.per_sf);
+        }
+        priced.then_some(cost)
+    }
+
+    /// Add one measurement into running totals.
+    pub fn accumulate(&self, t: &mut Totals, m: &Measure) {
+        let scale = self.scale(m.sheet);
+        t.items += 1;
+        t.sheets.insert(m.sheet);
+        match m.qty(scale) {
+            Qty::Length(l) => t.len += l,
+            Qty::Area { area, perimeter, volume } => {
+                t.area += area;
+                t.perimeter += perimeter;
+                t.vol += volume.unwrap_or(0.0);
+            }
+            Qty::Count(n) => t.count += n,
+            Qty::Unscaled => t.unscaled += 1,
+        }
+        t.wall += m.wall_area(scale).unwrap_or(0.0);
+        if let Some(c) = self.cost(m) {
+            t.cost += c;
+            t.priced = true;
+        }
+    }
+
+    /// Totals per group over visible layers, in group order (groups with
+    /// no visible items are skipped).
+    pub fn group_totals(&self) -> Vec<(&Group, Totals)> {
+        self.groups
+            .iter()
+            .filter_map(|g| {
+                let mut t = Totals::default();
+                for m in self.visible_items().filter(|m| m.group == g.name) {
+                    self.accumulate(&mut t, m);
+                }
+                (t.items > 0).then_some((g, t))
+            })
+            .collect()
+    }
+
+    /// Totals per (sheet, group) over visible layers.
+    pub fn sheet_totals(&self) -> BTreeMap<(u32, String), Totals> {
+        let mut out: BTreeMap<(u32, String), Totals> = BTreeMap::new();
+        for m in self.visible_items() {
+            let t = out.entry((m.sheet, m.group.clone())).or_default();
+            self.accumulate(t, m);
+        }
+        out
+    }
+
     pub fn group_color(&self, name: &str) -> u32 {
         self.groups.iter().find(|g| g.name == name).map(|g| g.color).unwrap_or(0x1976d2)
     }
@@ -522,7 +689,7 @@ impl Takeoff {
         let name = if name.is_empty() { "General" } else { name };
         if !self.groups.iter().any(|g| g.name == name) {
             let color = PALETTE[self.groups.len() % PALETTE.len()];
-            self.groups.push(Group { name: name.to_string(), color });
+            self.groups.push(Group { name: name.to_string(), color, prices: Prices::default() });
         }
         name.to_string()
     }
@@ -569,6 +736,8 @@ impl Takeoff {
             leader,
             holes: Vec::new(),
             depth_in: None,
+            slope: None,
+            height_in: None,
         });
         id
     }
@@ -623,29 +792,35 @@ impl Takeoff {
         std::fs::rename(&tmp, path)
     }
 
+    /// Numbers in the takeoff's units for export: (length, area, volume)
+    /// converters and their unit names.
+    pub fn export_units(&self) -> ExportUnits {
+        match self.units {
+            Units::Metric => ExportUnits {
+                len: 0.0254,
+                area: 0.0254 * 0.0254,
+                vol: 0.0254f64.powi(3),
+                len_unit: "m",
+                area_unit: "m2",
+                vol_unit: "m3",
+                decimals: 3,
+            },
+            _ => ExportUnits {
+                len: 1.0 / 12.0,
+                area: 1.0 / 144.0,
+                vol: 1.0 / 46_656.0,
+                len_unit: "LF",
+                area_unit: "SF",
+                vol_unit: "CY",
+                decimals: 2,
+            },
+        }
+    }
+
     /// Spreadsheet export: one row per measurement plus group totals.
     pub fn to_csv(&self, sheet_names: &dyn Fn(u32) -> String) -> String {
-        let units = self.units;
-        let (len_unit, area_unit) = match units {
-            Units::Metric => ("m", "m2"),
-            _ => ("ft", "sf"),
-        };
-        let len_num = |inches: f64| match units {
-            Units::Metric => format!("{:.3}", inches * 0.0254),
-            _ => format!("{:.2}", inches / 12.0),
-        };
-        let vol_unit = match units {
-            Units::Metric => "m3",
-            _ => "cy",
-        };
-        let vol_num = |cu: f64| match units {
-            Units::Metric => format!("{:.3}", cu * 0.0254f64.powi(3)),
-            _ => format!("{:.2}", cu / 46_656.0),
-        };
-        let area_num = |sq: f64| match units {
-            Units::Metric => format!("{:.3}", sq * 0.0254 * 0.0254),
-            _ => format!("{:.2}", sq / 144.0),
-        };
+        let u = self.export_units();
+        let n = |v: f64| format!("{:.*}", u.decimals, v);
         let esc = |s: &str| {
             if s.contains([',', '"', '\n']) {
                 format!("\"{}\"", s.replace('"', "\"\""))
@@ -653,72 +828,76 @@ impl Takeoff {
                 s.to_string()
             }
         };
-        let mut out =
-            String::from("Group,Layer,Sheet,Type,Quantity,Unit,Perimeter,Perimeter unit,Volume,Volume unit,Display,Scale,Counted\n");
+        let mut out = String::from(
+            "Group,Layer,Sheet,Type,Quantity,Unit,Perimeter,Perimeter unit,Volume,Volume unit,Wall area,Wall area unit,Slope,Cost,Display,Scale,Counted\n",
+        );
         let mut items: Vec<&Measure> = self.items.iter().collect();
         items.sort_by(|a, b| (&a.group, a.sheet, a.id).cmp(&(&b.group, b.sheet, b.id)));
-        // (length in, area sq in, perimeter in, count, volume cu in)
-        let mut totals: BTreeMap<&str, (f64, f64, f64, usize, f64)> = BTreeMap::new();
-        let mut hidden = (0f64, 0f64, 0f64, 0usize, 0f64);
         for m in &items {
             let scale = self.scale(m.sheet);
             let q = m.qty(scale);
             let counted = self.layer_visible(&m.layer);
-            // Items on hidden layers are listed but left out of the totals.
-            let t = if counted { totals.entry(m.group.as_str()).or_default() } else { &mut hidden };
-            let mut vol = (String::new(), "");
-            let (qty, unit, per, per_unit) = match q {
-                Qty::Length(l) => {
-                    t.0 += l;
-                    (len_num(l), len_unit, String::new(), "")
-                }
-                Qty::Area { area, perimeter, volume } => {
-                    t.1 += area;
-                    t.2 += perimeter;
-                    if let Some(v) = volume {
-                        t.4 += v;
-                        vol = (vol_num(v), vol_unit);
-                    }
-                    (area_num(area), area_unit, len_num(perimeter), len_unit)
-                }
-                Qty::Count(n) => {
-                    t.3 += n;
-                    (n.to_string(), "ea", String::new(), "")
-                }
-                Qty::Unscaled => (String::new(), "no scale", String::new(), ""),
+            let none = || (String::new(), "");
+            let ((qty, unit), (per, per_unit), (vol, vol_unit)) = match q {
+                Qty::Length(l) => ((n(l * u.len), u.len_unit), none(), none()),
+                Qty::Area { area, perimeter, volume } => (
+                    (n(area * u.area), u.area_unit),
+                    (n(perimeter * u.len), u.len_unit),
+                    volume.map(|v| (n(v * u.vol), u.vol_unit)).unwrap_or_else(none),
+                ),
+                Qty::Count(c) => ((c.to_string(), "EA"), none(), none()),
+                Qty::Unscaled => ((String::new(), "no scale"), none(), none()),
+            };
+            let (wall, wall_unit) = match m.wall_area(scale) {
+                Some(w) => (n(w * u.area), u.area_unit),
+                None => (String::new(), ""),
             };
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{qty},{unit},{per},{per_unit},{vol},{vol_unit},{wall},{wall_unit},{},{},{},{},{}\n",
                 esc(&m.group),
                 esc(&m.layer),
                 esc(&sheet_names(m.sheet)),
                 m.kind.name(),
-                qty,
-                unit,
-                per,
-                per_unit,
-                vol.0,
-                vol.1,
-                esc(&fmt_qty(q, units)),
+                m.slope.map(fmt_slope).unwrap_or_default(),
+                self.cost(m).map(|c| format!("{c:.2}")).unwrap_or_default(),
+                esc(&fmt_qty(q, self.units)),
                 esc(&scale.map(|s| s.label.clone()).unwrap_or_default()),
                 if counted { "yes" } else { "no (hidden layer)" }
             ));
         }
-        out.push_str(
-            "\nTOTALS (visible layers)\nGroup,Length,Length unit,Area,Area unit,Perimeter,Perimeter unit,Volume,Volume unit,Count\n",
-        );
-        for (g, (l, a, p, c, v)) in totals {
+        out.push_str(&format!(
+            "\nTOTALS (visible layers)\nGroup,Length ({0}),Area ({1}),Perimeter ({0}),Wall area ({1}),Volume ({2}),Count (EA),Cost\n",
+            u.len_unit, u.area_unit, u.vol_unit
+        ));
+        let mut grand = 0.0;
+        for (g, t) in self.group_totals() {
+            grand += t.cost;
             out.push_str(&format!(
-                "{},{},{len_unit},{},{area_unit},{},{len_unit},{},{vol_unit},{c}\n",
-                esc(g),
-                len_num(l),
-                area_num(a),
-                len_num(p),
-                vol_num(v)
+                "{},{},{},{},{},{},{},{}\n",
+                esc(&g.name),
+                n(t.len * u.len),
+                n(t.area * u.area),
+                n(t.perimeter * u.len),
+                n(t.wall * u.area),
+                n(t.vol * u.vol),
+                t.count,
+                if t.priced { format!("{:.2}", t.cost) } else { String::new() }
             ));
         }
+        out.push_str(&format!("GRAND TOTAL,,,,,,,{grand:.2}\n"));
         out
     }
+}
+
+/// Unit conversion from real inches for exports.
+pub struct ExportUnits {
+    pub len: f64,
+    pub area: f64,
+    pub vol: f64,
+    pub len_unit: &'static str,
+    pub area_unit: &'static str,
+    pub vol_unit: &'static str,
+    pub decimals: usize,
 }
 
 #[cfg(test)]
@@ -754,6 +933,28 @@ mod tests {
     }
 
     #[test]
+    fn slopes() {
+        for (s, want) in [("6", 6.0), ("6:12", 6.0), ("6/12", 6.0), ("1:20", 0.6), ("8.333%", 0.99996), ("45\u{00B0}", 12.0), ("45deg", 12.0)] {
+            let got = parse_slope(s).unwrap_or_else(|| panic!("{s}"));
+            assert!((got - want).abs() < 1e-3, "{s}: {got}");
+        }
+        assert!(parse_slope("").is_none() && parse_slope("x").is_none() && parse_slope("0").is_none());
+        assert_eq!(fmt_slope(6.0), "6:12");
+        assert_eq!(fmt_money(1234.5), "$1,234.50");
+        // A 6:12 roof: plan 100 SF -> 111.8 SF.
+        let s = Scale::from_ratio("1/8\" = 1'-0\"", 96.0);
+        let mut t = Takeoff::new();
+        // 120 DIP = 120" = 10' at 1/8" scale, so the plan area is 100 SF.
+        t.add(0, Kind::Area, vec![[0.0, 0.0], [120.0, 0.0], [120.0, 120.0], [0.0, 120.0]], "Roof", "Default");
+        t.scales.insert(0, s.clone());
+        t.items[0].slope = Some(6.0);
+        match t.items[0].qty(Some(&s)) {
+            Qty::Area { area, .. } => assert!((area / 144.0 - 100.0 * 1.25f64.sqrt()).abs() < 1e-6),
+            q => panic!("{q:?}"),
+        }
+    }
+
+    #[test]
     fn formats() {
         assert_eq!(fmt_len(150.0, Units::FeetInches), "12'-6\"");
         assert_eq!(fmt_len(150.26, Units::FeetInches), "12'-6 1/4\"");
@@ -781,6 +982,8 @@ mod tests {
             leader: EndStyle::None,
             holes: Vec::new(),
             depth_in: None,
+            slope: None,
+            height_in: None,
         };
         let m = mk(Kind::Length, vec![[0.0, 0.0], [96.0, 0.0]]);
         assert_eq!(m.qty(Some(&s)), Qty::Length(96.0));
@@ -837,13 +1040,24 @@ mod tests {
         assert_eq!(t.items[0].ends, EndStyle::ClosedArrow);
         assert_eq!(t.items[1].ends, EndStyle::None);
         let csv = t.to_csv(&|i| format!("Sheet {}", i + 1));
-        assert!(csv.contains("\"Drywall, Type A\",Base,Sheet 1,Length,8.00,ft"), "{csv}");
-        assert!(csv.contains("Flooring,Base,Sheet 1,Area,128.00,sf,48.00,ft"), "{csv}");
-        assert!(csv.contains("Flooring,Base,Sheet 2,Count,3,ea"), "{csv}");
+        assert!(csv.contains("\"Drywall, Type A\",Base,Sheet 1,Length,8.00,LF"), "{csv}");
+        assert!(csv.contains("Flooring,Base,Sheet 1,Area,128.00,SF,48.00,LF"), "{csv}");
+        assert!(csv.contains("Flooring,Base,Sheet 2,Count,3,EA"), "{csv}");
         assert!(csv.contains("Flooring,Base,Sheet 2,Length,,no scale"), "{csv}");
-        assert!(csv.contains("Flooring,Alt 1,Sheet 1,Area,32.00,sf"), "{csv}");
+        assert!(csv.contains("Flooring,Alt 1,Sheet 1,Area,32.00,SF"), "{csv}");
         assert!(csv.contains("no (hidden layer)"), "{csv}");
-        assert!(csv.contains("Flooring,0.00,ft,128.00,sf,48.00,ft,0.00,cy,3"), "{csv}");
+        assert!(csv.contains("Flooring,0.00,128.00,48.00,0.00,0.00,3,\n"), "{csv}");
+        // Prices: flooring $4.50/SF and $12/EA; drywall wall 8' high at $3/SF.
+        t.groups.iter_mut().find(|g| g.name == "Flooring").unwrap().prices =
+            Prices { per_sf: Some(4.5), per_ea: Some(12.0), ..Default::default() };
+        t.groups.iter_mut().find(|g| g.name.starts_with("Drywall")).unwrap().prices =
+            Prices { per_sf: Some(3.0), ..Default::default() };
+        t.items.iter_mut().find(|m| m.id == a).unwrap().height_in = Some(96.0);
+        let csv = t.to_csv(&|i| format!("Sheet {}", i + 1));
+        // 8 LF x 8' = 64 SF wall x $3 = $192; flooring 128 SF x 4.5 + 3 x 12 = $612.
+        assert!(csv.contains("\"Drywall, Type A\",8.00,0.00,0.00,64.00,0.00,0,192.00"), "{csv}");
+        assert!(csv.contains("Flooring,0.00,128.00,48.00,0.00,0.00,3,612.00"), "{csv}");
+        assert!(csv.contains("GRAND TOTAL,,,,,,,804.00"), "{csv}");
         assert_eq!(t.visible_items().count(), 4);
         let src = t.items.iter().find(|m| m.id == a).unwrap().clone();
         let d = t.duplicate(&src, 2, [5.0, 5.0]);

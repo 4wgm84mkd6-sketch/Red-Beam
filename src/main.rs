@@ -11,6 +11,7 @@ mod settings;
 mod snap;
 mod takeoff;
 mod update;
+mod xlsx;
 mod view;
 mod worker;
 
@@ -130,12 +131,15 @@ fn popup_menu(hwnd: HWND, items: &[app::MenuItem]) -> usize {
     }
 }
 
-fn save_dialog(hwnd: HWND, default_name: &str) -> Option<PathBuf> {
+fn save_dialog(hwnd: HWND, default_name: &str, kind: app::ExportKind) -> Option<PathBuf> {
     unsafe {
         let dlg: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let filters = [COMDLG_FILTERSPEC { pszName: w!("CSV (opens in Excel)"), pszSpec: w!("*.csv") }];
+        let (filters, ext) = match kind {
+            app::ExportKind::Excel => ([COMDLG_FILTERSPEC { pszName: w!("Excel workbook"), pszSpec: w!("*.xlsx") }], w!("xlsx")),
+            app::ExportKind::Csv => ([COMDLG_FILTERSPEC { pszName: w!("CSV (opens in Excel)"), pszSpec: w!("*.csv") }], w!("csv")),
+        };
         dlg.SetFileTypes(&filters).ok()?;
-        dlg.SetDefaultExtension(w!("csv")).ok()?;
+        dlg.SetDefaultExtension(ext).ok()?;
         dlg.SetFileName(&HSTRING::from(default_name)).ok()?;
         dlg.SetTitle(w!("Export takeoff")).ok()?;
         dlg.Show(Some(hwnd)).ok()?;
@@ -154,9 +158,9 @@ fn after(hwnd: HWND) {
         with_app(|a| a.menu_result(kind, cmd));
         repaint(hwnd);
     }
-    if let Some(name) = with_app(|a| std::mem::take(&mut a.pending_export).then(|| a.export_default_name())).flatten() {
-        if let Some(p) = save_dialog(hwnd, &name) {
-            with_app(|a| a.export_csv(p));
+    if let Some((kind, name)) = with_app(|a| a.pending_export.take().map(|k| (k, a.export_default_name(k)))).flatten() {
+        if let Some(p) = save_dialog(hwnd, &name, kind) {
+            with_app(|a| a.export(kind, p));
         }
         repaint(hwnd);
     }
