@@ -201,6 +201,9 @@ pub struct Takeoff {
     /// Leader style for labels moved off their measurement.
     #[serde(default = "default_ends")]
     pub default_leader: EndStyle,
+    /// Markups (clouds, text, callouts, ...) on this drawing.
+    #[serde(default)]
+    pub markups: Vec<crate::markup::Markup>,
 }
 
 /// Distinct, print-friendly colours handed to new groups in turn.

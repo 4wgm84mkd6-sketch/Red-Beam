@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{IDC_HAND, IDC_SIZEALL};
 use windows_numerics::Vector2;
 
 use super::{d2r, rgb, App, CmpMode, ACCENT, BTN_BG, TEXT, TEXT_DIM};
+use crate::markup::{MKind, Markup};
 use crate::snap::SnapKind;
 use crate::takeoff::{self, EndStyle, Kind, Layer, Measure, Qty, Scale, Takeoff, Units, DEFAULT_LAYER, SCALES};
 
@@ -65,6 +66,8 @@ pub enum Tool {
     Volume,
     /// Outline a cut-out inside area measurement `id`.
     Cutout(u64),
+    /// Draw a markup.
+    Markup(MKind),
 }
 
 impl Tool {
@@ -74,13 +77,21 @@ impl Tool {
             Tool::Measure(k) => Some(k),
             Tool::Volume | Tool::Cutout(_) => Some(Kind::Area),
             Tool::Calibrate => Some(Kind::Length),
-            Tool::Select => None,
+            Tool::Select | Tool::Markup(_) => None,
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TBtn {
+    /// Switch toolbar between takeoff and markup tools.
+    Mode(bool),
+    MTool(MKind),
+    Stamp,
+    MColor,
+    MWidth,
+    MFont,
+    SavePdf,
     Select,
     Scale,
     Tool(Kind),
@@ -100,6 +111,12 @@ pub enum MenuKind {
     Layer,
     Units,
     Export,
+    Stamp,
+    MColor,
+    MWidth,
+    MFont,
+    SavePdf,
+    MarkupContext { id: u64 },
     /// Right-click on a measurement: maybe on one of its points
     /// (ring 0 = outline, ring k = cut-out k-1) or inside a cut-out.
     Context { id: u64, vertex: Option<(usize, usize)>, hole: Option<usize> },
@@ -120,6 +137,7 @@ pub enum PromptFor {
     RenameGroup(usize),
     Slope { id: u64 },
     WallHeight { id: u64 },
+    MarkupText { id: u64 },
 }
 
 pub struct Prompt {
@@ -140,6 +158,9 @@ pub enum Undo {
     Layers(Vec<Measure>, Vec<Layer>),
     /// Items and groups before a group rename.
     Groups(Vec<Measure>, Vec<takeoff::Group>),
+    MarkupAdded(u64),
+    MarkupRemoved(Markup),
+    MarkupModified(Markup),
 }
 
 /// A drag in progress with the Select tool.
@@ -151,6 +172,8 @@ pub enum EditDrag {
     Vertex { orig: Measure, ring: usize, index: usize, moved: bool },
     /// The label, which then gets a leader back to the measurement.
     Label { orig: Measure, start: [f32; 2], moved: bool },
+    MarkupMove { orig: Markup, start: [f32; 2], moved: bool },
+    MarkupHandle { orig: Markup, index: usize, moved: bool },
 }
 
 // Menu command ids.
@@ -200,17 +223,17 @@ pub struct MenuItem {
     pub children: Vec<MenuItem>,
 }
 
-fn item(id: usize, label: impl Into<String>, checked: bool) -> MenuItem {
+pub(super) fn item(id: usize, label: impl Into<String>, checked: bool) -> MenuItem {
     MenuItem { id, label: label.into(), checked, separator: false, children: Vec::new() }
 }
-fn sep() -> MenuItem {
+pub(super) fn sep() -> MenuItem {
     MenuItem { id: 0, label: String::new(), checked: false, separator: true, children: Vec::new() }
 }
-fn submenu(label: impl Into<String>, children: Vec<MenuItem>) -> MenuItem {
+pub(super) fn submenu(label: impl Into<String>, children: Vec<MenuItem>) -> MenuItem {
     MenuItem { id: 0, label: label.into(), checked: false, separator: false, children }
 }
 
-fn v2(p: [f32; 2]) -> Vector2 {
+pub(super) fn v2(p: [f32; 2]) -> Vector2 {
     Vector2 { X: p[0], Y: p[1] }
 }
 
@@ -306,12 +329,14 @@ impl App {
         }
     }
 
-    fn set_tool(&mut self, tool: Tool) {
+    pub(super) fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.pending_pts.clear();
         if !matches!(tool, Tool::Select | Tool::Cutout(_)) {
             self.selected = None;
+            self.selected_markup = None;
         }
+        self.mdraft = None;
         self.update_jobs(false);
         self.invalidate();
     }
@@ -403,7 +428,12 @@ impl App {
             Units::DecimalFeet => "dec ft",
             Units::Metric => "metric",
         };
-        let specs: Vec<(TBtn, String, f32, f32)> = vec![
+        let specs: Vec<(TBtn, String, f32, f32)> = if self.markup_mode {
+            self.markup_toolbar_specs()
+        } else {
+            vec![
+            (TBtn::Mode(false), "Takeoff".into(), 70.0, 0.0),
+            (TBtn::Mode(true), "Markup".into(), 70.0, 10.0),
             (TBtn::Select, "Select".into(), 60.0, 8.0),
             (TBtn::Scale, scale, 170.0, 8.0),
             (TBtn::Tool(Kind::Length), "Length".into(), 64.0, 4.0),
@@ -417,7 +447,8 @@ impl App {
             (TBtn::Units, format!("{units} \u{25BE}"), 72.0, 8.0),
             (TBtn::Quantities, "Quantities".into(), 90.0, 4.0),
             (TBtn::Export, "Export".into(), 64.0, 0.0),
-        ];
+        ]
+        };
         let mut x = self.left_inset() + 8.0 * s;
         specs
             .into_iter()
@@ -459,6 +490,19 @@ impl App {
 
     pub(super) fn press_tool(&mut self, b: TBtn) {
         match b {
+            TBtn::Mode(m) => {
+                self.markup_mode = m;
+                self.set_tool(Tool::Select);
+            }
+            TBtn::MTool(k) => self.set_tool(Tool::Markup(k)),
+            TBtn::Stamp => {
+                self.set_tool(Tool::Markup(MKind::Stamp));
+                self.status = Some("Stamp: click where it goes".into());
+            }
+            TBtn::MColor => self.pending_menu = Some(MenuKind::MColor),
+            TBtn::MWidth => self.pending_menu = Some(MenuKind::MWidth),
+            TBtn::MFont => self.pending_menu = Some(MenuKind::MFont),
+            TBtn::SavePdf => self.pending_menu = Some(MenuKind::SavePdf),
             TBtn::Select => self.set_tool(Tool::Select),
             TBtn::Tool(k) => self.set_tool(Tool::Measure(k)),
             TBtn::Volume => self.set_tool(Tool::Volume),
@@ -488,6 +532,9 @@ impl App {
     }
 
     pub fn menu_items(&self, kind: MenuKind) -> Vec<MenuItem> {
+        if let Some(v) = self.markup_menu_items(kind) {
+            return v;
+        }
         match kind {
             MenuKind::Scale => {
                 let cur = self.takeoff_sheet().and_then(|p| self.takeoff.scale(p)).map(|s| s.label.clone());
@@ -580,6 +627,10 @@ impl App {
                 item(CMD_BASE + 1, "Decimal feet (12.52') and SF", self.takeoff.units == Units::DecimalFeet),
                 item(CMD_BASE + 2, "Metric (m and m\u{00B2})", self.takeoff.units == Units::Metric),
             ],
+            // Markup menus are handled in markups.rs.
+            MenuKind::Stamp | MenuKind::MColor | MenuKind::MWidth | MenuKind::MFont | MenuKind::SavePdf | MenuKind::MarkupContext { .. } => {
+                Vec::new()
+            }
             MenuKind::Context { id, vertex, hole } => {
                 let Some(m) = self.takeoff.items.iter().find(|m| m.id == id) else { return Vec::new() };
                 let mut groups: Vec<MenuItem> = self
@@ -661,6 +712,11 @@ impl App {
 
     pub fn menu_result(&mut self, kind: MenuKind, cmd: usize) {
         if cmd == 0 {
+            self.stamp_at = None;
+            return;
+        }
+        if self.markup_menu_result(kind, cmd) {
+            self.invalidate();
             return;
         }
         let sheet = self.takeoff_sheet();
@@ -706,6 +762,7 @@ impl App {
                 self.save_takeoff();
             }
             MenuKind::Context { id, vertex, hole } => self.context_menu(id, vertex, hole, cmd),
+            MenuKind::Stamp | MenuKind::MColor | MenuKind::MWidth | MenuKind::MFont | MenuKind::SavePdf | MenuKind::MarkupContext { .. } => {}
         }
         self.invalidate();
     }
@@ -973,12 +1030,12 @@ impl App {
 
     // ------------------------------------------------------------- input
 
-    fn page_pt(&self, x: f32, y: f32) -> [f32; 2] {
+    pub(super) fn page_pt(&self, x: f32, y: f32) -> [f32; 2] {
         let r = self.view.screen_to_page(&RectF::new(x, y, x, y));
         [r.l, r.t]
     }
 
-    fn to_screen(&self, p: [f32; 2]) -> [f32; 2] {
+    pub(super) fn to_screen(&self, p: [f32; 2]) -> [f32; 2] {
         let r = self.view.page_to_screen(&RectF::new(p[0], p[1], p[0], p[1]));
         [r.l, r.t]
     }
@@ -989,7 +1046,7 @@ impl App {
 
     /// The point a click at (x, y) would place: Shift = ortho, otherwise
     /// snapped to the drawing's line work when snapping is on.
-    fn place_pt(&self, x: f32, y: f32) -> [f32; 2] {
+    pub(super) fn place_pt(&self, x: f32, y: f32) -> [f32; 2] {
         self.place_pt_kind(x, y).0
     }
 
@@ -1022,6 +1079,7 @@ impl App {
                 self.invalidate();
                 true
             }
+            Tool::Markup(k) => self.markup_down(k, x, y),
             Tool::Measure(_) | Tool::Volume | Tool::Cutout(_) => {
                 let p = self.place_pt(x, y);
                 self.pending_pts.push(p);
@@ -1038,12 +1096,15 @@ impl App {
     /// point, so finish. With the Select tool on a selected polyline/area
     /// edge: insert a point there.
     pub(super) fn tools_dblclick(&mut self, x: f32, y: f32) -> bool {
-        if matches!(self.tool, Tool::Measure(_) | Tool::Volume | Tool::Cutout(_)) && !self.pending_pts.is_empty() {
+        if matches!(self.tool, Tool::Measure(_) | Tool::Volume | Tool::Cutout(_) | Tool::Markup(_)) && !self.pending_pts.is_empty() {
             self.finish_measure();
             return true;
         }
         if self.tool != Tool::Select {
             return false;
+        }
+        if self.markup_dblclick(x, y) {
+            return true;
         }
         let p = self.page_pt(x, y);
         let tol = 6.0 * self.s() / self.view.zoom;
@@ -1074,6 +1135,10 @@ impl App {
     }
 
     pub(super) fn finish_measure(&mut self) {
+        if let Tool::Markup(_) = self.tool {
+            self.finish_cloud_poly();
+            return;
+        }
         let (Some(kind), Some(sheet)) = (self.tool.kind(), self.takeoff_sheet()) else { return };
         if self.tool == Tool::Calibrate {
             return;
@@ -1203,6 +1268,10 @@ impl App {
             return false;
         }
         let start = self.page_pt(x, y);
+        if self.markup_select_down(x, y, start) {
+            return true;
+        }
+        self.selected_markup = None;
         if let (Some((ring, index)), Some(m)) = (self.handle_at(x, y), self.selected_measure()) {
             self.edit = Some(EditDrag::Vertex { orig: m.clone(), ring, index, moved: false });
             return true;
@@ -1228,6 +1297,9 @@ impl App {
         // A count's label starts just above its first marker.
         let count_lift = [0.0, -20.0 * self.s() / self.view.zoom];
         let snapped = self.snap_pt(p).0;
+        if self.markup_edit_move(p, slop) {
+            return true;
+        }
         let Some(edit) = self.edit.as_mut() else { return false };
         // Work out the edited measurement, or None if still within the
         // click slop (so a plain click doesn't nudge anything).
@@ -1259,6 +1331,7 @@ impl App {
                     m
                 })
             }
+            EditDrag::MarkupMove { .. } | EditDrag::MarkupHandle { .. } => None,
             EditDrag::Label { orig, start, moved } => {
                 let (dx, dy) = (p[0] - start[0], p[1] - start[1]);
                 (*moved || dx.hypot(dy) >= slop).then(|| {
@@ -1286,6 +1359,14 @@ impl App {
             EditDrag::Move { orig, moved, .. } | EditDrag::Vertex { orig, moved, .. } | EditDrag::Label { orig, moved, .. } => {
                 (orig, moved)
             }
+            EditDrag::MarkupMove { orig, moved, .. } | EditDrag::MarkupHandle { orig, moved, .. } => {
+                if moved {
+                    self.undo.push(Undo::MarkupModified(orig));
+                    self.save_takeoff();
+                }
+                self.invalidate();
+                return true;
+            }
         };
         if moved {
             self.undo.push(Undo::Modified(orig));
@@ -1299,6 +1380,13 @@ impl App {
     pub(super) fn context_menu_at(&mut self, x: f32, y: f32) -> bool {
         if self.tool != Tool::Select || self.takeoff_sheet().is_none() {
             return false;
+        }
+        if let Some(id) = self.markup_at(x, y) {
+            self.selected_markup = Some(id);
+            self.selected = None;
+            self.pending_menu = Some(MenuKind::MarkupContext { id });
+            self.invalidate();
+            return true;
         }
         let vertex = self.handle_at(x, y);
         let id = match (vertex, self.selected) {
@@ -1324,7 +1412,7 @@ impl App {
         if self.tool != Tool::Select || self.takeoff_sheet().is_none() {
             return None;
         }
-        if self.edit.is_some() || self.handle_at(x, y).is_some() {
+        if self.edit.is_some() || self.handle_at(x, y).is_some() || self.markup_handle_at(x, y).is_some() || self.markup_at(x, y).is_some() {
             return Some(IDC_SIZEALL);
         }
         match self.measure_at(x, y) {
@@ -1339,6 +1427,12 @@ impl App {
         if self.takeoff_sheet().is_none() {
             return;
         }
+        self.selected_markup = self.markup_at(x, y);
+        if self.selected_markup.is_some() {
+            self.selected = None;
+            self.invalidate();
+            return;
+        }
         self.selected = self.measure_at(x, y).map(|(id, _)| id);
         if let Some(m) = self.selected_measure() {
             self.group = m.group.clone();
@@ -1347,6 +1441,15 @@ impl App {
     }
 
     fn delete_selected(&mut self) {
+        if let Some(id) = self.selected_markup.take() {
+            if let Some(ix) = self.takeoff.markups.iter().position(|m| m.id == id) {
+                let m = self.takeoff.markups.remove(ix);
+                self.undo.push(Undo::MarkupRemoved(m));
+                self.save_takeoff();
+            }
+            self.invalidate();
+            return;
+        }
         let Some(id) = self.selected.take() else { return };
         if let Some(ix) = self.takeoff.items.iter().position(|m| m.id == id) {
             let m = self.takeoff.items.remove(ix);
@@ -1356,7 +1459,10 @@ impl App {
         self.invalidate();
     }
 
-    fn duplicate_selected(&mut self) {
+    pub(super) fn duplicate_selected(&mut self) {
+        if self.selected_markup.is_some() {
+            return self.duplicate_markup();
+        }
         let (Some(m), Some(sheet)) = (self.selected_measure().cloned(), self.takeoff_sheet()) else { return };
         let off = 24.0 * self.s() / self.view.zoom;
         let id = self.takeoff.duplicate(&m, sheet, [off, off]);
@@ -1406,6 +1512,13 @@ impl App {
                 self.takeoff.scales.remove(&sheet);
             }
             Undo::AllScales(all) => self.takeoff.scales = all,
+            Undo::MarkupAdded(id) => self.takeoff.markups.retain(|m| m.id != id),
+            Undo::MarkupRemoved(m) => self.takeoff.markups.push(m),
+            Undo::MarkupModified(m) => {
+                if let Some(cur) = self.takeoff.markups.iter_mut().find(|x| x.id == m.id) {
+                    *cur = m;
+                }
+            }
             Undo::Groups(items, groups) => {
                 self.takeoff.items = items;
                 self.takeoff.groups = groups;
@@ -1422,6 +1535,7 @@ impl App {
             }
         }
         self.selected = None;
+        self.selected_markup = None;
         self.save_takeoff();
         self.invalidate();
     }
@@ -1456,7 +1570,12 @@ impl App {
             _ if ctrl_key(b'Z') => self.undo_last(),
             _ if ctrl_key(b'C') && self.selected.is_some() => self.clip = self.selected_measure().cloned(),
             _ if ctrl_key(b'V') && self.clip.is_some() => self.paste(),
-            _ if ctrl_key(b'D') && self.selected.is_some() => self.duplicate_selected(),
+            _ if ctrl_key(b'D') && (self.selected.is_some() || self.selected_markup.is_some()) => self.duplicate_selected(),
+            _ if letter(b'M') => {
+                self.markup_mode = !self.markup_mode;
+                self.set_tool(Tool::Select);
+            }
+            _ if self.markup_mode && self.markup_key(vk) => {}
             VK_DELETE => self.delete_selected(),
             VK_ESCAPE if !self.pending_pts.is_empty() => {
                 self.pending_pts.clear();
@@ -1471,8 +1590,10 @@ impl App {
                 self.set_tool(Tool::Select);
                 self.selected = keep;
             }
-            VK_ESCAPE if self.selected.is_some() => {
+            VK_ESCAPE if self.selected.is_some() || self.selected_markup.is_some() || self.mdraft.is_some() => {
                 self.selected = None;
+                self.selected_markup = None;
+                self.mdraft = None;
                 self.invalidate();
             }
             VK_RETURN if !self.pending_pts.is_empty() && self.goto_buf.is_empty() => self.finish_measure(),
@@ -1636,6 +1757,7 @@ impl App {
                     self.save_takeoff();
                 }
             }
+            PromptFor::MarkupText { id } => self.set_markup_text(id, p.text.clone()),
             PromptFor::RenameLayer(i) => {
                 let new = p.text.trim().to_string();
                 let taken = self.takeoff.layers.iter().enumerate().any(|(j, l)| j != i && l.name == new);
@@ -1683,7 +1805,7 @@ impl App {
 
     /// Path with one figure per ring; with the default alternate fill mode,
     /// inner rings (cut-outs) are left unfilled.
-    fn geometry_rings(&self, rings: &[Vec<[f32; 2]>], closed: bool) -> Option<ID2D1PathGeometry> {
+    pub(super) fn geometry_rings(&self, rings: &[Vec<[f32; 2]>], closed: bool) -> Option<ID2D1PathGeometry> {
         if rings.first().is_none_or(|r| r.len() < 2) {
             return None;
         }
@@ -1740,7 +1862,7 @@ impl App {
         }
     }
 
-    fn line(&self, a: [f32; 2], b: [f32; 2], color: u32, width: f32) {
+    pub(super) fn line(&self, a: [f32; 2], b: [f32; 2], color: u32, width: f32) {
         unsafe {
             self.brush.SetColor(&rgb(color, 1.0));
             self.gfx.ctx.DrawLine(v2(a), v2(b), &self.brush, width, None);
@@ -2023,6 +2145,9 @@ impl App {
             self.fill(&r, 0x1e2023, 0.92);
             for (b, r, label) in self.toolbar_layout() {
                 let active = match b {
+                    TBtn::Mode(m) => self.markup_mode == m,
+                    TBtn::MTool(k) => self.tool == Tool::Markup(k) || (k == MKind::Cloud && self.tool == Tool::Markup(MKind::CloudPoly)),
+                    TBtn::Stamp => self.tool == Tool::Markup(MKind::Stamp),
                     TBtn::Select => self.tool == Tool::Select,
                     TBtn::Tool(k) => self.tool == Tool::Measure(k),
                     TBtn::Volume => self.tool == Tool::Volume,
@@ -2035,7 +2160,12 @@ impl App {
                 let warn = b == TBtn::Scale && self.takeoff_sheet().is_some_and(|p| self.takeoff.scale(p).is_none());
                 let bg = if active || hover { ACCENT } else { BTN_BG };
                 self.fill(&r, bg, 1.0);
-                if let TBtn::Group = b {
+                if matches!(b, TBtn::MColor) {
+                    let sw = RectF::new(r.l + 8.0 * s, r.t + 8.0 * s, r.l + 24.0 * s, r.b - 8.0 * s);
+                    self.fill(&sw, self.settings.markup_color, 1.0);
+                    let tr = RectF::new(r.l + 20.0 * s, r.t, r.r, r.b);
+                    self.text(&label, &self.fonts.ui_center, &tr, TEXT);
+                } else if let TBtn::Group = b {
                     let sw = RectF::new(r.l + 6.0 * s, r.t + 10.0 * s, r.l + 16.0 * s, r.b - 10.0 * s);
                     self.fill(&sw, self.takeoff.group_color(&self.group), 1.0);
                     let tr = RectF::new(r.l + 14.0 * s, r.t, r.r, r.b);

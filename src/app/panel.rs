@@ -53,12 +53,17 @@ impl App {
         self.settings.panel_open && x < self.left_inset() && y < ch
     }
 
-    fn tab_rects(&self) -> [(PanelTab, RectF, &'static str); 3] {
+    fn tab_rects(&self) -> [(PanelTab, RectF, &'static str); 4] {
         let s = self.s();
         let w = self.left_inset();
-        let tw = (w - 16.0 * s) / 3.0;
+        let tw = (w - 16.0 * s) / 4.0;
         let r = |i: f32| RectF::new(8.0 * s + tw * i, 6.0 * s, 8.0 * s + tw * (i + 1.0) - 2.0 * s, TAB_H * s);
-        [(PanelTab::Pages, r(0.0), "Pages"), (PanelTab::Files, r(1.0), "Files"), (PanelTab::Settings, r(2.0), "Settings")]
+        [
+            (PanelTab::Pages, r(0.0), "Pages"),
+            (PanelTab::Files, r(1.0), "Files"),
+            (PanelTab::Markups, r(2.0), "Markups"),
+            (PanelTab::Settings, r(3.0), "Settings"),
+        ]
     }
 
     fn content_rect(&self) -> RectF {
@@ -70,7 +75,8 @@ impl App {
         match tab {
             PanelTab::Pages => 0,
             PanelTab::Files => 1,
-            PanelTab::Settings => 2,
+            PanelTab::Markups => 2,
+            PanelTab::Settings => 3,
         }
     }
 
@@ -173,6 +179,7 @@ impl App {
         match self.settings.panel_tab {
             PanelTab::Pages => self.thumb_rects().1,
             PanelTab::Files => self.file_rows().2,
+            PanelTab::Markups => self.markup_rows(&self.content_rect(), self.scroll()).1,
             PanelTab::Settings => self.setting_rows().1,
         }
     }
@@ -257,6 +264,10 @@ impl App {
                 } else {
                     self.status = Some(format!("Not found: {}", row.path.display()));
                 }
+            }
+            PanelTab::Markups => {
+                let (c, sc) = (self.content_rect(), self.scroll());
+                self.markups_tab_click(&c, sc, x, y);
             }
             PanelTab::Settings => {
                 if let Some((id, ..)) = self.setting_rows().0.into_iter().find(|(.., r)| r.contains_pt(x, y)) {
@@ -364,6 +375,7 @@ impl App {
         match self.settings.panel_tab {
             PanelTab::Pages => self.paint_pages_tab(&c),
             PanelTab::Files => self.paint_files_tab(&c),
+            PanelTab::Markups => self.paint_markups_tab(&c, self.scroll()),
             PanelTab::Settings => self.paint_settings_tab(&c),
         }
         unsafe {

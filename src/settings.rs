@@ -44,6 +44,7 @@ pub enum PanelTab {
     #[default]
     Pages,
     Files,
+    Markups,
     Settings,
 }
 
@@ -74,6 +75,10 @@ pub struct Settings {
     pub panel_tab: PanelTab,
     pub recent: Vec<Recent>,
     pub pinned: Vec<PathBuf>,
+    /// Markup style for new markups.
+    pub markup_color: u32,
+    pub markup_width: f32,
+    pub markup_font: f32,
 }
 
 impl Default for Settings {
@@ -91,6 +96,9 @@ impl Default for Settings {
             panel_tab: PanelTab::Pages,
             recent: Vec::new(),
             pinned: Vec::new(),
+            markup_color: 0xe53935,
+            markup_width: 2.0,
+            markup_font: 14.0,
         }
     }
 }

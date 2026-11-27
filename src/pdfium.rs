@@ -26,6 +26,37 @@ type Page = *mut c_void;
 type Bitmap = *mut c_void;
 type Obj = *mut c_void;
 type Seg = *mut c_void;
+type Annot = *mut c_void;
+
+#[repr(C)]
+struct FsRectF {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+/// FPDF_FILEWRITE followed by our output buffer.
+#[repr(C)]
+struct FileWrite {
+    version: c_int,
+    write_block: extern "C" fn(*mut FileWrite, *const c_void, std::ffi::c_ulong) -> c_int,
+    out: *mut Vec<u8>,
+}
+
+extern "C" fn write_block(this: *mut FileWrite, data: *const c_void, size: std::ffi::c_ulong) -> c_int {
+    // SAFETY: `this` is the FileWrite we passed to FPDF_SaveAsCopy; `out`
+    // points at a live Vec for the duration of that call.
+    unsafe {
+        let out = &mut *(*this).out;
+        out.extend_from_slice(std::slice::from_raw_parts(data as *const u8, size as usize));
+    }
+    1
+}
+
+const ANNOT_STAMP: c_int = 13;
+const ANNOT_FLAG_PRINT: c_int = 1 << 2;
+const FPDF_INCREMENTAL: u32 = 1;
 
 const OBJ_PATH: c_int = 2;
 const OBJ_FORM: c_int = 5;
@@ -120,6 +151,28 @@ pub struct Lib {
     form_get_object: unsafe extern "system" fn(Obj, u32) -> Obj,
     page_to_device:
         unsafe extern "system" fn(Page, c_int, c_int, c_int, c_int, c_int, f64, f64, *mut c_int, *mut c_int) -> c_int,
+    // Annotation export
+    create_annot: unsafe extern "system" fn(Page, c_int) -> Annot,
+    close_annot: unsafe extern "system" fn(Annot),
+    annot_set_rect: unsafe extern "system" fn(Annot, *const FsRectF) -> c_int,
+    annot_append_object: unsafe extern "system" fn(Annot, Obj) -> c_int,
+    annot_set_string: unsafe extern "system" fn(Annot, *const c_char, *const u16) -> c_int,
+    annot_set_flags: unsafe extern "system" fn(Annot, c_int) -> c_int,
+    new_path: unsafe extern "system" fn(f32, f32) -> Obj,
+    path_move_to: unsafe extern "system" fn(Obj, f32, f32) -> c_int,
+    path_line_to: unsafe extern "system" fn(Obj, f32, f32) -> c_int,
+    path_close: unsafe extern "system" fn(Obj) -> c_int,
+    path_set_draw_mode: unsafe extern "system" fn(Obj, c_int, c_int) -> c_int,
+    obj_set_stroke_color: unsafe extern "system" fn(Obj, u32, u32, u32, u32) -> c_int,
+    obj_set_stroke_width: unsafe extern "system" fn(Obj, f32) -> c_int,
+    obj_set_fill_color: unsafe extern "system" fn(Obj, u32, u32, u32, u32) -> c_int,
+    obj_set_line_join: unsafe extern "system" fn(Obj, c_int) -> c_int,
+    obj_set_line_cap: unsafe extern "system" fn(Obj, c_int) -> c_int,
+    obj_transform: unsafe extern "system" fn(Obj, f64, f64, f64, f64, f64, f64),
+    obj_destroy: unsafe extern "system" fn(Obj),
+    new_text_obj: unsafe extern "system" fn(Doc, *const c_char, f32) -> Obj,
+    text_set_text: unsafe extern "system" fn(Obj, *const u16) -> c_int,
+    save_as_copy: unsafe extern "system" fn(Doc, *mut FileWrite, u32) -> c_int,
 }
 unsafe impl Send for Lib {}
 unsafe impl Sync for Lib {}
@@ -198,6 +251,27 @@ fn load_lib() -> Result<Lib, String> {
             form_count_objects: sym!("FPDFFormObj_CountObjects"),
             form_get_object: sym!("FPDFFormObj_GetObject"),
             page_to_device: sym!("FPDF_PageToDevice"),
+            create_annot: sym!("FPDFPage_CreateAnnot"),
+            close_annot: sym!("FPDFPage_CloseAnnot"),
+            annot_set_rect: sym!("FPDFAnnot_SetRect"),
+            annot_append_object: sym!("FPDFAnnot_AppendObject"),
+            annot_set_string: sym!("FPDFAnnot_SetStringValue"),
+            annot_set_flags: sym!("FPDFAnnot_SetFlags"),
+            new_path: sym!("FPDFPageObj_CreateNewPath"),
+            path_move_to: sym!("FPDFPath_MoveTo"),
+            path_line_to: sym!("FPDFPath_LineTo"),
+            path_close: sym!("FPDFPath_Close"),
+            path_set_draw_mode: sym!("FPDFPath_SetDrawMode"),
+            obj_set_stroke_color: sym!("FPDFPageObj_SetStrokeColor"),
+            obj_set_stroke_width: sym!("FPDFPageObj_SetStrokeWidth"),
+            obj_set_fill_color: sym!("FPDFPageObj_SetFillColor"),
+            obj_set_line_join: sym!("FPDFPageObj_SetLineJoin"),
+            obj_set_line_cap: sym!("FPDFPageObj_SetLineCap"),
+            obj_transform: sym!("FPDFPageObj_Transform"),
+            obj_destroy: sym!("FPDFPageObj_Destroy"),
+            new_text_obj: sym!("FPDFPageObj_NewTextObj"),
+            text_set_text: sym!("FPDFText_SetText"),
+            save_as_copy: sym!("FPDF_SaveAsCopy"),
         };
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (lib.init_library)();
@@ -318,6 +392,198 @@ impl Document {
     }
 }
 
+/// PDF user space -> page DIPs, exactly as rendering maps it (crop box and
+/// rotation), derived from FPDF_PageToDevice at a large size for sub-pixel
+/// precision. Caller holds `LOCK`.
+unsafe fn page_to_dip(lib: &Lib, p: Page, page_size: (f32, f32)) -> Affine {
+    const K: f32 = 1000.0;
+    let (w, h) = ((page_size.0.round() * K) as c_int, (page_size.1.round() * K) as c_int);
+    let dev = |x: f64, y: f64| {
+        let (mut dx, mut dy) = (0, 0);
+        unsafe { (lib.page_to_device)(p, 0, 0, w, h, 0, x, y, &mut dx, &mut dy) };
+        [dx as f32 / K, dy as f32 / K]
+    };
+    let (o, ex, ey) = (dev(0.0, 0.0), dev(1000.0, 0.0), dev(0.0, 1000.0));
+    Affine([(ex[0] - o[0]) / 1000.0, (ex[1] - o[1]) / 1000.0, (ey[0] - o[0]) / 1000.0, (ey[1] - o[1]) / 1000.0, o[0], o[1]])
+}
+
+impl Affine {
+    fn inverse(self) -> Affine {
+        let [a, b, c, d, e, f] = self.0;
+        let det = a * d - b * c;
+        let (ia, ib, ic, id) = (d / det, -b / det, -c / det, a / det);
+        Affine([ia, ib, ic, id, -(e * ia + f * ic), -(e * ib + f * id)])
+    }
+}
+
+/// One annotation to write: what it is, and how it looks.
+pub struct AnnotSpec {
+    pub page: u32,
+    pub subject: String,
+    pub contents: String,
+    pub author: String,
+    /// Unique name (/NM), e.g. `redbeam-markup-12`.
+    pub name: String,
+    pub prims: Vec<crate::markup::Prim>,
+}
+
+fn utf16z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Write a copy of `src` to `dst` with `annots` added as PDF annotations
+/// (stamp annotations carrying their own appearance, so Acrobat, Bluebeam
+/// and browsers all display them). Returns how many were written.
+pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<usize, String> {
+    use crate::markup::{wrap, Prim};
+    let lib = lib()?;
+    let data = std::fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    let mut written = 0usize;
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() + 65536);
+    {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
+            if doc.is_null() {
+                return Err(error_text((lib.get_last_error)()).to_string());
+            }
+            let mut pages: Vec<u32> = annots.iter().map(|a| a.page).collect();
+            pages.sort_unstable();
+            pages.dedup();
+            for pg in pages {
+                let p = (lib.load_page)(doc, pg as c_int);
+                if p.is_null() {
+                    continue;
+                }
+                let mut sz = FsSizeF { width: 612.0, height: 792.0 };
+                (lib.get_page_size_by_index_f)(doc, pg as c_int, &mut sz);
+                let to_pdf = page_to_dip(lib, p, (sz.width * PT_TO_DIP, sz.height * PT_TO_DIP)).inverse();
+                let k = to_pdf.0[0].hypot(to_pdf.0[1]);
+                // Unit vectors for upright text: DIP x, and DIP "up" (-y).
+                let ux = [to_pdf.0[0] / k, to_pdf.0[1] / k];
+                let uy = [-to_pdf.0[2] / k, -to_pdf.0[3] / k];
+                for a in annots.iter().filter(|a| a.page == pg) {
+                    let annot = (lib.create_annot)(p, ANNOT_STAMP);
+                    if annot.is_null() {
+                        continue;
+                    }
+                    // Annotation rectangle: bounds of everything, in PDF space.
+                    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    let mut grow = |q: [f32; 2], pad: f32| {
+                        let r = to_pdf.apply(q[0], q[1]);
+                        x0 = x0.min(r[0] - pad);
+                        y0 = y0.min(r[1] - pad);
+                        x1 = x1.max(r[0] + pad);
+                        y1 = y1.max(r[1] + pad);
+                    };
+                    for prim in &a.prims {
+                        match prim {
+                            Prim::Path { rings, stroke, .. } => {
+                                let pad = stroke.map(|s| s.1 * k).unwrap_or(0.0) + 1.0;
+                                rings.iter().flatten().for_each(|q| grow(*q, pad));
+                            }
+                            Prim::Text { rect, .. } => {
+                                for q in [[rect[0], rect[1]], [rect[2], rect[3]], [rect[0], rect[3]], [rect[2], rect[1]]] {
+                                    grow(q, 1.0);
+                                }
+                            }
+                        }
+                    }
+                    let r = FsRectF { left: x0, top: y1, right: x1, bottom: y0 };
+                    (lib.annot_set_rect)(annot, &r);
+                    let rgb = |c: u32| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+                    for prim in &a.prims {
+                        match prim {
+                            Prim::Path { rings, closed, stroke, fill } => {
+                                let Some(first) = rings.iter().find(|r| !r.is_empty()) else { continue };
+                                let f0 = to_pdf.apply(first[0][0], first[0][1]);
+                                let obj = (lib.new_path)(f0[0], f0[1]);
+                                for (ri, ring) in rings.iter().filter(|r| !r.is_empty()).enumerate() {
+                                    for (i, q) in ring.iter().enumerate() {
+                                        let t = to_pdf.apply(q[0], q[1]);
+                                        if i == 0 {
+                                            if ri > 0 {
+                                                (lib.path_move_to)(obj, t[0], t[1]);
+                                            }
+                                        } else {
+                                            (lib.path_line_to)(obj, t[0], t[1]);
+                                        }
+                                    }
+                                    if *closed {
+                                        (lib.path_close)(obj);
+                                    }
+                                }
+                                if let Some((c, w)) = stroke {
+                                    let (r, g, b) = rgb(*c);
+                                    (lib.obj_set_stroke_color)(obj, r, g, b, 255);
+                                    (lib.obj_set_stroke_width)(obj, w * k);
+                                }
+                                if let Some((c, alpha)) = fill {
+                                    let (r, g, b) = rgb(*c);
+                                    (lib.obj_set_fill_color)(obj, r, g, b, (alpha * 255.0).round() as u32);
+                                }
+                                (lib.obj_set_line_join)(obj, 1);
+                                (lib.obj_set_line_cap)(obj, 1);
+                                (lib.path_set_draw_mode)(obj, if fill.is_some() { 1 } else { 0 }, stroke.is_some() as c_int);
+                                if (lib.annot_append_object)(annot, obj) == 0 {
+                                    (lib.obj_destroy)(obj);
+                                }
+                            }
+                            Prim::Text { rect, text, size, color, bold, center } => {
+                                let font: &[u8] = if *bold { b"Helvetica-Bold\0" } else { b"Helvetica\0" };
+                                let width = rect[2] - rect[0];
+                                for (i, line) in wrap(text, *size, width).iter().enumerate() {
+                                    if line.is_empty() {
+                                        continue;
+                                    }
+                                    let baseline = rect[1] + size * (0.85 + i as f32 * 1.2);
+                                    if baseline > rect[3] + size * 0.4 {
+                                        break;
+                                    }
+                                    let est = line.chars().count() as f32 * size * if *bold { 0.62 } else { 0.52 };
+                                    let x = if *center { rect[0] + ((width - est) / 2.0).max(0.0) } else { rect[0] };
+                                    let obj = (lib.new_text_obj)(doc, font.as_ptr() as *const c_char, size * k);
+                                    if obj.is_null() {
+                                        continue;
+                                    }
+                                    let w = utf16z(line);
+                                    (lib.text_set_text)(obj, w.as_ptr());
+                                    let (r, g, b) = rgb(*color);
+                                    (lib.obj_set_fill_color)(obj, r, g, b, 255);
+                                    let o = to_pdf.apply(x, baseline);
+                                    (lib.obj_transform)(obj, ux[0] as f64, ux[1] as f64, uy[0] as f64, uy[1] as f64, o[0] as f64, o[1] as f64);
+                                    if (lib.annot_append_object)(annot, obj) == 0 {
+                                        (lib.obj_destroy)(obj);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (key, val) in [("Contents", &a.contents), ("T", &a.author), ("Subj", &a.subject), ("NM", &a.name)] {
+                        let k = std::ffi::CString::new(key).unwrap();
+                        let v = utf16z(val);
+                        (lib.annot_set_string)(annot, k.as_ptr(), v.as_ptr());
+                    }
+                    (lib.annot_set_flags)(annot, ANNOT_FLAG_PRINT);
+                    (lib.close_annot)(annot);
+                    written += 1;
+                }
+                (lib.close_page)(p);
+            }
+            let mut fw = FileWrite { version: 1, write_block, out: &mut out };
+            let ok = (lib.save_as_copy)(doc, &mut fw, FPDF_INCREMENTAL);
+            (lib.close_document)(doc);
+            if ok == 0 {
+                return Err("PDFium could not save the document".into());
+            }
+        }
+    }
+    let tmp = dst.with_extension("pdf.tmp");
+    std::fs::write(&tmp, &out).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dst).map_err(|e| format!("cannot write {}: {e}", dst.display()))?;
+    Ok(written)
+}
+
 impl Document {
     /// All straight segments of the page's line work in page DIPs (curves
     /// contribute their chords), for snapping. `Ok(None)` if cancelled.
@@ -326,25 +592,7 @@ impl Document {
         unsafe {
             let p = self.page(page)?;
             let lib = self.lib;
-            // PDF user space -> page DIPs, exactly as rendering maps it
-            // (crop box and rotation), derived from FPDF_PageToDevice at a
-            // large size for sub-pixel precision.
-            const K: f32 = 1000.0;
-            let (w, h) = ((page_size.0.round() * K) as c_int, (page_size.1.round() * K) as c_int);
-            let dev = |x: f64, y: f64| {
-                let (mut dx, mut dy) = (0, 0);
-                (lib.page_to_device)(p, 0, 0, w, h, 0, x, y, &mut dx, &mut dy);
-                [dx as f32 / K, dy as f32 / K]
-            };
-            let (o, ex, ey) = (dev(0.0, 0.0), dev(1000.0, 0.0), dev(0.0, 1000.0));
-            let to_dip = Affine([
-                (ex[0] - o[0]) / 1000.0,
-                (ex[1] - o[1]) / 1000.0,
-                (ey[0] - o[0]) / 1000.0,
-                (ey[1] - o[1]) / 1000.0,
-                o[0],
-                o[1],
-            ]);
+            let to_dip = page_to_dip(lib, p, page_size);
             let mut out: Vec<[[f32; 2]; 2]> = Vec::new();
             // Explicit stack: (object, transform of its parent form).
             let mut stack: Vec<(Obj, Affine)> =

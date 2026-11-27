@@ -17,6 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
 
+mod markups;
 mod panel;
 mod tools;
 
@@ -33,6 +34,8 @@ use crate::worker::{Change, Engine, Job, JobKey, JobKind, Msg, Pool, WM_APP_RESU
 
 pub const WM_APP_OPEN: u32 = WM_APP + 2;
 pub const WM_APP_COMPARE: u32 = WM_APP + 4;
+/// A background task (e.g. PDF export) finished.
+pub const WM_APP_BG: u32 = WM_APP + 5;
 const TIMER_SETTLE: usize = 1;
 /// How long the view must be still before a pixel-exact detail render is requested.
 const SETTLE_MS: u32 = 140;
@@ -90,6 +93,8 @@ V  or  Esc\tSelect: drag to move, drag handles to reshape\n\
   \tDrag a label for a leader \u{00B7} right-click for properties\n\
   \tDouble-click an edge to add a point \u{00B7} Del deletes\n\
 Ctrl+C / V / D\tCopy, paste at cursor, duplicate\n\
+M\tToolbar: Takeoff \u{2194} Markup tools\n\
+C T K A L R E H\tMarkup: cloud, text, callout, arrow, line, rect, ellipse, highlight\n\
 Enter / dbl-click\tFinish polyline, area or count\n\
 Shift (while measuring)\tStraight lines (0\u{00B0}/45\u{00B0}/90\u{00B0})\n\
 Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
@@ -185,6 +190,8 @@ struct Fonts {
     perf: IDWriteTextFormat,
     /// Small one-line secondary text (file folders).
     small: IDWriteTextFormat,
+    /// Markup text (size set per layout).
+    markup: IDWriteTextFormat,
     /// Measurement labels.
     label: IDWriteTextFormat,
     ui: IDWriteTextFormat,
@@ -229,8 +236,8 @@ pub struct App {
     /// Pages-panel thumbnails keyed by (document, sheet).
     thumbs: HashMap<(u64, u32), Cached>,
     settings: Settings,
-    /// Scroll offset per panel tab (Pages, Files, Settings).
-    panel_scroll: [f32; 3],
+    /// Scroll offset per panel tab (Pages, Files, Markups, Settings).
+    panel_scroll: [f32; 4],
     /// Sharp renders of recently seen views (any sheet near the current one),
     /// least recently added first.
     details: Vec<Cached>,
@@ -282,6 +289,16 @@ pub struct App {
     tool_hover: Option<TBtn>,
     /// Where the left button went down (click vs drag).
     down_at: Option<(i32, i32)>,
+    /// Toolbar shows markup tools instead of takeoff tools.
+    markup_mode: bool,
+    selected_markup: Option<u64>,
+    mdraft: Option<markups::MDraft>,
+    /// Where a stamp goes once picked from the menu.
+    stamp_at: Option<[f32; 2]>,
+    bg_tx: Sender<std::result::Result<String, String>>,
+    bg_rx: Receiver<std::result::Result<String, String>>,
+    /// Save-a-copy request: Some(with takeoffs).
+    pub pending_pdf_save: Option<bool>,
     pub pending_menu: Option<MenuKind>,
     pub pending_export: Option<ExportKind>,
 
@@ -416,7 +433,8 @@ fn make_fonts(dw: &IDWriteFactory, s: f32) -> Result<Fonts> {
         one_line(&label, DWRITE_TEXT_ALIGNMENT_CENTER)?;
         let small = mk(11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
         one_line(&small, DWRITE_TEXT_ALIGNMENT_LEADING)?;
-        Ok(Fonts { perf, small, label, ui, ui_center, ui_right, title, body })
+        let markup = mk(12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+        Ok(Fonts { perf, small, markup, label, ui, ui_center, ui_right, title, body })
     }
 }
 
@@ -445,6 +463,7 @@ impl App {
             let _ = GetClientRect(hwnd, &mut rc);
         }
         let (upd_tx, upd_rx) = channel();
+        let (bg_tx, bg_rx) = channel();
         if settings.check_updates {
             update::spawn_check(hwnd, upd_tx.clone(), false);
         }
@@ -468,7 +487,7 @@ impl App {
             blend,
             bases: HashMap::new(),
             thumbs: HashMap::new(),
-            panel_scroll: [0.0; 3],
+            panel_scroll: [0.0; 4],
             details: Vec::new(),
             detail_budget,
             posted: Vec::new(),
@@ -505,6 +524,13 @@ impl App {
             show_qty: false,
             tool_hover: None,
             down_at: None,
+            markup_mode: false,
+            selected_markup: None,
+            mdraft: None,
+            stamp_at: None,
+            bg_tx,
+            bg_rx,
+            pending_pdf_save: None,
             pending_menu: None,
             pending_export: None,
             update: if settings.check_updates { UpdState::Checking } else { UpdState::Idle },
@@ -1641,7 +1667,7 @@ impl App {
     fn paint_help(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
-        let (pw, ph) = (660.0 * s, 760.0 * s);
+        let (pw, ph) = (680.0 * s, 820.0 * s);
         let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round(), 0.0, 0.0);
         let panel = RectF::new(panel.l, panel.t, panel.l + pw, panel.t + ph);
         self.fill(&panel, 0x141518, 0.94);
@@ -1722,6 +1748,7 @@ impl App {
             }
             self.paint_changes();
             self.paint_takeoff();
+            self.paint_markups();
             self.paint_snap_marker();
             ctx.PopAxisAlignedClip();
             self.paint_tools_ui();
@@ -2070,7 +2097,11 @@ impl App {
                                 self.press_tool(tb);
                                 return Some(0);
                             }
-                            if self.over_tool_ui(fx, fy) || self.tools_canvas_down(fx, fy) {
+                            if self.over_tool_ui(fx, fy) {
+                                return Some(0);
+                            }
+                            if self.tools_canvas_down(fx, fy) {
+                                SetCapture(hwnd);
                                 return Some(0);
                             }
                             if self.select_mouse_down(fx, fy) {
@@ -2105,7 +2136,7 @@ impl App {
                 WM_MOUSEMOVE => {
                     let (x, y) = (lo(lp), hi(lp));
                     self.mouse = (x, y);
-                    if self.edit_drag_move(x as f32, y as f32) {
+                    if self.markup_draft_move(x as f32, y as f32) || self.edit_drag_move(x as f32, y as f32) {
                         return Some(0);
                     }
                     if let Some((lx, ly)) = self.drag {
@@ -2126,6 +2157,10 @@ impl App {
                     Some(0)
                 }
                 WM_LBUTTONUP | WM_MBUTTONUP => {
+                    if msg == WM_LBUTTONUP && self.markup_draft_up(lo(lp) as f32, hi(lp) as f32) {
+                        let _ = ReleaseCapture();
+                        return Some(0);
+                    }
                     if msg == WM_LBUTTONUP && self.edit_drag_end() {
                         let _ = ReleaseCapture();
                         return Some(0);
@@ -2140,6 +2175,8 @@ impl App {
                             self.select_at(x as f32, y as f32);
                         }
                     }
+                    // Tools capture the mouse on press; always let go.
+                    let _ = ReleaseCapture();
                     Some(0)
                 }
                 WM_CAPTURECHANGED => {
@@ -2171,6 +2208,10 @@ impl App {
                 }
                 WM_APP_UPDATE => {
                     self.on_update_msgs();
+                    Some(0)
+                }
+                WM_APP_BG => {
+                    self.on_bg_msgs();
                     Some(0)
                 }
                 _ => None,

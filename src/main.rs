@@ -7,6 +7,7 @@ compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.
 mod app;
 mod diff;
 mod gfx;
+mod markup;
 mod pdfium;
 mod settings;
 mod snap;
@@ -151,6 +152,22 @@ fn save_dialog(hwnd: HWND, default_name: &str, kind: app::ExportKind) -> Option<
     }
 }
 
+fn save_pdf_dialog(hwnd: HWND, default_name: &str) -> Option<PathBuf> {
+    unsafe {
+        let dlg: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let filters = [COMDLG_FILTERSPEC { pszName: w!("PDF"), pszSpec: w!("*.pdf") }];
+        dlg.SetFileTypes(&filters).ok()?;
+        dlg.SetDefaultExtension(w!("pdf")).ok()?;
+        dlg.SetFileName(&HSTRING::from(default_name)).ok()?;
+        dlg.SetTitle(w!("Save a copy with markups")).ok()?;
+        dlg.Show(Some(hwnd)).ok()?;
+        let p = dlg.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s.map(PathBuf::from)
+    }
+}
+
 fn after(hwnd: HWND) {
     // Menus and dialogs run their own message loops, so they are shown here,
     // outside the App borrow.
@@ -162,6 +179,12 @@ fn after(hwnd: HWND) {
     if let Some((kind, name)) = with_app(|a| a.pending_export.take().map(|k| (k, a.export_default_name(k)))).flatten() {
         if let Some(p) = save_dialog(hwnd, &name, kind) {
             with_app(|a| a.export(kind, p));
+        }
+        repaint(hwnd);
+    }
+    if let Some((with, name)) = with_app(|a| a.pending_pdf_save.take().map(|w| (w, a.pdf_default_name()))).flatten() {
+        if let Some(p) = save_pdf_dialog(hwnd, &name) {
+            with_app(|a| a.start_pdf_export(p, with));
         }
         repaint(hwnd);
     }
