@@ -192,6 +192,11 @@ pub struct Lib {
     render_page_dc: unsafe extern "system" fn(*mut c_void, Page, c_int, c_int, c_int, c_int, c_int, c_int),
     page_insert_object: unsafe extern "system" fn(Page, Obj),
     page_generate_content: unsafe extern "system" fn(Page) -> c_int,
+    // Sheet tools
+    create_new_document: unsafe extern "system" fn() -> Doc,
+    import_pages: unsafe extern "system" fn(Doc, Doc, *const c_char, c_int) -> c_int,
+    page_get_rotation: unsafe extern "system" fn(Page) -> c_int,
+    page_set_rotation: unsafe extern "system" fn(Page, c_int),
 }
 unsafe impl Send for Lib {}
 unsafe impl Sync for Lib {}
@@ -308,6 +313,10 @@ fn load_lib() -> Result<Lib, String> {
             render_page_dc: sym!("FPDF_RenderPage"),
             page_insert_object: sym!("FPDFPage_InsertObject"),
             page_generate_content: sym!("FPDFPage_GenerateContent"),
+            create_new_document: sym!("FPDF_CreateNewDocument"),
+            import_pages: sym!("FPDF_ImportPages"),
+            page_get_rotation: sym!("FPDFPage_GetRotation"),
+            page_set_rotation: sym!("FPDFPage_SetRotation"),
         };
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (lib.init_library)();
@@ -636,6 +645,68 @@ pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool) -> Result<(Ve
         }
     }
     Ok((out, written))
+}
+
+/// Build a new PDF from sheets of existing PDFs and save it to `dst`:
+/// `parts` = (source file, sheets to take in order (0-based), or all if
+/// empty), `rotate` = quarter turns per output sheet (0-based index in the
+/// new file). Sources are never modified. Returns the new sheet count.
+pub fn assemble(parts: &[(PathBuf, Vec<u32>)], rotate: &[(u32, i32)], dst: &Path) -> Result<usize, String> {
+    let lib = lib()?;
+    let datas: Vec<Vec<u8>> = parts
+        .iter()
+        .map(|(p, _)| std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display())))
+        .collect::<Result<_, _>>()?;
+    let mut out: Vec<u8> = Vec::new();
+    let count;
+    {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let dest = (lib.create_new_document)();
+            if dest.is_null() {
+                return Err("PDFium could not create a document".into());
+            }
+            let mut n = 0;
+            for ((path, pages), data) in parts.iter().zip(&datas) {
+                let src = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
+                if src.is_null() {
+                    (lib.close_document)(dest);
+                    return Err(format!("{}: {}", path.display(), error_text((lib.get_last_error)())));
+                }
+                let range = if pages.is_empty() {
+                    None
+                } else {
+                    Some(std::ffi::CString::new(pages.iter().map(|p| (p + 1).to_string()).collect::<Vec<_>>().join(",")).unwrap())
+                };
+                let ok = (lib.import_pages)(dest, src, range.as_ref().map(|r| r.as_ptr()).unwrap_or(std::ptr::null()), n);
+                n += if pages.is_empty() { (lib.get_page_count)(src) } else { pages.len() as c_int };
+                (lib.close_document)(src);
+                if ok == 0 {
+                    (lib.close_document)(dest);
+                    return Err(format!("could not copy sheets from {}", path.display()));
+                }
+            }
+            for &(i, q) in rotate {
+                let p = (lib.load_page)(dest, i as c_int);
+                if !p.is_null() {
+                    let r = ((lib.page_get_rotation)(p) + q).rem_euclid(4);
+                    (lib.page_set_rotation)(p, r);
+                    (lib.close_page)(p);
+                }
+            }
+            count = (lib.get_page_count)(dest).max(0) as usize;
+            let mut fw = FileWrite { version: 1, write_block, out: &mut out };
+            let ok = (lib.save_as_copy)(dest, &mut fw, 2);
+            (lib.close_document)(dest);
+            if ok == 0 {
+                return Err("PDFium could not save the new document".into());
+            }
+        }
+    }
+    let tmp = dst.with_extension("pdf.tmp");
+    std::fs::write(&tmp, &out).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dst).map_err(|e| format!("cannot write {}: {e}", dst.display()))?;
+    Ok(count)
 }
 
 /// Print `pages` (0-based) of the PDF `data` to printer DC `hdc`: each

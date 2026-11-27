@@ -5,7 +5,43 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::takeoff::Units;
+use crate::markup::MKind;
+use crate::takeoff::{EndStyle, Kind, Units};
+
+/// What a preset draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PresetTool {
+    Measure(Kind),
+    Volume,
+    Markup(MKind),
+}
+
+/// A saved tool with its settings (Bluebeam's Tool Chest).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Preset {
+    pub name: String,
+    pub tool: PresetTool,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub layer: String,
+    #[serde(default)]
+    pub ends: EndStyle,
+    #[serde(default)]
+    pub leader: EndStyle,
+    #[serde(default)]
+    pub depth_in: Option<f64>,
+    #[serde(default)]
+    pub height_in: Option<f64>,
+    #[serde(default)]
+    pub slope: Option<f64>,
+    #[serde(default)]
+    pub color: u32,
+    #[serde(default)]
+    pub width: f32,
+    #[serde(default)]
+    pub font: f32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Background {
@@ -80,6 +116,7 @@ pub struct Settings {
     pub markup_color: u32,
     pub markup_width: f32,
     pub markup_font: f32,
+    pub presets: Vec<Preset>,
 }
 
 impl Default for Settings {
@@ -100,6 +137,7 @@ impl Default for Settings {
             markup_color: 0xe53935,
             markup_width: 2.0,
             markup_font: 14.0,
+            presets: Vec::new(),
         }
     }
 }

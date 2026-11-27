@@ -204,6 +204,25 @@ pub struct Takeoff {
     /// Markups (clouds, text, callouts, ...) on this drawing.
     #[serde(default)]
     pub markups: Vec<crate::markup::Markup>,
+    /// Detail areas with their own scale (override the sheet scale).
+    #[serde(default)]
+    pub viewports: Vec<Viewport>,
+}
+
+/// A region of a sheet drawn at a different scale (e.g. a 1/4" detail on
+/// a 1/8" plan sheet).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Viewport {
+    pub sheet: u32,
+    /// Page DIPs [l, t, r, b].
+    pub rect: [f32; 4],
+    pub scale: Scale,
+}
+
+impl Viewport {
+    pub fn contains(&self, p: [f32; 2]) -> bool {
+        p[0] >= self.rect[0] && p[0] <= self.rect[2] && p[1] >= self.rect[1] && p[1] <= self.rect[3]
+    }
 }
 
 /// Distinct, print-friendly colours handed to new groups in turn.
@@ -598,8 +617,28 @@ impl Takeoff {
         }
     }
 
+    /// The sheet's own scale.
     pub fn scale(&self, sheet: u32) -> Option<&Scale> {
         self.scales.get(&sheet)
+    }
+
+    /// Scale at a point: the smallest viewport containing it, else the
+    /// sheet scale.
+    pub fn scale_at(&self, sheet: u32, p: [f32; 2]) -> Option<&Scale> {
+        self.viewports
+            .iter()
+            .filter(|v| v.sheet == sheet && v.contains(p))
+            .min_by(|a, b| ((a.rect[2] - a.rect[0]) * (a.rect[3] - a.rect[1])).total_cmp(&((b.rect[2] - b.rect[0]) * (b.rect[3] - b.rect[1]))))
+            .map(|v| &v.scale)
+            .or_else(|| self.scale(sheet))
+    }
+
+    /// Scale for a measurement: where its first point lies.
+    pub fn scale_of(&self, m: &Measure) -> Option<&Scale> {
+        match m.points.first() {
+            Some(p) => self.scale_at(m.sheet, *p),
+            None => self.scale(m.sheet),
+        }
     }
 
     pub fn group(&self, name: &str) -> Option<&Group> {
@@ -609,7 +648,7 @@ impl Takeoff {
     /// Cost of one measurement from its group's unit prices, if priced.
     pub fn cost(&self, m: &Measure) -> Option<f64> {
         let p = self.group(&m.group)?.prices;
-        let scale = self.scale(m.sheet);
+        let scale = self.scale_of(m);
         let mut cost = 0.0;
         let mut priced = false;
         let mut add = |qty: f64, price: Option<f64>| {
@@ -637,7 +676,7 @@ impl Takeoff {
 
     /// Add one measurement into running totals.
     pub fn accumulate(&self, t: &mut Totals, m: &Measure) {
-        let scale = self.scale(m.sheet);
+        let scale = self.scale_of(m);
         t.items += 1;
         t.sheets.insert(m.sheet);
         match m.qty(scale) {
@@ -837,7 +876,7 @@ impl Takeoff {
         let mut items: Vec<&Measure> = self.items.iter().collect();
         items.sort_by(|a, b| (&a.group, a.sheet, a.id).cmp(&(&b.group, b.sheet, b.id)));
         for m in &items {
-            let scale = self.scale(m.sheet);
+            let scale = self.scale_of(m);
             let q = m.qty(scale);
             let counted = self.layer_visible(&m.layer);
             let none = || (String::new(), "");
@@ -933,6 +972,20 @@ mod tests {
         for bad in ["", "abc", "0", "-3'", "1/0\""] {
             assert!(parse_len(bad).is_none(), "{bad} should not parse");
         }
+    }
+
+    #[test]
+    fn viewport_scales() {
+        let mut t = Takeoff::new();
+        t.scales.insert(0, Scale::from_ratio("1/8\" = 1'-0\"", 96.0));
+        t.viewports.push(Viewport { sheet: 0, rect: [1000.0, 1000.0, 2000.0, 2000.0], scale: Scale::from_ratio("1/4\" = 1'-0\"", 48.0) });
+        let plan = t.add(0, Kind::Length, vec![[0.0, 0.0], [96.0, 0.0]], "G", "Default");
+        let detail = t.add(0, Kind::Length, vec![[1100.0, 1100.0], [1196.0, 1100.0]], "G", "Default");
+        let q = |id| t.items.iter().find(|m| m.id == id).map(|m| m.qty(t.scale_of(m))).unwrap();
+        // One paper inch: 8' on the plan, 4' in the 1/4" detail.
+        assert_eq!(q(plan), Qty::Length(96.0));
+        assert_eq!(q(detail), Qty::Length(48.0));
+        assert_eq!(t.scale_at(1, [1500.0, 1500.0]), None);
     }
 
     #[test]

@@ -128,13 +128,26 @@ The takeoff toolbar sits at the top-left of the drawing.
 7. **Slope and wall height** (right-click a measurement):
    * **Slope / pitch** (`6:12`, `1:12`, `26.6°`, `8.33%`) turns plan lengths and areas into true sloped size, for roofs and ramps.
    * **Wall height** on a length adds a **wall area**, e.g. drywall or paint, priced per SF.
-8. **Quantities** (`Q`): totals per group (length, area, perimeter, count) across all sheets, with warnings for sheets that have no scale.
-9. **Export ▾:**
+8. **Detail scales:** in **Scale ▾ → Add a detail scale**, drag a box around a detail drawn at a different scale (e.g. a 1/4" detail on a 1/8" plan), then pick its scale or calibrate inside it. Measurements whose first point is inside the box use that scale. Remove one from the same menu.
+9. **Presets ▾** (Bluebeam's Tool Chest): set up a tool or select a configured measurement, then **Save current tool as a preset**, e.g. *6" slab* (Volume, Concrete group, 6" depth) or *Type A wall* (Length, 9' wall height). Click a preset to measure with all its settings. Markup presets keep colour, width and font. Presets are saved with your settings and work in every drawing.
+10. **Quantities** (`Q`): totals per group (length, area, perimeter, count) across all sheets, with warnings for sheets that have no scale.
+11. **Export ▾:**
    * **Excel workbook:** a *Summary* tab with each group's quantities, unit prices (editable, highlighted yellow) and live cost formulas with totals; a *By sheet* tab; and an *Items* tab with every measurement, filterable.
    * **CSV:** the same data as plain text.
-10. **Units ▾:** feet-inches (default), decimal feet, or metric.
+12. **Units ▾:** feet-inches (default), decimal feet, or metric.
 
 Takeoffs save automatically to `<drawing name>.redbeam.json` next to the PDF. If that folder is read-only, they go to `%LOCALAPPDATA%\Red-Beam\takeoffs`. **The PDF itself is never modified.** Quantities are computed from each sheet's current scale, so correcting a calibration updates every measurement on that sheet.
+
+### Sheet tools
+
+**Sheets ▾** in the status bar:
+
+* **Combine PDFs into one set**, or **Open a folder of PDFs as one set**: files are sorted naturally (A-2 before A-10).
+* **Extract sheets to a new PDF**, e.g. `3` or `1, 4-6`.
+* **Save a copy without some sheets.**
+* **Save a copy with this sheet rotated** ↻ / ↺.
+
+Each one writes a **new** PDF and opens it in a new tab. Source files are never modified.
 
 ### Tabs and split view
 
@@ -219,6 +232,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/markup.rs` | Markup model: kinds, hit testing, handles, and drawing primitives shared by the screen and PDF export (unit-tested) |
 | `src/app/markups.rs` | Markup tools, editing, menus, Markups list, Save a copy with markups |
 | `src/sheets.rs` | Sheet numbers and titles, sheet links, phrase search (unit-tested) |
+| `src/app/extras.rs` | Detail viewport scales, tool presets, sheet tools (combine, folder as set, extract, rotate) |
 | `src/app/tabs.rs` | Document tabs (park and restore per-document state), tab strip |
 | `src/app/find.rs` | Find / Go to sheet UI, highlighted hits, clickable sheet links |
 | `src/snap.rs` | Snap index over a sheet's line work: nearest corner, else nearest point on a line (unit-tested) |
@@ -238,7 +252,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 2. **Takeoffs:** scales and calibration, length, polyline, area (with cut-outs), volume, count, snapping, groups, layers, editing, leaders, a quantities panel and CSV export are done. Next: per-viewport scales, intersection snapping, and a native Excel export.
 3. **Markups:** cloud, text, callout, arrow, line, rectangle, ellipse, highlight, pen and stamps are done, with status, a markups list and saving into a PDF copy. Next: importing markups that already exist in a PDF so they can be edited, and reply threads.
 4. **Navigation and UI:** the side panel, sheet names, text search, go-to-sheet, clickable sheet links, tabs and side-by-side split view are done. Next: UI polish.
-5. **Rollout:** installer, "Open with Red-Beam", shared tool sets.
+5. **Rollout:** installer, "Open with Red-Beam", sharing presets with a team.
 
 ## Third-party software
 

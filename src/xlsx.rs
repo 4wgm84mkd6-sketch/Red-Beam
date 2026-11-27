@@ -212,7 +212,7 @@ pub fn write(t: &Takeoff, path: &Path, title: &str, sheet_name: &dyn Fn(u32) -> 
     items.sort_by(|a, b| (&a.group, a.sheet, a.id).cmp(&(&b.group, b.sheet, b.id)));
     for (i, m) in items.iter().enumerate() {
         let r = 1 + i as u32;
-        let scale = t.scale(m.sheet);
+        let scale = t.scale_of(m);
         let q = m.qty(scale);
         ws.write_string(r, 0, &m.group)?;
         ws.write_string(r, 1, &m.layer)?;

@@ -164,9 +164,66 @@ pub fn search_page(page: u32, words: &[Word], query: &str) -> Vec<Hit> {
     hits
 }
 
+/// Parse "1, 3-5, 8" (1-based, as typed) into sorted 0-based sheets.
+pub fn parse_range(s: &str, count: u32) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for part in s.split([',', ';', ' ']).filter(|p| !p.trim().is_empty()) {
+        let (a, b) = match part.split_once(['-', '\u{2013}']) {
+            Some((a, b)) => (a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?),
+            None => {
+                let v = part.trim().parse::<u32>().ok()?;
+                (v, v)
+            }
+        };
+        if a == 0 || b == 0 || a > count || b > count || a > b {
+            return None;
+        }
+        out.extend(a - 1..b);
+    }
+    out.sort_unstable();
+    out.dedup();
+    (!out.is_empty()).then_some(out)
+}
+
+/// Sort key so "A-2" comes before "A-10" (natural order).
+pub fn natural_key(s: &str) -> Vec<(u8, u64, String)> {
+    let mut key = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut n = String::new();
+            while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                n.push(d);
+                chars.next();
+            }
+            key.push((0, n.parse().unwrap_or(u64::MAX), String::new()));
+        } else {
+            let mut t = String::new();
+            while let Some(&d) = chars.peek().filter(|d| !d.is_ascii_digit()) {
+                t.push(d.to_ascii_lowercase());
+                chars.next();
+            }
+            key.push((1, 0, t));
+        }
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranges_and_order() {
+        assert_eq!(parse_range("1, 3-5, 8", 10), Some(vec![0, 2, 3, 4, 7]));
+        assert_eq!(parse_range("2-2", 3), Some(vec![1]));
+        assert_eq!(parse_range("0", 3), None);
+        assert_eq!(parse_range("4", 3), None);
+        assert_eq!(parse_range("x", 3), None);
+        let mut names = vec!["A-10.pdf", "A-2.pdf", "a-1.pdf", "S-1.pdf"];
+        names.sort_by_key(|n| natural_key(n));
+        assert_eq!(names, vec!["a-1.pdf", "A-2.pdf", "A-10.pdf", "S-1.pdf"]);
+    }
 
     fn w(text: &str, x: f32, y: f32, size: f32) -> Word {
         Word { text: text.into(), rect: [x, y, x + size * text.len() as f32 * 0.6, y + size], size }

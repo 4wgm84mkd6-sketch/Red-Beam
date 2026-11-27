@@ -68,6 +68,8 @@ pub enum Tool {
     Cutout(u64),
     /// Draw a markup.
     Markup(MKind),
+    /// Drag a box around a detail that has its own scale.
+    Viewport,
 }
 
 impl Tool {
@@ -77,7 +79,7 @@ impl Tool {
             Tool::Measure(k) => Some(k),
             Tool::Volume | Tool::Cutout(_) => Some(Kind::Area),
             Tool::Calibrate => Some(Kind::Length),
-            Tool::Select | Tool::Markup(_) => None,
+            Tool::Select | Tool::Markup(_) | Tool::Viewport => None,
         }
     }
 }
@@ -92,6 +94,7 @@ pub enum TBtn {
     MWidth,
     MFont,
     SavePdf,
+    Presets,
     Select,
     Scale,
     Tool(Kind),
@@ -117,6 +120,9 @@ pub enum MenuKind {
     MFont,
     SavePdf,
     MarkupContext { id: u64 },
+    ViewportScale,
+    Presets,
+    Sheets,
     /// Right-click on a measurement: maybe on one of its points
     /// (ring 0 = outline, ring k = cut-out k-1) or inside a cut-out.
     Context { id: u64, vertex: Option<(usize, usize)>, hole: Option<usize> },
@@ -140,6 +146,8 @@ pub enum PromptFor {
     MarkupText { id: u64 },
     Find,
     GoTo,
+    PresetName,
+    SheetRange { delete: bool },
 }
 
 pub struct Prompt {
@@ -160,6 +168,7 @@ pub enum Undo {
     Layers(Vec<Measure>, Vec<Layer>),
     /// Items and groups before a group rename.
     Groups(Vec<Measure>, Vec<takeoff::Group>),
+    Viewports(Vec<takeoff::Viewport>),
     MarkupAdded(u64),
     MarkupRemoved(Markup),
     MarkupModified(Markup),
@@ -200,6 +209,8 @@ const CMD_SET_HEIGHT: usize = 916;
 const CMD_CLEAR_HEIGHT: usize = 917;
 const CMD_EXPORT_XLSX: usize = 918;
 const CMD_EXPORT_CSV: usize = 919;
+const CMD_ADD_VP: usize = 920;
+const CMD_VP_REMOVE: usize = 16_000;
 const CMD_GROUP_ACTIVE: usize = 10_000;
 const CMD_GROUP_RENAME: usize = 11_000;
 const CMD_PRICE_LF: usize = 12_000;
@@ -339,6 +350,10 @@ impl App {
             self.selected_markup = None;
         }
         self.mdraft = None;
+        self.active_preset = None;
+        if tool != Tool::Calibrate {
+            self.calib_vp = None;
+        }
         self.update_jobs(false);
         self.invalidate();
     }
@@ -449,7 +464,8 @@ impl App {
             (TBtn::Layer, format!("Layer: {} \u{25BE}", self.layer), 140.0, 4.0),
             (TBtn::Units, format!("{units} \u{25BE}"), 72.0, 8.0),
             (TBtn::Quantities, "Quantities".into(), 90.0, 4.0),
-            (TBtn::Export, "Export".into(), 64.0, 0.0),
+            (TBtn::Export, "Export".into(), 64.0, 8.0),
+            (TBtn::Presets, self.presets_label(), 130.0, 0.0),
         ]
         };
         let mut x = self.left_inset() + 8.0 * s;
@@ -507,6 +523,7 @@ impl App {
             TBtn::MWidth => self.pending_menu = Some(MenuKind::MWidth),
             TBtn::MFont => self.pending_menu = Some(MenuKind::MFont),
             TBtn::SavePdf => self.pending_menu = Some(MenuKind::SavePdf),
+            TBtn::Presets => self.pending_menu = Some(MenuKind::Presets),
             TBtn::Select => self.set_tool(Tool::Select),
             TBtn::Tool(k) => self.set_tool(Tool::Measure(k)),
             TBtn::Volume => self.set_tool(Tool::Volume),
@@ -552,6 +569,9 @@ impl App {
                 v.push(sep());
                 v.push(item(CMD_APPLY_ALL, "Apply this sheet's scale to all sheets", false));
                 v.push(item(CMD_CLEAR, "Clear this sheet's scale", false));
+                v.push(sep());
+                v.push(item(CMD_ADD_VP, "Add a detail scale (drag a box around a detail)\u{2026}", false));
+                v.extend(self.viewport_remove_items(CMD_VP_REMOVE));
                 v
             }
             MenuKind::Group => {
@@ -631,6 +651,9 @@ impl App {
                 item(CMD_BASE + 1, "Decimal feet (12.52') and SF", self.takeoff.units == Units::DecimalFeet),
                 item(CMD_BASE + 2, "Metric (m and m\u{00B2})", self.takeoff.units == Units::Metric),
             ],
+            MenuKind::ViewportScale => self.viewport_menu_items(),
+            MenuKind::Presets => self.preset_menu_items(),
+            MenuKind::Sheets => self.sheets_menu_items(),
             // Markup menus are handled in markups.rs.
             MenuKind::Stamp | MenuKind::MColor | MenuKind::MWidth | MenuKind::MFont | MenuKind::SavePdf | MenuKind::MarkupContext { .. } => {
                 Vec::new()
@@ -738,6 +761,11 @@ impl App {
                         }
                         self.save_takeoff();
                     }
+                } else if cmd == CMD_ADD_VP {
+                    self.set_tool(Tool::Viewport);
+                    self.status = Some("Detail scale: drag a box around the detail".into());
+                } else if let Some(i) = cmd.checked_sub(CMD_VP_REMOVE).filter(|i| *i < self.takeoff.viewports.len()) {
+                    self.remove_viewport(i);
                 } else if cmd == CMD_CLEAR {
                     let old = self.takeoff.scales.remove(&sheet);
                     self.undo.push(Undo::Scale(sheet, old));
@@ -766,6 +794,9 @@ impl App {
                 self.save_takeoff();
             }
             MenuKind::Context { id, vertex, hole } => self.context_menu(id, vertex, hole, cmd),
+            MenuKind::ViewportScale => self.viewport_menu_result(cmd),
+            MenuKind::Presets => self.preset_menu_result(cmd),
+            MenuKind::Sheets => self.sheets_menu_result(cmd),
             MenuKind::Stamp | MenuKind::MColor | MenuKind::MWidth | MenuKind::MFont | MenuKind::SavePdf | MenuKind::MarkupContext { .. } => {}
         }
         self.invalidate();
@@ -1084,6 +1115,7 @@ impl App {
                 true
             }
             Tool::Markup(k) => self.markup_down(k, x, y),
+            Tool::Viewport => self.markup_down(MKind::Rect, x, y),
             Tool::Measure(_) | Tool::Volume | Tool::Cutout(_) => {
                 let p = self.place_pt(x, y);
                 self.pending_pts.push(p);
@@ -1175,11 +1207,13 @@ impl App {
             l.visible = true;
         }
         self.undo.push(Undo::Added(id));
-        if self.takeoff.scale(sheet).is_none() && kind != Kind::Count {
+        let first = self.takeoff.items.iter().find(|m| m.id == id).and_then(|m| m.points.first().copied()).unwrap_or([0.0, 0.0]);
+        if self.takeoff.scale_at(sheet, first).is_none() && kind != Kind::Count {
             self.status = Some("This sheet has no scale \u{2014} set one from the Scale menu".into());
         }
+        let preset_depth = self.preset_extras(id);
         self.save_takeoff();
-        if self.tool == Tool::Volume {
+        if self.tool == Tool::Volume && !preset_depth {
             self.ask_depth(id);
         }
         self.invalidate();
@@ -1203,7 +1237,7 @@ impl App {
     }
 
     fn label_text(&self, m: &Measure) -> String {
-        let scale = self.takeoff.scale(m.sheet);
+        let scale = self.takeoff.scale_of(m);
         let mut t = match m.kind {
             Kind::Count => format!("{} \u{00D7}{}", m.group, m.points.len()),
             _ => takeoff::fmt_qty(m.qty(scale), self.takeoff.units),
@@ -1516,6 +1550,7 @@ impl App {
                 self.takeoff.scales.remove(&sheet);
             }
             Undo::AllScales(all) => self.takeoff.scales = all,
+            Undo::Viewports(v) => self.takeoff.viewports = v,
             Undo::MarkupAdded(id) => self.takeoff.markups.retain(|m| m.id != id),
             Undo::MarkupRemoved(m) => self.takeoff.markups.push(m),
             Undo::MarkupModified(m) => {
@@ -1633,10 +1668,16 @@ impl App {
         match p.purpose {
             PromptFor::Calibrate { sheet, dip_len } => match takeoff::parse_len(&p.text).and_then(|real| Scale::calibrated(dip_len, real)) {
                 Some(sc) => {
-                    let old = self.takeoff.scales.insert(sheet, sc);
-                    self.undo.push(Undo::Scale(sheet, old));
+                    match self.calib_vp.take() {
+                        // Calibrating a detail viewport.
+                        Some(rect) => self.add_viewport(sheet, rect, Scale { label: format!("{} (calibrated)", "Detail"), ..sc }),
+                        None => {
+                            let old = self.takeoff.scales.insert(sheet, sc);
+                            self.undo.push(Undo::Scale(sheet, old));
+                            self.save_takeoff();
+                        }
+                    }
                     self.status = None;
-                    self.save_takeoff();
                     self.set_tool(Tool::Select);
                 }
                 None => {
@@ -1763,6 +1804,8 @@ impl App {
             }
             PromptFor::MarkupText { id } => self.set_markup_text(id, p.text.clone()),
             PromptFor::Find => self.run_find(p.text.clone()),
+            PromptFor::PresetName => self.save_preset(p.text.clone()),
+            PromptFor::SheetRange { delete } => self.sheet_range_entered(&p.text.clone(), delete),
             PromptFor::GoTo => self.goto_sheet(p.text.clone()),
             PromptFor::RenameLayer(i) => {
                 let new = p.text.trim().to_string();
@@ -1998,9 +2041,10 @@ impl App {
     /// Measurements on the current sheet, plus the one being drawn.
     pub(super) fn paint_takeoff(&self) {
         let Some(sheet) = self.takeoff_sheet() else { return };
+        self.paint_viewports();
         let s = self.s();
         let units = self.takeoff.units;
-        let scale = self.takeoff.scale(sheet);
+        let scale = self.pending_pts.first().and_then(|p| self.takeoff.scale_at(sheet, *p)).or(self.takeoff.scale(sheet));
         for m in self.sheet_items() {
             let color = self.takeoff.group_color(&m.group);
             let sel = self.selected == Some(m.id);

@@ -199,6 +199,63 @@ fn print_dialog(hwnd: HWND, count: u32, current: u32) -> Option<(isize, Vec<u32>
     }
 }
 
+/// Pick several PDFs (Combine) or a folder (Folder as set).
+fn pick_sheets(hwnd: HWND, pick: app::SheetPick) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
+    unsafe {
+        let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let opts = dlg.GetOptions().ok()?;
+        let path_of = |item: &IShellItem| -> Option<PathBuf> {
+            let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+            let s = p.to_string().ok();
+            CoTaskMemFree(Some(p.0 as *const _));
+            s.map(PathBuf::from)
+        };
+        match pick {
+            app::SheetPick::Combine => {
+                let filters = [COMDLG_FILTERSPEC { pszName: w!("PDF drawings"), pszSpec: w!("*.pdf") }];
+                dlg.SetFileTypes(&filters).ok()?;
+                dlg.SetOptions(opts | FOS_ALLOWMULTISELECT).ok()?;
+                dlg.SetTitle(w!("Choose the PDFs to combine (Ctrl+click for several)")).ok()?;
+                dlg.Show(Some(hwnd)).ok()?;
+                let items = dlg.GetResults().ok()?;
+                let n = items.GetCount().ok()?;
+                let files = (0..n).filter_map(|i| items.GetItemAt(i).ok().and_then(|it| path_of(&it))).collect();
+                Some((files, None))
+            }
+            app::SheetPick::Folder => {
+                dlg.SetOptions(opts | FOS_PICKFOLDERS).ok()?;
+                dlg.SetTitle(w!("Choose a folder of PDF drawings")).ok()?;
+                dlg.Show(Some(hwnd)).ok()?;
+                let folder = path_of(&dlg.GetResult().ok()?)?;
+                let files = std::fs::read_dir(&folder).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+                Some((files, Some(folder)))
+            }
+        }
+    }
+}
+
+/// Save dialog for a new PDF, starting in `dir`.
+fn save_new_pdf(hwnd: HWND, name: &str, dir: Option<&std::path::Path>, title: &str) -> Option<PathBuf> {
+    unsafe {
+        let dlg: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let filters = [COMDLG_FILTERSPEC { pszName: w!("PDF"), pszSpec: w!("*.pdf") }];
+        dlg.SetFileTypes(&filters).ok()?;
+        dlg.SetDefaultExtension(w!("pdf")).ok()?;
+        dlg.SetFileName(&HSTRING::from(name)).ok()?;
+        dlg.SetTitle(&HSTRING::from(title)).ok()?;
+        if let Some(d) = dir {
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(d.as_os_str()), None) {
+                let _ = dlg.SetFolder(&item);
+            }
+        }
+        dlg.Show(Some(hwnd)).ok()?;
+        let p = dlg.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s.map(PathBuf::from)
+    }
+}
+
 fn after(hwnd: HWND) {
     // Menus and dialogs run their own message loops, so they are shown here,
     // outside the App borrow.
@@ -217,6 +274,18 @@ fn after(hwnd: HWND) {
         let name = if flat { name.replace(" - marked up.pdf", " - issued.pdf") } else { name };
         if let Some(p) = save_pdf_dialog(hwnd, &name) {
             with_app(|a| a.start_pdf_export(p, with, flat));
+        }
+        repaint(hwnd);
+    }
+    if let Some(pick) = with_app(|a| a.pending_sheet_pick.take()).flatten() {
+        if let Some((files, folder)) = pick_sheets(hwnd, pick) {
+            with_app(|a| a.sheets_picked(pick, files, folder));
+        }
+        repaint(hwnd);
+    }
+    if let Some(job) = with_app(|a| a.pending_sheet_save.take()).flatten() {
+        if let Some(dst) = save_new_pdf(hwnd, &job.default_name, job.default_dir.as_deref(), &job.title) {
+            with_app(|a| a.run_sheet_job(job, dst));
         }
         repaint(hwnd);
     }

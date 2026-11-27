@@ -76,7 +76,8 @@ impl App {
             (TBtn::MColor, "Color \u{25BE}".into(), 82.0, 4.0),
             (TBtn::MWidth, format!("{width} \u{25BE}"), 80.0, 4.0),
             (TBtn::MFont, format!("{:.0}pt \u{25BE}", self.settings.markup_font * 0.75), 66.0, 8.0),
-            (TBtn::SavePdf, "Save PDF \u{25BE}".into(), 88.0, 0.0),
+            (TBtn::SavePdf, "Save PDF \u{25BE}".into(), 88.0, 8.0),
+            (TBtn::Presets, self.presets_label(), 130.0, 0.0),
         ]
     }
 
@@ -244,6 +245,10 @@ impl App {
         };
         let mut d = self.mdraft.take().unwrap();
         d.cur = p;
+        if self.tool == Tool::Viewport && !dragged {
+            self.status = Some("Drag a box around the detail".into());
+            return true;
+        }
         if dragged {
             self.commit_draft(d);
         } else {
@@ -275,6 +280,10 @@ impl App {
     fn commit_draft(&mut self, d: MDraft) {
         let (a, b) = (d.start, d.cur);
         let boxed = vec![[a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]];
+        if self.tool == Tool::Viewport {
+            self.viewport_drawn([boxed[0][0], boxed[0][1], boxed[1][0], boxed[1][1]]);
+            return;
+        }
         match d.kind {
             MKind::Cloud | MKind::Rect | MKind::Ellipse | MKind::Highlight => {
                 self.add_markup(d.kind, boxed, String::new());
@@ -751,7 +760,7 @@ impl App {
                 })
                 .collect(),
         };
-        let scale = self.takeoff.scale(m.sheet);
+        let scale = self.takeoff.scale_of(m);
         let mut label = match m.kind {
             Kind::Count => format!("{} x{}", m.group, m.points.len()),
             _ => takeoff::fmt_qty(m.qty(scale), self.takeoff.units),
@@ -792,7 +801,7 @@ impl App {
                 specs.push(AnnotSpec {
                     page: m.sheet,
                     subject: format!("Takeoff: {}", m.group),
-                    contents: format!("{} \u{2014} {}", m.group, takeoff::fmt_qty(m.qty(self.takeoff.scale(m.sheet)), self.takeoff.units)),
+                    contents: format!("{} \u{2014} {}", m.group, takeoff::fmt_qty(m.qty(self.takeoff.scale_of(m)), self.takeoff.units)),
                     author: author(),
                     name: format!("redbeam-takeoff-{}", m.id),
                     prims: self.measure_prims(m),
@@ -826,6 +835,11 @@ impl App {
 
     /// Run `job` on a background thread; its message is shown when done.
     fn run_bg(&self, job: impl FnOnce() -> std::result::Result<String, String> + Send + 'static) {
+        self.run_bg_open(move || job().map(|s| (s, None)));
+    }
+
+    /// Like `run_bg`, but the job may name a PDF to open when it's done.
+    pub(super) fn run_bg_open(&self, job: impl FnOnce() -> std::result::Result<(String, Option<PathBuf>), String> + Send + 'static) {
         let tx = self.bg_tx.clone();
         let hwnd = self.hwnd.0 as isize;
         std::thread::spawn(move || {
@@ -874,7 +888,11 @@ impl App {
         while let Ok(m) = self.bg_rx.try_recv() {
             self.status = None;
             match m {
-                Ok(info) => self.pending_info = Some(info),
+                Ok((info, Some(open))) => {
+                    self.open(open);
+                    self.status = Some(info);
+                }
+                Ok((info, None)) => self.pending_info = Some(info),
                 Err(e) => self.pending_error = Some(e),
             }
         }

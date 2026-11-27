@@ -17,12 +17,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
 
+mod extras;
 mod find;
 mod markups;
 mod panel;
 mod tabs;
 mod tools;
 
+pub use extras::SheetPick;
 pub use tools::{ExportKind, MenuItem, MenuKind};
 use tools::{EditDrag, Prompt, TBtn, Tool, Undo};
 
@@ -127,6 +129,7 @@ enum Btn {
     Update,
     Compare,
     Panel,
+    Sheets,
     CmpOverlay,
     CmpOld,
     CmpNew,
@@ -319,8 +322,15 @@ pub struct App {
     mdraft: Option<markups::MDraft>,
     /// Where a stamp goes once picked from the menu.
     stamp_at: Option<[f32; 2]>,
-    bg_tx: Sender<std::result::Result<String, String>>,
-    bg_rx: Receiver<std::result::Result<String, String>>,
+    bg_tx: Sender<std::result::Result<(String, Option<PathBuf>), String>>,
+    bg_rx: Receiver<std::result::Result<(String, Option<PathBuf>), String>>,
+    /// Detail-scale box waiting for its scale; box being calibrated.
+    pending_vp: Option<[f32; 4]>,
+    calib_vp: Option<[f32; 4]>,
+    /// Preset whose settings new measurements take.
+    active_preset: Option<crate::settings::Preset>,
+    pub pending_sheet_pick: Option<extras::SheetPick>,
+    pub pending_sheet_save: Option<extras::SheetJob>,
     /// Save-a-copy request: Some((with takeoffs, flattened)).
     pub pending_pdf_save: Option<(bool, bool)>,
     pub pending_print: bool,
@@ -635,6 +645,11 @@ impl App {
             stamp_at: None,
             bg_tx,
             bg_rx,
+            pending_vp: None,
+            calib_vp: None,
+            active_preset: None,
+            pending_sheet_pick: None,
+            pending_sheet_save: None,
             pending_pdf_save: None,
             pending_print: false,
             pending_menu: None,
@@ -1705,7 +1720,8 @@ impl App {
         let (top, bot) = (h - self.bar_h() + 5.0 * s, h - 5.0 * s);
         let mut specs: Vec<(Btn, &str, f32, f32)> = vec![
             (Btn::Panel, "\u{2630}", 34.0, 4.0),
-            (Btn::Open, "Open", 56.0, 12.0),
+            (Btn::Open, "Open", 56.0, 4.0),
+            (Btn::Sheets, "Sheets \u{25BE}", 76.0, 12.0),
             (Btn::Prev, "\u{25C0}", 32.0, 4.0),
             (Btn::Next, "\u{25B6}", 32.0, 12.0),
             (Btn::ZoomOut, "\u{2212}", 32.0, 4.0),
@@ -2143,6 +2159,7 @@ impl App {
                 }
             }
             Btn::Panel => self.toggle_panel(),
+            Btn::Sheets => self.pending_menu = Some(MenuKind::Sheets),
             Btn::CmpOverlay => self.set_cmp_mode(CmpMode::Overlay),
             Btn::CmpOld => self.set_cmp_mode(CmpMode::Old),
             Btn::CmpNew => self.set_cmp_mode(CmpMode::New),
