@@ -188,6 +188,10 @@ pub struct Lib {
     action_get_dest: unsafe extern "system" fn(Doc, *mut c_void) -> *mut c_void,
     dest_page_index: unsafe extern "system" fn(Doc, *mut c_void) -> c_int,
     get_page_label: unsafe extern "system" fn(Doc, c_int, *mut c_void, u32) -> u32,
+    // Printing and flattening
+    render_page_dc: unsafe extern "system" fn(*mut c_void, Page, c_int, c_int, c_int, c_int, c_int, c_int),
+    page_insert_object: unsafe extern "system" fn(Page, Obj),
+    page_generate_content: unsafe extern "system" fn(Page) -> c_int,
 }
 unsafe impl Send for Lib {}
 unsafe impl Sync for Lib {}
@@ -301,6 +305,9 @@ fn load_lib() -> Result<Lib, String> {
             action_get_dest: sym!("FPDFAction_GetDest"),
             dest_page_index: sym!("FPDFDest_GetDestPageIndex"),
             get_page_label: sym!("FPDF_GetPageLabel"),
+            render_page_dc: sym!("FPDF_RenderPage"),
+            page_insert_object: sym!("FPDFPage_InsertObject"),
+            page_generate_content: sym!("FPDFPage_GenerateContent"),
         };
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (lib.init_library)();
@@ -460,13 +467,23 @@ fn utf16z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Write a copy of `src` to `dst` with `annots` added as PDF annotations
+/// Write a copy of `src` to `dst` with `annots` added: as PDF annotations
 /// (stamp annotations carrying their own appearance, so Acrobat, Bluebeam
-/// and browsers all display them). Returns how many were written.
-pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<usize, String> {
+/// and browsers all display them and they stay movable), or, with
+/// `flatten`, burned into the page content. Returns how many were written.
+pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec], flatten: bool) -> Result<usize, String> {
+    let data = std::fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    let (out, written) = build_pdf(&data, annots, flatten)?;
+    let tmp = dst.with_extension("pdf.tmp");
+    std::fs::write(&tmp, &out).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dst).map_err(|e| format!("cannot write {}: {e}", dst.display()))?;
+    Ok(written)
+}
+
+/// The PDF bytes of `data` with `annots` added (see `export_annotated`).
+pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool) -> Result<(Vec<u8>, usize), String> {
     use crate::markup::{wrap, Prim};
     let lib = lib()?;
-    let data = std::fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
     let mut written = 0usize;
     let mut out: Vec<u8> = Vec::with_capacity(data.len() + 65536);
     {
@@ -492,10 +509,18 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<
                 let ux = [to_pdf.0[0] / k, to_pdf.0[1] / k];
                 let uy = [-to_pdf.0[2] / k, -to_pdf.0[3] / k];
                 for a in annots.iter().filter(|a| a.page == pg) {
-                    let annot = (lib.create_annot)(p, ANNOT_STAMP);
-                    if annot.is_null() {
+                    let annot = if flatten { std::ptr::null_mut() } else { (lib.create_annot)(p, ANNOT_STAMP) };
+                    if annot.is_null() && !flatten {
                         continue;
                     }
+                    // Flattened: objects go straight into the page content.
+                    let add = |obj: Obj| {
+                        if flatten {
+                            (lib.page_insert_object)(p, obj);
+                        } else if (lib.annot_append_object)(annot, obj) == 0 {
+                            (lib.obj_destroy)(obj);
+                        }
+                    };
                     // Annotation rectangle: bounds of everything, in PDF space.
                     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                     let mut grow = |q: [f32; 2], pad: f32| {
@@ -519,7 +544,9 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<
                         }
                     }
                     let r = FsRectF { left: x0, top: y1, right: x1, bottom: y0 };
-                    (lib.annot_set_rect)(annot, &r);
+                    if !flatten {
+                        (lib.annot_set_rect)(annot, &r);
+                    }
                     let rgb = |c: u32| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
                     for prim in &a.prims {
                         match prim {
@@ -554,9 +581,7 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<
                                 (lib.obj_set_line_join)(obj, 1);
                                 (lib.obj_set_line_cap)(obj, 1);
                                 (lib.path_set_draw_mode)(obj, if fill.is_some() { 1 } else { 0 }, stroke.is_some() as c_int);
-                                if (lib.annot_append_object)(annot, obj) == 0 {
-                                    (lib.obj_destroy)(obj);
-                                }
+                                add(obj);
                             }
                             Prim::Text { rect, text, size, color, bold, center } => {
                                 let font: &[u8] = if *bold { b"Helvetica-Bold\0" } else { b"Helvetica\0" };
@@ -581,21 +606,24 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<
                                     (lib.obj_set_fill_color)(obj, r, g, b, 255);
                                     let o = to_pdf.apply(x, baseline);
                                     (lib.obj_transform)(obj, ux[0] as f64, ux[1] as f64, uy[0] as f64, uy[1] as f64, o[0] as f64, o[1] as f64);
-                                    if (lib.annot_append_object)(annot, obj) == 0 {
-                                        (lib.obj_destroy)(obj);
-                                    }
+                                    add(obj);
                                 }
                             }
                         }
                     }
-                    for (key, val) in [("Contents", &a.contents), ("T", &a.author), ("Subj", &a.subject), ("NM", &a.name)] {
-                        let k = std::ffi::CString::new(key).unwrap();
-                        let v = utf16z(val);
-                        (lib.annot_set_string)(annot, k.as_ptr(), v.as_ptr());
+                    if !flatten {
+                        for (key, val) in [("Contents", &a.contents), ("T", &a.author), ("Subj", &a.subject), ("NM", &a.name)] {
+                            let k = std::ffi::CString::new(key).unwrap();
+                            let v = utf16z(val);
+                            (lib.annot_set_string)(annot, k.as_ptr(), v.as_ptr());
+                        }
+                        (lib.annot_set_flags)(annot, ANNOT_FLAG_PRINT);
+                        (lib.close_annot)(annot);
                     }
-                    (lib.annot_set_flags)(annot, ANNOT_FLAG_PRINT);
-                    (lib.close_annot)(annot);
                     written += 1;
+                }
+                if flatten {
+                    (lib.page_generate_content)(p);
                 }
                 (lib.close_page)(p);
             }
@@ -607,10 +635,54 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec]) -> Result<
             }
         }
     }
-    let tmp = dst.with_extension("pdf.tmp");
-    std::fs::write(&tmp, &out).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, dst).map_err(|e| format!("cannot write {}: {e}", dst.display()))?;
-    Ok(written)
+    Ok((out, written))
+}
+
+/// Print `pages` (0-based) of the PDF `data` to printer DC `hdc`: each
+/// sheet fitted to the printable area and rotated to match the paper.
+/// Returns the number of pages printed.
+pub fn print_pdf(data: &[u8], pages: &[u32], hdc: isize, job_name: &str) -> Result<usize, String> {
+    use windows::core::HSTRING;
+    use windows::Win32::Graphics::Gdi::{GetDeviceCaps, HDC, HORZRES, VERTRES};
+    use windows::Win32::Storage::Xps::{EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
+    let lib = lib()?;
+    let dc = HDC(hdc as *mut c_void);
+    let name = HSTRING::from(job_name);
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
+        if doc.is_null() {
+            return Err(error_text((lib.get_last_error)()).to_string());
+        }
+        let info = DOCINFOW { cbSize: size_of::<DOCINFOW>() as i32, lpszDocName: windows::core::PCWSTR(name.as_ptr()), ..Default::default() };
+        if StartDocW(dc, &info) <= 0 {
+            (lib.close_document)(doc);
+            return Err("the printer refused the job".into());
+        }
+        let (pw, ph) = (GetDeviceCaps(Some(dc), HORZRES), GetDeviceCaps(Some(dc), VERTRES));
+        let mut printed = 0;
+        for &pg in pages {
+            let p = (lib.load_page)(doc, pg as c_int);
+            if p.is_null() {
+                continue;
+            }
+            let mut sz = FsSizeF { width: 612.0, height: 792.0 };
+            (lib.get_page_size_by_index_f)(doc, pg as c_int, &mut sz);
+            // Rotate a landscape sheet onto portrait paper (and vice versa).
+            let rotate = ((sz.width > sz.height) != (pw > ph)) as c_int;
+            let (w, h) = if rotate == 1 { (sz.height, sz.width) } else { (sz.width, sz.height) };
+            let k = (pw as f32 / w).min(ph as f32 / h);
+            let (sx, sy) = ((w * k) as c_int, (h * k) as c_int);
+            StartPage(dc);
+            (lib.render_page_dc)(dc.0, p, (pw - sx) / 2, (ph - sy) / 2, sx, sy, rotate, FPDF_ANNOT | 0x800);
+            EndPage(dc);
+            (lib.close_page)(p);
+            printed += 1;
+        }
+        EndDoc(dc);
+        (lib.close_document)(doc);
+        Ok(printed)
+    }
 }
 
 /// UTF-16LE bytes (with trailing NUL) from a PDFium "get string" call.

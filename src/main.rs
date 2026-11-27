@@ -169,6 +169,36 @@ fn save_pdf_dialog(hwnd: HWND, default_name: &str) -> Option<PathBuf> {
     }
 }
 
+/// Windows print dialog. Returns the printer DC and 0-based sheets.
+fn print_dialog(hwnd: HWND, count: u32, current: u32) -> Option<(isize, Vec<u32>)> {
+    use windows::Win32::UI::Controls::Dialogs::*;
+    unsafe {
+        let mut pd = PRINTDLGW {
+            lStructSize: size_of::<PRINTDLGW>() as u32,
+            hwndOwner: hwnd,
+            Flags: PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION,
+            nFromPage: (current + 1) as u16,
+            nToPage: (current + 1) as u16,
+            nMinPage: 1,
+            nMaxPage: count.min(u16::MAX as u32) as u16,
+            nCopies: 1,
+            ..Default::default()
+        };
+        let ok = PrintDlgW(&mut pd).as_bool();
+        let _ = windows::Win32::Foundation::GlobalFree(Some(pd.hDevMode));
+        let _ = windows::Win32::Foundation::GlobalFree(Some(pd.hDevNames));
+        if !ok || pd.hDC.is_invalid() {
+            return None;
+        }
+        let pages: Vec<u32> = if (pd.Flags & PD_PAGENUMS).0 != 0 {
+            (pd.nFromPage.max(1) as u32 - 1..pd.nToPage.min(count as u16) as u32).collect()
+        } else {
+            (0..count).collect()
+        };
+        Some((pd.hDC.0 as isize, pages))
+    }
+}
+
 fn after(hwnd: HWND) {
     // Menus and dialogs run their own message loops, so they are shown here,
     // outside the App borrow.
@@ -183,9 +213,16 @@ fn after(hwnd: HWND) {
         }
         repaint(hwnd);
     }
-    if let Some((with, name)) = with_app(|a| a.pending_pdf_save.take().map(|w| (w, a.pdf_default_name()))).flatten() {
+    if let Some(((with, flat), name)) = with_app(|a| a.pending_pdf_save.take().map(|w| (w, a.pdf_default_name()))).flatten() {
+        let name = if flat { name.replace(" - marked up.pdf", " - issued.pdf") } else { name };
         if let Some(p) = save_pdf_dialog(hwnd, &name) {
-            with_app(|a| a.start_pdf_export(p, with));
+            with_app(|a| a.start_pdf_export(p, with, flat));
+        }
+        repaint(hwnd);
+    }
+    if let Some((count, current)) = with_app(|a| std::mem::take(&mut a.pending_print).then(|| a.print_request()).flatten()).flatten() {
+        if let Some((hdc, pages)) = print_dialog(hwnd, count, current) {
+            with_app(|a| a.start_print(hdc, pages));
         }
         repaint(hwnd);
     }

@@ -102,6 +102,7 @@ Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
 Ctrl+B\tSide panel: pages, files, markups, find, settings\n\
 Ctrl+F  /  F3\tFind text in the set / next result (Shift+F3 previous)\n\
 Ctrl+G\tGo to sheet by number or name\n\
+Ctrl+P\tPrint (with markups and takeoffs)\n\
 Ctrl+K\tCompare with an earlier revision\n\
 Tab\tCompare: overlay \u{2192} old \u{2192} new\n\
 ,  /  .\tCompare: previous / next detected change\n\
@@ -306,8 +307,9 @@ pub struct App {
     stamp_at: Option<[f32; 2]>,
     bg_tx: Sender<std::result::Result<String, String>>,
     bg_rx: Receiver<std::result::Result<String, String>>,
-    /// Save-a-copy request: Some(with takeoffs).
-    pub pending_pdf_save: Option<bool>,
+    /// Save-a-copy request: Some((with takeoffs, flattened)).
+    pub pending_pdf_save: Option<(bool, bool)>,
+    pub pending_print: bool,
     pub pending_menu: Option<MenuKind>,
     pub pending_export: Option<ExportKind>,
 
@@ -543,6 +545,7 @@ impl App {
             bg_tx,
             bg_rx,
             pending_pdf_save: None,
+            pending_print: false,
             pending_menu: None,
             pending_export: None,
             update: if settings.check_updates { UpdState::Checking } else { UpdState::Idle },
@@ -1865,6 +1868,10 @@ impl App {
             self.pan_by(0.0, (ch / 8.0).round());
         } else if k == VK_DOWN {
             self.pan_by(0.0, -(ch / 8.0).round());
+        } else if ctrl && ch_(b'P') {
+            if self.doc.is_some() {
+                self.pending_print = true;
+            }
         } else if ctrl && ch_(b'F') {
             self.ask_find();
         } else if ctrl && ch_(b'G') {

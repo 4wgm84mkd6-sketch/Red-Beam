@@ -40,6 +40,8 @@ const CMD_M_DUPLICATE: usize = 25_001;
 const CMD_M_DELETE: usize = 25_002;
 const CMD_SAVE_MARKUPS: usize = 25_003;
 const CMD_SAVE_ALL: usize = 25_004;
+const CMD_SAVE_FLAT: usize = 25_005;
+const CMD_PRINT: usize = 25_006;
 
 const WIDTHS: [(&str, f32); 4] = [("Thin", 1.0), ("Medium", 2.0), ("Thick", 3.5), ("Heavy", 6.0)];
 const FONTS: [(&str, f32); 5] = [("Small (10)", 10.0), ("Medium (14)", 14.0), ("Large (20)", 20.0), ("X-Large (28)", 28.0), ("Huge (40)", 40.0)];
@@ -411,6 +413,9 @@ impl App {
             MenuKind::SavePdf => vec![
                 item(CMD_SAVE_MARKUPS, "Save a copy with markups\u{2026}", false),
                 item(CMD_SAVE_ALL, "Save a copy with markups and takeoffs\u{2026}", false),
+                item(CMD_SAVE_FLAT, "Save a flattened copy (burned in, for issuing)\u{2026}", false),
+                sep(),
+                item(CMD_PRINT, "Print\u{2026}\tCtrl+P", false),
             ],
             MenuKind::MarkupContext { id } => {
                 let m = self.markup(id)?;
@@ -459,11 +464,13 @@ impl App {
                     self.settings.save();
                 }
             }
-            MenuKind::SavePdf => {
-                if cmd == CMD_SAVE_MARKUPS || cmd == CMD_SAVE_ALL {
-                    self.pending_pdf_save = Some(cmd == CMD_SAVE_ALL);
-                }
-            }
+            MenuKind::SavePdf => match cmd {
+                CMD_SAVE_MARKUPS => self.pending_pdf_save = Some((false, false)),
+                CMD_SAVE_ALL => self.pending_pdf_save = Some((true, false)),
+                CMD_SAVE_FLAT => self.pending_pdf_save = Some((true, true)),
+                CMD_PRINT => self.pending_print = true,
+                _ => {}
+            },
             MenuKind::MarkupContext { id } => {
                 let Some(before) = self.markup(id).cloned() else { return true };
                 match cmd {
@@ -765,14 +772,8 @@ impl App {
         v
     }
 
-    /// Save a copy of the drawing with markups (and optionally takeoffs) as
-    /// PDF annotations, on a background thread.
-    pub fn start_pdf_export(&mut self, dst: PathBuf, with_takeoffs: bool) {
-        let Some(doc) = &self.doc else { return };
-        if dst == doc.path {
-            self.pending_error = Some("Choose a new file name \u{2014} Red-Beam never overwrites your drawing.".into());
-            return;
-        }
+    /// Markups (and optionally visible takeoffs) as annotations to write.
+    fn export_specs(&self, with_takeoffs: bool) -> Vec<AnnotSpec> {
         let mut specs: Vec<AnnotSpec> = self
             .takeoff
             .markups
@@ -798,22 +799,68 @@ impl App {
                 });
             }
         }
+        specs
+    }
+
+    /// Save a copy of the drawing with markups (and optionally takeoffs),
+    /// as PDF annotations or flattened, on a background thread.
+    pub fn start_pdf_export(&mut self, dst: PathBuf, with_takeoffs: bool, flatten: bool) {
+        let Some(doc) = &self.doc else { return };
+        if dst == doc.path {
+            self.pending_error = Some("Choose a new file name \u{2014} Red-Beam never overwrites your drawing.".into());
+            return;
+        }
+        let specs = self.export_specs(with_takeoffs);
         if specs.is_empty() {
-            self.pending_info = Some("There are no markups to save yet.".into());
+            self.pending_info = Some("There are no markups or takeoffs to save yet.".into());
             return;
         }
         let src = doc.path.clone();
+        self.status = Some(format!("Saving {} items\u{2026}", specs.len()));
+        self.run_bg(move || match crate::pdfium::export_annotated(&src, &dst, &specs, flatten) {
+            Ok(n) if flatten => Ok(format!("Saved a flattened copy with {n} items burned in:\n{}\n\nYour original drawing was not changed.", dst.display())),
+            Ok(n) => Ok(format!("Saved {n} annotations to\n{}\n\nThey show in Bluebeam, Acrobat and web browsers. Your original drawing was not changed.", dst.display())),
+            Err(e) => Err(format!("Could not save {}:\n{e}", dst.display())),
+        });
+    }
+
+    /// Run `job` on a background thread; its message is shown when done.
+    fn run_bg(&self, job: impl FnOnce() -> std::result::Result<String, String> + Send + 'static) {
         let tx = self.bg_tx.clone();
         let hwnd = self.hwnd.0 as isize;
-        self.status = Some(format!("Saving {} annotations\u{2026}", specs.len()));
         std::thread::spawn(move || {
-            let msg = match crate::pdfium::export_annotated(&src, &dst, &specs) {
-                Ok(n) => Ok(format!("Saved {n} annotations to\n{}\n\nThey show in Bluebeam, Acrobat and web browsers. Your original drawing was not changed.", dst.display())),
-                Err(e) => Err(format!("Could not save {}:\n{e}", dst.display())),
-            };
-            let _ = tx.send(msg);
+            let _ = tx.send(job());
             unsafe {
                 let _ = PostMessageW(Some(windows::Win32::Foundation::HWND(hwnd as *mut _)), WM_APP_BG, WPARAM(0), LPARAM(0));
+            }
+        });
+    }
+
+    /// (sheet count, current sheet) for the print dialog.
+    pub fn print_request(&self) -> Option<(u32, u32)> {
+        self.doc.as_ref().map(|d| (d.pages.len() as u32, d.current))
+    }
+
+    /// Print `pages` to printer DC `hdc` (taken over and deleted when done),
+    /// with markups and visible takeoffs drawn on.
+    pub fn start_print(&mut self, hdc: isize, pages: Vec<u32>) {
+        let Some(doc) = &self.doc else { return };
+        let src = doc.path.clone();
+        let specs = self.export_specs(true);
+        let job = doc.name.clone();
+        self.status = Some(format!("Printing {} sheet(s)\u{2026}", pages.len()));
+        self.run_bg(move || {
+            let result = (|| {
+                let data = std::fs::read(&src).map_err(|e| e.to_string())?;
+                let data = if specs.is_empty() { data } else { crate::pdfium::build_pdf(&data, &specs, true)?.0 };
+                crate::pdfium::print_pdf(&data, &pages, hdc, &job)
+            })();
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::DeleteDC(windows::Win32::Graphics::Gdi::HDC(hdc as *mut _));
+            }
+            match result {
+                Ok(n) => Ok(format!("Sent {n} sheet(s) to the printer.")),
+                Err(e) => Err(format!("Printing failed:\n{e}")),
             }
         });
     }

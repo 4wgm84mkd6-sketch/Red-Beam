@@ -39,6 +39,7 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Side panel: pages, files, markups, find, settings | `Ctrl+B` or **☰** |
 | Find text in the set / next / previous result | `Ctrl+F` / `F3` / `Shift+F3` |
 | Go to a sheet by number (A-201), title or position | `Ctrl+G` |
+| Print with markups and takeoffs | `Ctrl+P` |
 | Performance readout | `F2` |
 | Switch PDF engine (PDFium / Windows built-in) | `F4` |
 | Help | `F1` or `?` |
@@ -90,7 +91,11 @@ Click **Markup** at the left of the toolbar, or press `M`, to switch to the mark
 * With **Select**, you can drag markups to move them and drag their handles to resize. Double-click a text markup to edit it. Right-click a markup for its **status** (Open / Accepted / Rejected / Completed), colour, width, font size, duplicate and delete. **Ctrl+D** duplicates, **Del** deletes, and **Ctrl+Z** undoes.
 * The **Markups** tab in the side panel lists every markup by sheet, with author and status. Click one to jump to it.
 * Markups save automatically with the takeoff file next to the PDF.
-* **Save PDF ▾ → Save a copy with markups** (optionally with takeoffs too) writes a new PDF with everything as real PDF annotations, each carrying its own appearance. They show in Bluebeam, Acrobat, Edge and Chrome. **Your original drawing is never modified.**
+* **Save PDF ▾:**
+  * **Save a copy with markups** (optionally with takeoffs too) writes a new PDF with everything as real PDF annotations, each carrying its own appearance. They show in Bluebeam, Acrobat, Edge and Chrome, and can still be moved there.
+  * **Save a flattened copy** burns markups and takeoffs into the drawing content, for issuing.
+  * **Your original drawing is never modified.**
+* **Print** (`Ctrl+P`, or Save PDF ▾ → Print): the standard Windows print dialog, with page range and copies. Each sheet is fitted and auto-rotated to the paper, with markups and visible takeoffs drawn on.
 
 ### Takeoffs
 
