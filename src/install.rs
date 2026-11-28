@@ -205,8 +205,9 @@ pub fn uninstall() -> Result<(), String> {
         // cmd waits ~3 s for this process to exit, then removes the folder.
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let script = format!("ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display());
-        std::process::Command::new("cmd").args(["/c", &script]).creation_flags(CREATE_NO_WINDOW).spawn().map_err(|e| e.to_string())?;
+        // cmd.exe parses quotes its own way, so the line is passed raw.
+        let line = format!("/c ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display());
+        std::process::Command::new("cmd").raw_arg(line).creation_flags(CREATE_NO_WINDOW).spawn().map_err(|e| e.to_string())?;
     } else if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
     }

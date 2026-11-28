@@ -71,7 +71,7 @@ jobs:
           Get-ItemProperty "HKCU:/Software/Classes/.pdf/OpenWithProgids" | Out-String | Write-Host
           $p = Start-Process -FilePath $exe -ArgumentList "--uninstall","--quiet" -PassThru -Wait
           if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
-          Start-Sleep -Seconds 8
+          for ($i = 0; $i -lt 20 -and (Test-Path $exe); $i++) { Start-Sleep -Seconds 1 }
           if (Test-Path $exe) { throw "installed exe still there after uninstall" }
           if (Test-Path $lnk) { throw "shortcut still there after uninstall" }
           if (Test-Path "HKCU:/Software/Classes/RedBeam.PDF") { throw "ProgID still registered" }
