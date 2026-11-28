@@ -18,7 +18,7 @@ use crate::takeoff::{Kind, Scale};
 
 pub const TIMER_SMOKE: usize = 3;
 
-const STEPS: [&str; 11] = [
+const STEPS: [&str; 17] = [
     "01-open",
     "02-pages-list",
     "03-thumbs-discipline",
@@ -30,6 +30,12 @@ const STEPS: [&str; 11] = [
     "09-compare-side",
     "10-import-bluebeam",
     "11-imported-quantities",
+    "12-password-prompt",
+    "13-password-opened",
+    "14-layers",
+    "15-layer-hidden",
+    "16-ocr-scanned",
+    "17-ocr-find",
 ];
 
 pub struct Smoke {
@@ -287,7 +293,78 @@ impl App {
                     }
                 }
             }
+            "12-password-prompt" => {
+                self.show_qty = false;
+                self.smoke_open("sample-locked.pdf");
+            }
+            "13-password-opened" => {
+                let asked = matches!(self.prompt.as_ref().map(|p| &p.purpose), Some(super::tools::PromptFor::Password { .. }));
+                if let Some(sm) = self.smoke.as_mut() {
+                    sm.note(if asked { "password prompt shown".to_string() } else { "ERROR: no password prompt for the locked PDF".to_string() });
+                }
+                if let Some(p) = self.prompt.as_mut() {
+                    p.text = "redbeam".into();
+                }
+                self.prompt_confirm();
+            }
+            "14-layers" => {
+                let name = self.doc.as_ref().map(|d| d.name.clone()).unwrap_or_default();
+                if let Some(sm) = self.smoke.as_mut() {
+                    sm.note(format!("open after password: {name}"));
+                    if !name.contains("locked") {
+                        sm.note("ERROR: the locked PDF did not open with its password");
+                    }
+                }
+                self.smoke_open("sample-layers.pdf");
+            }
+            "15-layer-hidden" => {
+                let layers = self.doc.as_ref().map(|d| d.layers.clone()).unwrap_or_default();
+                if let Some(sm) = self.smoke.as_mut() {
+                    sm.note(format!("PDF layers found: {layers:?}"));
+                    if layers.is_empty() {
+                        sm.note("ERROR: no PDF layers found in sample-layers.pdf");
+                    }
+                }
+                self.takeoff.hidden_layers = vec!["M-DUCT".into()];
+                self.save_takeoff();
+                self.refresh_annot_visibility();
+            }
+            "16-ocr-scanned" => {
+                self.takeoff.hidden_layers.clear();
+                self.save_takeoff();
+                self.smoke_open("sample-scanned.pdf");
+            }
+            "17-ocr-find" => {
+                self.run_find("CORRIDOR".into());
+                let hits = self.find.as_ref().map(|f| f.hits.len()).unwrap_or(0);
+                let ocr = self.doc.as_ref().map(|d| d.ocr_pages).unwrap_or(0);
+                let words = self.doc.as_ref().and_then(|d| self.texts.get(&(d.id, 0))).map(|w| w.iter().map(|x| x.text.clone()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                let available = crate::ocr::available();
+                if let Some(sm) = self.smoke.as_mut() {
+                    sm.note(format!("OCR available: {available}, sheets read by OCR: {ocr}, hits for CORRIDOR: {hits}"));
+                    sm.note(format!("OCR text: {words}"));
+                    if available && hits == 0 {
+                        sm.note("ERROR: OCR found no CORRIDOR on the scanned sheet");
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Open one of the test PDFs that sit next to the sample set.
+    fn smoke_open(&mut self, file: &str) {
+        let pdf = self.smoke.as_ref().map(|s| s.pdf.with_file_name(file));
+        match pdf.filter(|p| p.exists()) {
+            Some(p) => {
+                let _ = std::fs::remove_file(crate::takeoff::Takeoff::sidecar_path(&p));
+                self.open(p);
+            }
+            None => {
+                if let Some(sm) = self.smoke.as_mut() {
+                    sm.note(format!("ERROR: tests/{file} not found"));
+                }
+            }
         }
     }
 

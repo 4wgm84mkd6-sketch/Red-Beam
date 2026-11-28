@@ -206,6 +206,12 @@ Each one writes a **new** PDF and opens it in a new tab. Source files are never 
 
 The two sheets are rendered separately, tinted on the GPU and blended with a darken (per-channel minimum) blend, so overlays stay smooth at any zoom.
 
+### Awkward PDFs
+
+* **Password-protected PDFs:** Red-Beam asks for the password and opens the file. The password is kept for this session only and is used when comparing, saving copies or printing that file. A wrong password asks again.
+* **PDF layers:** drawings exported from CAD often put their line work on layers (A-WALL, M-DUCT, E-LIGHTING…). When a drawing has layers, a **Layers ▾** button appears in the status bar. Tick layers on or off, or use **Show all** / **Hide all**. The choice is saved with the drawing, and the button shows ● while any layer is hidden. Hiding works on Red-Beam's in-memory copy, so the file never changes.
+* **Scanned sheets (OCR):** a sheet with no text layer, such as a scan, is read with the text recognition built into Windows. It's rendered at about 200 DPI in tiles, in the background. Search, sheet names and clickable sheet links then work on scans too. An OCR language must be installed in Windows (English is on most PCs).
+
 ### Crash safety
 
 * **Your work is saved as you go.** Takeoffs and markups are written to the sidecar file after every change.
@@ -284,6 +290,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/png.rs` | Minimal PNG writer for smoke-test screenshots (unit-tested) |
 | `src/import.rs` | Turns PDF annotations into markups and measurements; scale from /Measure or from displayed values (unit-tested) |
 | `src/app/importer.rs` | Import flow: background read, one-time prompt, scales and detail boxes, hiding the PDF's own copies |
+| `src/ocr.rs` | Text recognition for scanned sheets (Windows.Media.Ocr) |
 | `src/app/tabs.rs` | Document tabs (park and restore per-document state), tab strip |
 | `src/app/find.rs` | Find / Go to sheet UI, highlighted hits, clickable sheet links |
 | `src/snap.rs` | Snap index over a sheet's line work: nearest corner, else nearest point on a line (unit-tested) |
@@ -293,7 +300,6 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Known limitations
 
-* Password-protected PDFs aren't supported.
 * Opening a file reads every page size up front. Sets with several thousand sheets take a moment to open.
 
 ## Roadmap (goal: replace Bluebeam)

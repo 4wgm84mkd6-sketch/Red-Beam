@@ -10,6 +10,7 @@ mod diff;
 mod gfx;
 mod import;
 mod markup;
+mod ocr;
 mod pdfium;
 mod png;
 mod settings;

@@ -217,6 +217,9 @@ pub struct Takeoff {
     /// show twice).
     #[serde(default)]
     pub hide_pdf_annots: bool,
+    /// PDF layers (CAD exports) not drawn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_layers: Vec<String>,
 }
 
 /// A region of a sheet drawn at a different scale (e.g. a 1/4" detail on

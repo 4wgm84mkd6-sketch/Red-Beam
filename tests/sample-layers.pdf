@@ -1,0 +1,50 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /OCG /Name (A-WALL) >>
+endobj
+2 0 obj
+<< /Type /OCG /Name (M-DUCT) >>
+endobj
+3 0 obj
+<< /Type /OCG /Name (E-LIGHTING) >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+5 0 obj
+<< /Length 602 >>
+stream
+1 J 1 j
+/OC /L0 BDC 0 0 0 RG 6 w 200 200 1800 1200 re S 3 w 1000 200 m 1000 1400 l S EMC
+/OC /L1 BDC 0 0.5 1 RG 10 w 260 900 m 1700 900 l S 4 w 600 900 m 600 1300 l S 1400 900 m 1400 500 l S EMC
+/OC /L2 BDC 1 0.6 0 RG 3 w 300 400 30 30 re S 300 1100 30 30 re S 500 400 30 30 re S 500 1100 30 30 re S 700 400 30 30 re S 700 1100 30 30 re S 900 400 30 30 re S 900 1100 30 30 re S 1100 400 30 30 re S 1100 1100 30 30 re S 1300 400 30 30 re S 1300 1100 30 30 re S 1500 400 30 30 re S 1500 1100 30 30 re S 1700 400 30 30 re S 1700 1100 30 30 re S EMC
+0 g BT /F1 40 Tf 2100 200 Td (M-201 LAYERED PLAN) Tj ET
+
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 7 0 R /MediaBox [0 0 2592 1728] /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> /Properties << /L0 1 0 R /L1 2 0 R /L2 3 0 R >> >> >>
+endobj
+7 0 obj
+<< /Type /Pages /Kids [6 0 R] /Count 1 >>
+endobj
+8 0 obj
+<< /Type /Catalog /Pages 7 0 R /OCProperties << /OCGs [1 0 R 2 0 R 3 0 R] /D << /Order [1 0 R 2 0 R 3 0 R] /OFF [] >> >> >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000015 00000 n 
+0000000062 00000 n 
+0000000109 00000 n 
+0000000160 00000 n 
+0000000235 00000 n 
+0000000888 00000 n 
+0000001064 00000 n 
+0000001121 00000 n 
+trailer
+<< /Size 9 /Root 8 0 R >>
+startxref
+1260
+%%EOF

@@ -20,6 +20,10 @@ version = "0.62"
 features = [
     "Data_Pdf",
     "Foundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
     "Storage",
     "Storage_Streams",
     "Win32_Foundation",

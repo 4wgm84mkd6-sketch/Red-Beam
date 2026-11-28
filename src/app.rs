@@ -140,6 +140,7 @@ enum Btn {
     Compare,
     Panel,
     Sheets,
+    Layers,
     CmpOverlay,
     CmpOld,
     CmpNew,
@@ -209,6 +210,10 @@ struct Doc {
     current: u32,
     /// Sheet number / title per sheet (bookmarks, labels, title block).
     names: Vec<crate::sheets::SheetName>,
+    /// PDF layers found so far (CAD exports), in sorted order.
+    layers: Vec<String>,
+    /// Sheets read with OCR (scans).
+    ocr_pages: usize,
 }
 
 struct Fonts {
@@ -349,6 +354,8 @@ pub struct App {
     pub pending_import_prompt: Option<String>,
     /// Annotation scans still running.
     import_pending: usize,
+    /// A password was just tried for this file (a new failure = wrong).
+    pw_retry: Option<PathBuf>,
     mdraft: Option<markups::MDraft>,
     /// Where a stamp goes once picked from the menu.
     stamp_at: Option<[f32; 2]>,
@@ -714,6 +721,7 @@ impl App {
             pending_import: None,
             pending_import_prompt: None,
             import_pending: 0,
+            pw_retry: None,
             mdraft: None,
             stamp_at: None,
             bg_tx,
@@ -923,6 +931,24 @@ impl App {
     }
 
     // --------------------------------------------------------------- compare
+
+    /// Ask for the password of a protected PDF, then open (or compare).
+    fn ask_password(&mut self, path: PathBuf, compare: bool) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let wrong = self.pw_retry.as_ref().is_some_and(|p| crate::settings::same_path(p, &path));
+        self.pw_retry = None;
+        self.prompt = Some(tools::Prompt {
+            title: format!("Password for {name}"),
+            hint: if wrong {
+                "That password didn't work. Try again.".into()
+            } else {
+                "This PDF is protected. Its password is kept for this session only.".into()
+            },
+            text: String::new(),
+            purpose: tools::PromptFor::Password { path, compare },
+        });
+        self.invalidate();
+    }
 
     pub fn start_compare(&mut self, path: PathBuf) {
         self.start_compare_mode(path, CmpMode::Overlay);
@@ -1367,7 +1393,7 @@ impl App {
                         (0..pages.len()).map(|i| labels.get(i).map(|l| crate::sheets::parse_label(l)).unwrap_or_default()).collect();
                     if let Some(c) = self.cmp.as_mut().filter(|c| c.opening.as_ref().map(|o| o.0) == Some(doc_id)) {
                         c.opening = None;
-                        c.doc = Some(Doc { id: doc_id, path, name, pages, current: 0, names });
+                        c.doc = Some(Doc { id: doc_id, path, name, pages, current: 0, names, layers: Vec::new(), ocr_pages: 0 });
                         self.sync_docs();
                         self.update_jobs(true);
                         self.invalidate();
@@ -1393,6 +1419,8 @@ impl App {
                         pages,
                         names,
                         current: restore.as_ref().map(|r| r.page.min(n.saturating_sub(1))).unwrap_or(0),
+                        layers: Vec::new(),
+                        ocr_pages: 0,
                     });
                     unsafe {
                         let _ = SetWindowTextW(self.hwnd, &HSTRING::from(format!("{name} \u{2014} Red-Beam")));
@@ -1426,29 +1454,34 @@ impl App {
                     self.open_next_queued();
                 }
                 Msg::OpenFailed { doc_id, path, error } => {
+                    let needs_pw = error == crate::pdfium::NEEDS_PASSWORD;
                     if self.cmp.as_ref().and_then(|c| c.opening.as_ref()).map(|o| o.0) == Some(doc_id) {
                         self.cmp = None;
                         self.sync_docs();
-                        self.pending_error = Some(format!("Could not open {} for comparison\n\n{}", path.display(), error));
+                        if needs_pw {
+                            self.ask_password(path, true);
+                        } else {
+                            self.pending_error = Some(format!("Could not open {} for comparison\n\n{}", path.display(), error));
+                        }
                         continue;
                     }
                     if self.opening.as_ref().map(|o| o.0) == Some(doc_id) {
                         self.sync_docs();
                         self.opening = None;
                         self.restore = None;
-                        self.open_next_queued();
-                        self.pending_error = Some(format!(
-                            "Could not open {}\n\n{}\n\nPassword-protected PDFs are not supported yet.",
-                            path.display(),
-                            error
-                        ));
+                        if needs_pw {
+                            self.ask_password(path, false);
+                        } else {
+                            self.open_next_queued();
+                            self.pending_error = Some(format!("Could not open {}\n\n{}", path.display(), error));
+                        }
                     }
                 }
-                Msg::Rendered { job, handle, texture, ms, parallel, annots } => {
+                Msg::Rendered { job, handle, texture, ms, parallel, look } => {
                     self.worker.ack(&job.key());
-                    // Rendered before the PDF's own markups were hidden (or
-                    // shown again): stale, render it again.
-                    if annots == self.annots_hidden(job.doc_id) {
+                    // Rendered before the PDF's own markups or a layer were
+                    // hidden (or shown again): stale, render it again.
+                    if look != self.expected_look(job.doc_id) {
                         self.update_jobs(true);
                         continue;
                     }
@@ -1522,8 +1555,19 @@ impl App {
                     self.render_log.truncate(8);
                     self.invalidate();
                 }
-                Msg::Text { job, words } => {
+                Msg::Text { job, words, layers, ocr } => {
                     self.worker.ack(&job.key());
+                    if let Some(d) = self.doc.as_mut().filter(|d| d.id == job.doc_id) {
+                        for l in layers {
+                            if !d.layers.contains(&l) {
+                                d.layers.push(l);
+                                d.layers.sort();
+                            }
+                        }
+                        if ocr && words.as_ref().is_ok_and(|w| !w.is_empty()) {
+                            d.ocr_pages += 1;
+                        }
+                    }
                     match words {
                         Ok(w) => self.on_text(job.doc_id, job.page, w),
                         Err(_) => {
@@ -1832,6 +1876,11 @@ impl App {
             (Btn::FitWidth, "Width", 56.0, 12.0),
             (Btn::Compare, if self.cmp.is_some() { "End compare" } else { "Compare" }, if self.cmp.is_some() { 96.0 } else { 76.0 }, 4.0),
         ];
+        if self.doc.as_ref().is_some_and(|d| !d.layers.is_empty()) {
+            let label = if self.takeoff.hidden_layers.is_empty() { "Layers \u{25BE}" } else { "Layers \u{25CF} \u{25BE}" };
+            specs.insert(3, (Btn::Layers, label, 84.0, 12.0));
+            specs[2].3 = 4.0;
+        }
         if self.cmp.as_ref().is_some_and(|c| c.doc.is_some()) {
             // Narrow windows get short labels so every button fits.
             let compact = self.client.0 < 1500.0 * s;
@@ -1895,6 +1944,7 @@ impl App {
             Btn::Compare => "Compare with an earlier revision  (Ctrl+K)",
             Btn::Panel => "Side panel: pages, files, markups, find, settings  (Ctrl+B)",
             Btn::Sheets => "Combine, extract, remove or rotate sheets (always a new PDF)",
+            Btn::Layers => "Show or hide this drawing's PDF layers (CAD exports)",
             Btn::CmpOverlay => "Overlay: old in red, new in blue  (Tab cycles)",
             Btn::CmpOld => "Show the old revision only",
             Btn::CmpNew => "Show the new revision only",
@@ -2354,6 +2404,7 @@ impl App {
             }
             Btn::Panel => self.toggle_panel(),
             Btn::Sheets => self.pending_menu = Some(MenuKind::Sheets),
+            Btn::Layers => self.pending_menu = Some(MenuKind::PdfLayers),
             Btn::CmpOverlay => self.set_cmp_mode(CmpMode::Overlay),
             Btn::CmpOld => self.set_cmp_mode(CmpMode::Old),
             Btn::CmpNew => self.set_cmp_mode(CmpMode::New),

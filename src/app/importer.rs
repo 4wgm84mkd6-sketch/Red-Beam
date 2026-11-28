@@ -18,6 +18,10 @@ use super::{App, WM_APP_BG};
 use crate::import::{convert, snap_ratio, Imported, RawAnnot};
 use crate::takeoff::{Scale, Viewport};
 
+const CMD_LAYER: usize = 27_000;
+const CMD_LAYERS_ALL: usize = 27_900;
+const CMD_LAYERS_NONE: usize = 27_901;
+
 /// Layer imported measurements go on (so they can be hidden or locked).
 pub const IMPORT_LAYER: &str = "Imported";
 
@@ -247,17 +251,76 @@ impl App {
         self.tabs.iter().flatten().any(|t| t.doc.as_ref().is_some_and(|d| d.id == id) && t.takeoff.hide_pdf_annots)
     }
 
+    /// PDF layers document `id` hides.
+    fn hidden_layers_of(&self, id: u64) -> &[String] {
+        if self.doc.as_ref().is_some_and(|d| d.id == id) {
+            return &self.takeoff.hidden_layers;
+        }
+        self.tabs.iter().flatten().find(|t| t.doc.as_ref().is_some_and(|d| d.id == id)).map(|t| t.takeoff.hidden_layers.as_slice()).unwrap_or(&[])
+    }
+
+    /// How document `id` should look (see `worker::look_key`).
+    pub(super) fn expected_look(&self, id: u64) -> u64 {
+        crate::worker::look_key(!self.annots_hidden(id), self.hidden_layers_of(id))
+    }
+
+    /// Tell the renderer which documents hide their own annotations and
+    /// which PDF layers.
     pub(super) fn sync_hidden_annots(&self) {
         let mut ids = HashSet::new();
-        if let (Some(d), true) = (&self.doc, self.takeoff.hide_pdf_annots) {
-            ids.insert(d.id);
-        }
-        for t in self.tabs.iter().flatten() {
-            if let (Some(d), true) = (&t.doc, t.takeoff.hide_pdf_annots) {
+        let mut layers = std::collections::HashMap::new();
+        if let Some(d) = &self.doc {
+            if self.takeoff.hide_pdf_annots {
                 ids.insert(d.id);
             }
+            if !self.takeoff.hidden_layers.is_empty() {
+                layers.insert(d.id, self.takeoff.hidden_layers.clone());
+            }
         }
-        self.worker.set_hidden_annots(ids);
+        for t in self.tabs.iter().flatten() {
+            if let Some(d) = &t.doc {
+                if t.takeoff.hide_pdf_annots {
+                    ids.insert(d.id);
+                }
+                if !t.takeoff.hidden_layers.is_empty() {
+                    layers.insert(d.id, t.takeoff.hidden_layers.clone());
+                }
+            }
+        }
+        self.worker.set_render_options(ids, layers);
+    }
+
+    // ------------------------------------------------------------ layers
+
+    pub(super) fn layer_menu_items(&self) -> Vec<crate::app::MenuItem> {
+        use super::tools::{item, sep};
+        let Some(d) = &self.doc else { return Vec::new() };
+        let mut v: Vec<crate::app::MenuItem> =
+            d.layers.iter().enumerate().map(|(i, l)| item(CMD_LAYER + i, l.clone(), !self.takeoff.hidden_layers.contains(l))).collect();
+        v.push(sep());
+        v.push(item(CMD_LAYERS_ALL, "Show all layers", false));
+        v.push(item(CMD_LAYERS_NONE, "Hide all layers", false));
+        v
+    }
+
+    pub(super) fn layer_menu_result(&mut self, cmd: usize) {
+        let Some(d) = &self.doc else { return };
+        let all = d.layers.clone();
+        match cmd {
+            CMD_LAYERS_ALL => self.takeoff.hidden_layers.clear(),
+            CMD_LAYERS_NONE => self.takeoff.hidden_layers = all,
+            c if c >= CMD_LAYER && c < CMD_LAYER + all.len() => {
+                let l = &all[c - CMD_LAYER];
+                if let Some(i) = self.takeoff.hidden_layers.iter().position(|x| x == l) {
+                    self.takeoff.hidden_layers.remove(i);
+                } else {
+                    self.takeoff.hidden_layers.push(l.clone());
+                }
+            }
+            _ => return,
+        }
+        self.save_takeoff();
+        self.refresh_annot_visibility();
     }
 }
 

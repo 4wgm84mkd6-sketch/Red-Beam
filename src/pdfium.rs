@@ -234,6 +234,12 @@ pub struct Lib {
     annot_set_ap: unsafe extern "system" fn(Annot, c_int, *const u16) -> c_int,
     annot_count_attach: unsafe extern "system" fn(Annot) -> usize,
     annot_get_attach: unsafe extern "system" fn(Annot, usize, *mut FsQuad) -> c_int,
+    // PDF layers (optional content marks)
+    obj_count_marks: unsafe extern "system" fn(Obj) -> c_int,
+    obj_get_mark: unsafe extern "system" fn(Obj, u32) -> *mut c_void,
+    mark_get_param_str: unsafe extern "system" fn(*mut c_void, *const c_char, *mut u16, u32, *mut u32) -> c_int,
+    page_remove_object: unsafe extern "system" fn(Page, Obj) -> c_int,
+    form_remove_object: unsafe extern "system" fn(Obj, Obj) -> c_int,
 }
 unsafe impl Send for Lib {}
 unsafe impl Sync for Lib {}
@@ -370,6 +376,11 @@ fn load_lib() -> Result<Lib, String> {
             annot_set_ap: sym!("FPDFAnnot_SetAP"),
             annot_count_attach: sym!("FPDFAnnot_CountAttachmentPoints"),
             annot_get_attach: sym!("FPDFAnnot_GetAttachmentPoints"),
+            obj_count_marks: sym!("FPDFPageObj_CountMarks"),
+            obj_get_mark: sym!("FPDFPageObj_GetMark"),
+            mark_get_param_str: sym!("FPDFPageObjMark_GetParamStringValue"),
+            page_remove_object: sym!("FPDFPage_RemoveObject"),
+            form_remove_object: sym!("FPDFFormObj_RemoveObject"),
         };
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (lib.init_library)();
@@ -383,11 +394,49 @@ pub fn lib() -> Result<&'static Lib, String> {
     LIB.get_or_init(load_lib).as_ref().map_err(|e| e.clone())
 }
 
+/// Error text when a PDF needs a password (the app asks for one).
+pub const NEEDS_PASSWORD: &str = "the PDF needs a password to open";
+
+/// Passwords the user has typed this session; every load tries them.
+static PASSWORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Remember a password for this session.
+pub fn add_password(pw: &str) {
+    let mut v = PASSWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !v.iter().any(|p| p == pw) {
+        v.push(pw.to_string());
+    }
+}
+
+/// Load a PDF from memory, trying the session's passwords if it needs one.
+/// Caller holds `LOCK`.
+unsafe fn load_mem(lib: &Lib, data: &[u8]) -> Result<Doc, u32> {
+    unsafe {
+        let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
+        if !doc.is_null() {
+            return Ok(doc);
+        }
+        let err = (lib.get_last_error)();
+        if err != 4 {
+            return Err(err);
+        }
+        let pws = PASSWORDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for pw in pws {
+            let c = std::ffi::CString::new(pw).unwrap_or_default();
+            let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), c.as_ptr());
+            if !doc.is_null() {
+                return Ok(doc);
+            }
+        }
+        Err(4)
+    }
+}
+
 fn error_text(code: u32) -> &'static str {
     match code {
         2 => "the file could not be read",
         3 => "the file is not a valid PDF or is damaged",
-        4 => "the PDF is password-protected (not supported yet)",
+        4 => NEEDS_PASSWORD,
         5 => "the PDF uses unsupported security",
         6 => "a page could not be loaded",
         _ => "unknown PDFium error",
@@ -406,6 +455,8 @@ pub struct Document {
     pages: Vec<(u32, Page)>,
     /// Draw the PDF's own annotations (off once they've been imported).
     pub show_annots: bool,
+    /// PDF layers (optional content) not to draw.
+    hidden_layers: Vec<String>,
 }
 unsafe impl Send for Document {}
 
@@ -418,10 +469,10 @@ impl Document {
         let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
-            let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
-            if doc.is_null() {
-                return Err(error_text((lib.get_last_error)()).to_string());
-            }
+            let doc = match load_mem(lib, &data) {
+                Ok(d) => d,
+                Err(code) => return Err(error_text(code).to_string()),
+            };
             let n = (lib.get_page_count)(doc).max(0);
             let mut sizes = Vec::with_capacity(n as usize);
             for i in 0..n {
@@ -429,7 +480,7 @@ impl Document {
                 (lib.get_page_size_by_index_f)(doc, i, &mut s);
                 sizes.push(((s.width * PT_TO_DIP).max(1.0), (s.height * PT_TO_DIP).max(1.0)));
             }
-            Ok((Document { lib, doc, _data: data, pages: Vec::new(), show_annots: true }, sizes))
+            Ok((Document { lib, doc, _data: data, pages: Vec::new(), show_annots: true, hidden_layers: Vec::new() }, sizes))
         }
     }
 
@@ -444,12 +495,58 @@ impl Document {
         if p.is_null() {
             return Err(error_text(6).into());
         }
+        if !self.hidden_layers.is_empty() {
+            unsafe { strip_layers(self.lib, p, &self.hidden_layers) };
+        }
         self.pages.insert(0, (index, p));
         while self.pages.len() > KEEP_PAGES {
             let (_, old) = self.pages.pop().unwrap();
             unsafe { (self.lib.close_page)(old) };
         }
         Ok(p)
+    }
+
+    /// Hide these PDF layers. Loaded pages are dropped so they reload (from
+    /// the unchanged file content) without the hidden layers' objects.
+    pub fn set_hidden_layers(&mut self, layers: &[String]) {
+        if self.hidden_layers == layers {
+            return;
+        }
+        self.hidden_layers = layers.to_vec();
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, p) in self.pages.drain(..) {
+            unsafe { (self.lib.close_page)(p) };
+        }
+    }
+
+    /// Names of the PDF layers used on a page (empty if it has none).
+    pub fn layer_names(&mut self, page: u32, cancel: &AtomicBool) -> Vec<String> {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<String> = Vec::new();
+        unsafe {
+            let Ok(p) = self.page(page) else { return out };
+            let lib = self.lib;
+            let mut stack: Vec<Obj> = (0..(lib.page_count_objects)(p)).map(|i| (lib.page_get_object)(p, i)).collect();
+            let mut visited = 0usize;
+            while let Some(obj) = stack.pop() {
+                visited += 1;
+                if visited.is_multiple_of(4096) && cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(name) = layer_of(lib, obj) {
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+                if (lib.obj_get_type)(obj) == OBJ_FORM {
+                    for i in 0..(lib.form_count_objects)(obj).max(0) as u32 {
+                        stack.push((lib.form_get_object)(obj, i));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Render the job's `src` (page DIPs) at `scale` px/DIP into a w×h BGRA
@@ -490,6 +587,64 @@ impl Document {
             }
         }
         Ok(Some(buf))
+    }
+}
+
+/// The PDF layer (optional content group) an object belongs to.
+unsafe fn layer_of(lib: &Lib, obj: Obj) -> Option<String> {
+    unsafe {
+        let key = c"Name";
+        for k in 0..(lib.obj_count_marks)(obj).max(0) as u32 {
+            let m = (lib.obj_get_mark)(obj, k);
+            if m.is_null() {
+                continue;
+            }
+            let mut n = 0u32;
+            if (lib.mark_get_param_str)(m, key.as_ptr(), std::ptr::null_mut(), 0, &mut n) == 0 || n <= 2 {
+                continue;
+            }
+            let mut buf = vec![0u16; (n as usize).div_ceil(2)];
+            (lib.mark_get_param_str)(m, key.as_ptr(), buf.as_mut_ptr(), n, &mut n);
+            return Some(String::from_utf16_lossy(&buf[..buf.len().saturating_sub(1)]));
+        }
+        None
+    }
+}
+
+/// Remove the objects of hidden layers from a loaded page (in memory only;
+/// the page reloads unchanged from the file). Caller holds `LOCK`.
+unsafe fn strip_layers(lib: &Lib, p: Page, hidden: &[String]) {
+    unsafe fn walk_form(lib: &Lib, form: Obj, hidden: &[String]) {
+        unsafe {
+            for i in (0..(lib.form_count_objects)(form).max(0) as u32).rev() {
+                let o = (lib.form_get_object)(form, i);
+                if o.is_null() {
+                    continue;
+                }
+                if layer_of(lib, o).is_some_and(|n| hidden.contains(&n)) {
+                    if (lib.form_remove_object)(form, o) != 0 {
+                        (lib.obj_destroy)(o);
+                    }
+                } else if (lib.obj_get_type)(o) == OBJ_FORM {
+                    walk_form(lib, o, hidden);
+                }
+            }
+        }
+    }
+    unsafe {
+        for i in (0..(lib.page_count_objects)(p)).rev() {
+            let o = (lib.page_get_object)(p, i);
+            if o.is_null() {
+                continue;
+            }
+            if layer_of(lib, o).is_some_and(|n| hidden.contains(&n)) {
+                if (lib.page_remove_object)(p, o) != 0 {
+                    (lib.obj_destroy)(o);
+                }
+            } else if (lib.obj_get_type)(o) == OBJ_FORM {
+                walk_form(lib, o, hidden);
+            }
+        }
     }
 }
 
@@ -541,10 +696,10 @@ pub fn read_annots(path: &Path) -> Result<Vec<crate::import::RawAnnot>, String> 
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     unsafe {
-        let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
-        if doc.is_null() {
-            return Err(error_text((lib.get_last_error)()).to_string());
-        }
+        let doc = match load_mem(lib, &data) {
+            Ok(d) => d,
+            Err(code) => return Err(error_text(code).to_string()),
+        };
         let key = |k: &str| std::ffi::CString::new(k).unwrap();
         let get_str = |a: Annot, k: &str| -> String {
             let k = key(k);
@@ -685,10 +840,10 @@ pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool, drop_original
     {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
-            let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
-            if doc.is_null() {
-                return Err(error_text((lib.get_last_error)()).to_string());
-            }
+            let doc = match load_mem(lib, data) {
+                Ok(d) => d,
+                Err(code) => return Err(error_text(code).to_string()),
+            };
             let mut pages: Vec<u32> = annots.iter().map(|a| a.page).collect();
             if drop_originals {
                 pages.extend(0..(lib.get_page_count)(doc).max(0) as u32);
@@ -880,7 +1035,7 @@ pub fn assemble(parts: &[(PathBuf, Vec<u32>)], rotate: &[(u32, i32)], dst: &Path
             }
             let mut n = 0;
             for ((path, pages), data) in parts.iter().zip(&datas) {
-                let src = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
+                let src = load_mem(lib, data).unwrap_or(std::ptr::null_mut());
                 if src.is_null() {
                     (lib.close_document)(dest);
                     return Err(format!("{}: {}", path.display(), error_text((lib.get_last_error)())));
@@ -933,10 +1088,10 @@ pub fn print_pdf(data: &[u8], pages: &[u32], hdc: isize, job_name: &str) -> Resu
     let name = HSTRING::from(job_name);
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
-        let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
-        if doc.is_null() {
-            return Err(error_text((lib.get_last_error)()).to_string());
-        }
+        let doc = match load_mem(lib, data) {
+            Ok(d) => d,
+            Err(code) => return Err(error_text(code).to_string()),
+        };
         let info = DOCINFOW { cbSize: size_of::<DOCINFOW>() as i32, lpszDocName: windows::core::PCWSTR(name.as_ptr()), ..Default::default() };
         if StartDocW(dc, &info) <= 0 {
             (lib.close_document)(doc);

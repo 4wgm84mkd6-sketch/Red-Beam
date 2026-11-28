@@ -143,6 +143,7 @@ pub enum MenuKind {
     FmtFill,
     FmtWidth,
     FmtStatus,
+    PdfLayers,
     /// Right-click on a measurement: maybe on one of its points
     /// (ring 0 = outline, ring k = cut-out k-1) or inside a cut-out.
     Context { id: u64, vertex: Option<(usize, usize)>, hole: Option<usize> },
@@ -168,6 +169,8 @@ pub enum PromptFor {
     GoTo,
     PresetName,
     SheetRange { delete: bool },
+    /// Password for a protected PDF (open it, or compare against it).
+    Password { path: std::path::PathBuf, compare: bool },
 }
 
 pub struct Prompt {
@@ -663,6 +666,9 @@ impl App {
         if let Some(v) = self.format_menu_items(kind) {
             return v;
         }
+        if kind == MenuKind::PdfLayers {
+            return self.layer_menu_items();
+        }
         match kind {
             MenuKind::Scale => {
                 let cur = self.takeoff_sheet().and_then(|p| self.takeoff.scale(p)).map(|s| s.label.clone());
@@ -773,7 +779,8 @@ impl App {
             | MenuKind::FmtLine
             | MenuKind::FmtFill
             | MenuKind::FmtWidth
-            | MenuKind::FmtStatus => {
+            | MenuKind::FmtStatus
+            | MenuKind::PdfLayers => {
                 Vec::new()
             }
             MenuKind::Context { id, vertex, hole } => {
@@ -864,6 +871,10 @@ impl App {
             self.invalidate();
             return;
         }
+        if kind == MenuKind::PdfLayers {
+            self.layer_menu_result(cmd);
+            return;
+        }
         if self.markup_menu_result(kind, cmd) {
             self.invalidate();
             return;
@@ -930,7 +941,8 @@ impl App {
             | MenuKind::FmtLine
             | MenuKind::FmtFill
             | MenuKind::FmtWidth
-            | MenuKind::FmtStatus => {}
+            | MenuKind::FmtStatus
+            | MenuKind::PdfLayers => {}
         }
         self.invalidate();
     }
@@ -1833,7 +1845,7 @@ impl App {
         true
     }
 
-    fn prompt_confirm(&mut self) {
+    pub(super) fn prompt_confirm(&mut self) {
         let Some(p) = self.prompt.take() else { return };
         match p.purpose {
             PromptFor::Calibrate { sheet, dip_len } => match takeoff::parse_len(&p.text).and_then(|real| Scale::calibrated(dip_len, real)) {
@@ -1973,6 +1985,15 @@ impl App {
                 }
             }
             PromptFor::MarkupText { id } => self.set_markup_text(id, p.text.clone()),
+            PromptFor::Password { path, compare } => {
+                crate::pdfium::add_password(&p.text);
+                self.pw_retry = Some(path.clone());
+                if compare {
+                    self.start_compare(path);
+                } else {
+                    self.open(path);
+                }
+            }
             PromptFor::Find => self.run_find(p.text.clone()),
             PromptFor::PresetName => self.save_preset(p.text.clone()),
             PromptFor::SheetRange { delete } => self.sheet_range_entered(&p.text.clone(), delete),
@@ -2448,7 +2469,8 @@ impl App {
                 self.text(&format!("{}\u{258F}", p.text), &self.fonts.body, &inner, 0x111111);
             } else {
                 let inner = RectF::new(field.l + 8.0 * s, field.t, field.r - 8.0 * s, field.b);
-                self.text(&format!("{}\u{258F}", p.text), &self.fonts.ui, &inner, 0x111111);
+                let shown = if matches!(p.purpose, PromptFor::Password { .. }) { "\u{2022}".repeat(p.text.chars().count()) } else { p.text.clone() };
+                self.text(&format!("{shown}\u{258F}"), &self.fonts.ui, &inner, 0x111111);
             }
             let y = field.b + 6.0 * s;
             self.text(&p.hint, &self.fonts.ui, &RectF::new(r.l + 16.0 * s, y, r.r - 16.0 * s, y + 22.0 * s), TEXT_DIM);

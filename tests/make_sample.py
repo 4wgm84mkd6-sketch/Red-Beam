@@ -288,3 +288,109 @@ def build_marked_up():
 
 
 build_marked_up()
+
+
+def write_pdf(name, objs, catalog):
+    out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, body in enumerate(objs):
+        offsets.append(len(out))
+        out += f"{i + 1} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for o in offsets:
+        out += f"{o:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root {catalog} 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    open(__file__.rsplit("/", 1)[0] + "/" + name, "wb").write(out)
+    print(f"wrote {name}: {len(out)} bytes")
+
+
+def build_layers():
+    """tests/sample-layers.pdf: a CAD-style sheet whose line work sits on
+    PDF layers (optional content): A-WALL, M-DUCT, E-LIGHTING."""
+    objs = []
+
+    def add(b):
+        objs.append(b if isinstance(b, bytes) else b.encode("latin-1"))
+        return len(objs)
+
+    layers = ["A-WALL", "M-DUCT", "E-LIGHTING"]
+    ocgs = [add(f"<< /Type /OCG /Name ({n}) >>") for n in layers]
+    font = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>")
+    c = "1 J 1 j\n"
+    c += "/OC /L0 BDC 0 0 0 RG 6 w 200 200 1800 1200 re S 3 w 1000 200 m 1000 1400 l S EMC\n"
+    c += "/OC /L1 BDC 0 0.5 1 RG 10 w 260 900 m 1700 900 l S 4 w 600 900 m 600 1300 l S 1400 900 m 1400 500 l S EMC\n"
+    c += "/OC /L2 BDC 1 0.6 0 RG 3 w " + " ".join(f"{x} {y} 30 30 re S" for x in range(300, 1800, 200) for y in (400, 1100)) + " EMC\n"
+    c += "0 g BT /F1 40 Tf 2100 200 Td (M-201 LAYERED PLAN) Tj ET\n"
+    data = c.encode("latin-1")
+    content = add(b"<< /Length %d >>\nstream\n" % len(data) + data + b"\nendstream")
+    props = " ".join(f"/L{i} {o} 0 R" for i, o in enumerate(ocgs))
+    page = add(f"<< /Type /Page /Parent {len(objs) + 2} 0 R /MediaBox [0 0 {W} {H}] /Contents {content} 0 R "
+               f"/Resources << /Font << /F1 {font} 0 R >> /Properties << {props} >> >> >>")
+    pages = add(f"<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>")
+    refs = " ".join(f"{o} 0 R" for o in ocgs)
+    catalog = add(f"<< /Type /Catalog /Pages {pages} 0 R /OCProperties << /OCGs [{refs}] /D << /Order [{refs}] /OFF [] >> >> >>")
+    write_pdf("sample-layers.pdf", objs, catalog)
+
+
+def build_scanned():
+    """tests/sample-scanned.pdf: a 17x11 sheet that is only a picture (like
+    a scan), with no text layer, for OCR. Needs Pillow."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        print("Pillow not installed: skipping sample-scanned.pdf")
+        return
+    dpi = 150
+    w, h = 17 * dpi, 11 * dpi
+    img = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(img)
+    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    big, mid = ImageFont.truetype(font, 90), ImageFont.truetype(font, 34)
+    d.rectangle([30, 30, w - 30, h - 30], outline=0, width=6)
+    d.rectangle([w - 520, 30, w - 30, h - 30], outline=0, width=4)
+    d.text((w - 480, h - 200), "A-201", font=big, fill=0)
+    d.text((w - 480, h - 330), "SECOND FLOOR PLAN", font=mid, fill=0)
+    for i, room in enumerate(["CORRIDOR", "LOBBY", "STAIR 2", "ELECTRICAL ROOM"]):
+        x, y = 200 + (i % 2) * 800, 300 + (i // 2) * 500
+        d.rectangle([x - 60, y - 60, x + 600, y + 300], outline=0, width=5)
+        d.text((x, y), room, font=mid, fill=0)
+    d.text((200, h - 160), "VERIFY ALL DIMENSIONS IN FIELD", font=mid, fill=0)
+    raw = zlib.compress(img.tobytes(), 9)
+    objs = []
+
+    def add(b):
+        objs.append(b if isinstance(b, bytes) else b.encode("latin-1"))
+        return len(objs)
+
+    image = add(b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 "
+                b"/Filter /FlateDecode /Length %d >>\nstream\n" % (w, h, len(raw)) + raw + b"\nendstream")
+    pw, ph = 17 * 72, 11 * 72
+    data = f"q {pw} 0 0 {ph} 0 0 cm /Im0 Do Q".encode()
+    content = add(b"<< /Length %d >>\nstream\n" % len(data) + data + b"\nendstream")
+    page = add(f"<< /Type /Page /Parent {len(objs) + 2} 0 R /MediaBox [0 0 {pw} {ph}] /Contents {content} 0 R "
+               f"/Resources << /XObject << /Im0 {image} 0 R >> >> >>")
+    pages = add(f"<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>")
+    catalog = add(f"<< /Type /Catalog /Pages {pages} 0 R >>")
+    write_pdf("sample-scanned.pdf", objs, catalog)
+
+
+def build_locked():
+    """tests/sample-locked.pdf: the sample set protected with the password
+    "redbeam". Needs pypdf."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        print("pypdf not installed: skipping sample-locked.pdf")
+        return
+    w = PdfWriter()
+    w.append(PdfReader(__file__.rsplit("/", 1)[0] + "/sample-set.pdf"))
+    w.encrypt(user_password="redbeam", owner_password="redbeam-owner", algorithm="RC4-128")
+    with open(__file__.rsplit("/", 1)[0] + "/sample-locked.pdf", "wb") as f:
+        w.write(f)
+    print("wrote sample-locked.pdf (password: redbeam)")
+
+
+build_layers()
+build_scanned()
+build_locked()

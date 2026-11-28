@@ -98,6 +98,18 @@ pub struct Job {
     pub pair: Option<(u64, u32)>,
 }
 
+/// Fingerprint of how a document is drawn: its own annotations on or
+/// off, and which PDF layers are hidden.
+pub fn look_key(annots: bool, hidden_layers: &[String]) -> u64 {
+    let mut h: u64 = if annots { 0x9e37_79b9_7f4a_7c15 } else { 0x1234_5678_9abc_def1 };
+    for l in hidden_layers {
+        for b in l.bytes().chain(std::iter::once(0)) {
+            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JobKey(u64, u32, u8, [u32; 4], u32, u32, Option<(u64, u32)>);
 
@@ -125,12 +137,14 @@ impl Job {
 pub enum Msg {
     /// `labels`: per-page bookmark titles or page labels ("" if none).
     Opened { doc_id: u64, path: PathBuf, pages: Vec<(f32, f32)>, labels: Vec<String> },
-    Text { job: Job, words: std::result::Result<Vec<crate::sheets::Word>, String> },
+    /// Words on a sheet (from OCR if `ocr`), and the PDF layers it uses.
+    Text { job: Job, words: std::result::Result<Vec<crate::sheets::Word>, String>, layers: Vec<String>, ocr: bool },
     OpenFailed { doc_id: u64, path: PathBuf, error: String },
     /// `texture` keeps the shared resource alive until the UI has opened it.
     /// `parallel` = renders running at the moment this one started (incl. itself).
-    /// `annots`: whether the PDF's own annotations were drawn.
-    Rendered { job: Job, handle: isize, texture: Sendable<ID3D11Texture2D>, ms: f32, parallel: usize, annots: bool },
+    /// `look`: what the render showed (PDF annotations, hidden layers), see
+    /// `look_key`; the UI drops results whose look is out of date.
+    Rendered { job: Job, handle: isize, texture: Sendable<ID3D11Texture2D>, ms: f32, parallel: usize, look: u64 },
     RenderFailed { job: Job, error: String },
     /// Abandoned because it was no longer wanted (PDFium only).
     Cancelled { job: Job, ms: f32 },
@@ -161,6 +175,8 @@ struct State {
     fg_running: usize,
     /// Documents whose own PDF annotations are not drawn (imported).
     hide_annots: HashSet<u64>,
+    /// PDF layers hidden per document.
+    hidden_layers: HashMap<u64, Vec<String>>,
     quit: bool,
 }
 
@@ -231,9 +247,12 @@ impl Pool {
         self.shared.cv.notify_all();
     }
 
-    /// Documents whose PDF annotations should not be drawn.
-    pub fn set_hidden_annots(&self, ids: HashSet<u64>) {
-        self.shared.m.lock().unwrap().hide_annots = ids;
+    /// Documents whose PDF annotations should not be drawn, and the PDF
+    /// layers each document hides.
+    pub fn set_render_options(&self, hide_annots: HashSet<u64>, hidden_layers: HashMap<u64, Vec<String>>) {
+        let mut s = self.shared.m.lock().unwrap();
+        s.hide_annots = hide_annots;
+        s.hidden_layers = hidden_layers;
     }
 
     pub fn ack(&self, key: &JobKey) {
@@ -537,6 +556,50 @@ fn render_job(g: &WorkerGpu, d: &mut DocHandle, job: &Job, cancel: &AtomicBool) 
     }
 }
 
+/// Read a scanned sheet with OCR: render it at about 200 DPI in tiles
+/// (overlapping, so words on a seam aren't cut) and map the words back to
+/// page DIPs. `Ok(None)` if cancelled.
+fn ocr_page(doc: &mut pdfium::Document, job: &Job, size: (f32, f32), cancel: &AtomicBool) -> std::result::Result<Option<Vec<crate::sheets::Word>>, String> {
+    let scale = 200.0 / 96.0;
+    let tile_px = crate::ocr::max_dim().clamp(1024, 4096) as f32;
+    let tile = tile_px / scale;
+    let overlap = 80.0;
+    let mut words = Vec::new();
+    let mut y0 = 0.0f32;
+    while y0 < size.1 {
+        let mut x0 = 0.0f32;
+        while x0 < size.0 {
+            let src = RectF::new(x0, y0, (x0 + tile).min(size.0), (y0 + tile).min(size.1));
+            let (w, h) = ((src.w() * scale).ceil().max(1.0) as u32, (src.h() * scale).ceil().max(1.0) as u32);
+            let tj = Job { doc_id: job.doc_id, page: job.page, kind: JobKind::Base, prefetch: false, src, w, h, scale, pair: None };
+            let Some(px) = doc.render(&tj, size, cancel)? else { return Ok(None) };
+            // Keep a word only in the tile whose core holds its centre.
+            let core = [
+                if x0 > 0.0 { x0 + overlap / 2.0 } else { 0.0 },
+                if y0 > 0.0 { y0 + overlap / 2.0 } else { 0.0 },
+                if src.r < size.0 { src.r - overlap / 2.0 } else { size.0 },
+                if src.b < size.1 { src.b - overlap / 2.0 } else { size.1 },
+            ];
+            for (text, r) in crate::ocr::recognize(&px, w, h)? {
+                let rect = [src.l + r[0] / scale, src.t + r[1] / scale, src.l + r[2] / scale, src.t + r[3] / scale];
+                let (cx, cy) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+                if cx >= core[0] && cx < core[2] && cy >= core[1] && cy < core[3] {
+                    words.push(crate::sheets::Word { text, rect, size: rect[3] - rect[1] });
+                }
+            }
+            if src.r >= size.0 {
+                break;
+            }
+            x0 += tile - overlap;
+        }
+        if (y0 + tile).min(size.1) >= size.1 {
+            break;
+        }
+        y0 += tile - overlap;
+    }
+    Ok(Some(words))
+}
+
 fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd: isize, engine: Engine) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -598,22 +661,39 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
             }
             Task::Render(job, parallel, cancel) => {
                 let t0 = Instant::now();
-                let hidden = shared.m.lock().unwrap().hide_annots.clone();
-                let annots_drawn = !hidden.contains(&job.doc_id);
+                let (hidden, layers) = {
+                    let s = shared.m.lock().unwrap();
+                    (s.hide_annots.clone(), s.hidden_layers.clone())
+                };
+                let none: Vec<String> = Vec::new();
+                let look = look_key(!hidden.contains(&job.doc_id), layers.get(&job.doc_id).unwrap_or(&none));
                 for (id, d) in docs.iter_mut() {
                     if let DocHandle::Pdfium { doc, .. } = d {
                         doc.show_annots = !hidden.contains(id);
+                        doc.set_hidden_layers(layers.get(id).unwrap_or(&none));
                     }
                 }
                 // Line-work extraction for snapping (PDFium only).
                 let mut snap: Option<std::result::Result<SnapIndex, String>> = None;
                 let mut diff: Option<std::result::Result<Vec<Change>, String>> = None;
                 let mut text: Option<std::result::Result<Vec<crate::sheets::Word>, String>> = None;
+                let mut layers: Vec<String> = Vec::new();
+                let mut ocr_used = false;
                 let result = if job.kind == JobKind::Text {
                     text = match docs.get_mut(&job.doc_id) {
                         Some(DocHandle::Pdfium { doc, sizes }) => {
                             let size = sizes.get(job.page as usize).copied().unwrap_or((1.0, 1.0));
+                            layers = doc.layer_names(job.page, &cancel);
                             match doc.words(job.page, size, &cancel) {
+                                // No text layer (a scan): read it with OCR.
+                                Ok(Some(w)) if w.len() < 3 && crate::ocr::available() => {
+                                    ocr_used = true;
+                                    match ocr_page(doc, &job, size, &cancel) {
+                                        Ok(Some(o)) => Some(Ok(o)),
+                                        Ok(None) => None,
+                                        Err(_) => Some(Ok(w)),
+                                    }
+                                }
                                 Ok(Some(w)) => Some(Ok(w)),
                                 Ok(None) => None,
                                 Err(e) => Some(Err(e)),
@@ -688,10 +768,10 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                 }
                 let msg = match (result, snap) {
                     _ if diff.is_some() => Msg::Changes { job, changes: diff.unwrap_or(Ok(Vec::new())), ms },
-                    _ if text.is_some() => Msg::Text { job, words: text.unwrap_or(Ok(Vec::new())) },
+                    _ if text.is_some() => Msg::Text { job, words: text.unwrap_or(Ok(Vec::new())), layers, ocr: ocr_used },
                     (_, Some(index)) => Msg::Snap { job, index: index.map(Sendable), ms },
                     (result, None) => match result {
-                    Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel, annots: annots_drawn },
+                    Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel, look },
                     Ok(None) => Msg::Cancelled { job, ms },
                     Err(e) => Msg::RenderFailed { job, error: e.message().to_string() },
                     },
