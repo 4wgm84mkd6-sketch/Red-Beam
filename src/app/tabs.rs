@@ -98,6 +98,7 @@ impl App {
         }
         self.ensure_thumb_visible();
         self.update_jobs(true);
+        self.save_session();
         self.invalidate();
     }
 
@@ -158,6 +159,7 @@ impl App {
                 self.active_tab -= 1;
             }
             self.sync_docs();
+            self.save_session();
             self.invalidate();
             return;
         }

@@ -5,10 +5,12 @@
 compile_error!("Red-Beam is a Windows application (it uses Direct2D and Windows.Data.Pdf).");
 
 mod app;
+mod crash;
 mod diff;
 mod gfx;
 mod markup;
 mod pdfium;
+mod png;
 mod settings;
 mod sheets;
 mod snap;
@@ -73,6 +75,7 @@ fn rebuild(hwnd: HWND) {
     let restore = APP.with(|c| c.borrow_mut().take().and_then(|a| a.restore_info()));
     match App::new(hwnd) {
         Ok(mut a) => {
+            a.mark_running();
             if let Some(r) = restore {
                 a.open_restore(r);
             }
@@ -257,6 +260,13 @@ fn save_new_pdf(hwnd: HWND, name: &str, dir: Option<&std::path::Path>, title: &s
 }
 
 fn after(hwnd: HWND) {
+    // Smoke test: no dialogs or menus (they would block the run).
+    if with_app(|a| a.smoke_absorb()).unwrap_or(false) {
+        if with_app(|a| a.device_lost).unwrap_or(false) {
+            rebuild(hwnd);
+        }
+        return;
+    }
     // Menus and dialogs run their own message loops, so they are shown here,
     // outside the App borrow.
     if let Some((kind, items)) = with_app(|a| a.pending_menu.take().map(|k| (k, a.menu_items(k)))).flatten() {
@@ -406,6 +416,12 @@ fn main() -> Result<()> {
         update::finish_update(&args[1..]);
         return Ok(());
     }
+    crash::install();
+    // RedBeam.exe --smoke <pdf> <out dir>: CI screenshot run.
+    let smoke = match (args.first().and_then(|a| a.to_str()), args.get(1), args.get(2)) {
+        (Some("--smoke"), Some(pdf), Some(out)) => Some((PathBuf::from(pdf), PathBuf::from(out))),
+        _ => None,
+    };
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok()?;
@@ -458,21 +474,40 @@ fn main() -> Result<()> {
                 return Err(e);
             }
         }
-        let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
-        // RedBeam.exe [file.pdf] [--page=N]
-        let mut file = None;
-        let mut page = 0u32;
-        for a in std::env::args_os().skip(1) {
-            match a.to_str().and_then(|s| s.strip_prefix("--page=")) {
-                Some(n) => page = n.parse::<u32>().unwrap_or(1).saturating_sub(1),
-                None => file = Some(PathBuf::from(a)),
+        if let Some((pdf, out)) = smoke {
+            // A fixed size, so screenshots are comparable between runs.
+            let _ = SetWindowPos(hwnd, None, 0, 0, 1600, 1000, SWP_NOZORDER);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            with_app(|a| a.start_smoke(pdf, out));
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+            // RedBeam.exe [--restore-session] [file.pdf] [--page=N]
+            let mut file = None;
+            let mut page = 0u32;
+            let mut restore = false;
+            for a in std::env::args_os().skip(1) {
+                if a == "--restore-session" {
+                    restore = true;
+                    continue;
+                }
+                match a.to_str().and_then(|s| s.strip_prefix("--page=")) {
+                    Some(n) => page = n.parse::<u32>().unwrap_or(1).saturating_sub(1),
+                    None => file = Some(PathBuf::from(a)),
+                }
             }
-        }
-        match file {
-            Some(p) => {
+            let recovery = with_app(|a| a.begin_session()).flatten();
+            if restore {
+                // Restarting after an update: every tab comes back.
+                with_app(|a| a.restore_session());
+            } else if let Some(p) = file {
                 with_app(|a| a.open_at(p, page));
-            }
-            None => {
+            } else if let Some(r) = recovery {
+                let flags = if r.files > 0 { MB_YESNO | MB_ICONWARNING } else { MB_OK | MB_ICONWARNING };
+                let answer = MessageBoxW(Some(hwnd), &HSTRING::from(r.message), w!("Red-Beam"), flags);
+                if r.files > 0 && answer == IDYES {
+                    with_app(|a| a.restore_session());
+                }
+            } else {
                 with_app(|a| a.reopen_last());
             }
         }

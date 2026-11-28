@@ -182,6 +182,13 @@ Each one writes a **new** PDF and opens it in a new tab. Source files are never 
 
 The two sheets are rendered separately, tinted on the GPU and blended with a darken (per-channel minimum) blend, so overlays stay smooth at any zoom.
 
+### Crash safety
+
+* **Your work is saved as you go.** Takeoffs and markups are written to the sidecar file after every change.
+* **Reopen after a crash.** If Red-Beam crashes or is closed by force, the next start says so and offers to reopen every drawing that was open, each in its tab and on its last sheet. The **Reopen last file** setting also reopens all tabs, and so does restarting after an update.
+* **Crash reports.** A crash writes `%LOCALAPPDATA%\Red-Beam\crash.log`: which file and sheet were open, plus the error and a stack trace. A crash inside the PDF engine also writes `crash.dmp`. The next start shows where the report is, so it can be sent in and the cause fixed.
+* **Tested on every build.** CI launches the real app on Windows (`RedBeam.exe --smoke tests/sample-set.pdf out`), steps through the main screens and saves a screenshot of each: open, page list, discipline jump, format bar, quantities, text editing, help and compare. A panic, crash or error dialog fails the build before it's released. The screenshots are uploaded as the `smoke-screenshots` artifact. `tests/make_sample.py` generates the sample set and its earlier revision.
+
 ## How it works
 
 ```
@@ -247,6 +254,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/sheets.rs` | Sheet numbers and titles, sheet links, phrase search (unit-tested) |
 | `src/app/extras.rs` | Detail viewport scales, tool presets, sheet tools (combine, folder as set, extract, rotate) |
 | `src/app/format.rs` | Format bar for selected markups, multi-selection, text shortcuts |
+| `src/app/session.rs` | Open tabs remembered for reopening after a crash or update; startup recovery prompt |
+| `src/app/smoke.rs` | CI smoke test: steps through the screens and saves screenshots |
+| `src/crash.rs` | Panic and native crash reports (crash.log, crash.dmp) |
+| `src/png.rs` | Minimal PNG writer for smoke-test screenshots (unit-tested) |
 | `src/app/tabs.rs` | Document tabs (park and restore per-document state), tab strip |
 | `src/app/find.rs` | Find / Go to sheet UI, highlighted hits, clickable sheet links |
 | `src/snap.rs` | Snap index over a sheet's line work: nearest corner, else nearest point on a line (unit-tested) |

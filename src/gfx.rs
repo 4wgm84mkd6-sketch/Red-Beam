@@ -191,6 +191,42 @@ impl Gfx {
         self.create_target()
     }
 
+    /// The frame just drawn (before Present) as RGBA pixels, for the CI
+    /// smoke test's screenshots.
+    pub fn capture(&self) -> Result<(u32, u32, Vec<u8>)> {
+        unsafe {
+            let tex: ID3D11Texture2D = self.swap.GetBuffer(0)?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            tex.GetDesc(&mut desc);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            desc.MiscFlags = 0;
+            let mut staging = None;
+            self.d3d.CreateTexture2D(&desc, None, Some(&mut staging))?;
+            let staging = staging.ok_or_else(|| Error::from(E_FAIL))?;
+            let ctx = self.d3d.GetImmediateContext()?;
+            ctx.CopyResource(&staging, &tex);
+            let mut map = D3D11_MAPPED_SUBRESOURCE::default();
+            ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut map))?;
+            let (w, h) = (desc.Width, desc.Height);
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h as usize {
+                let row = std::slice::from_raw_parts((map.pData as *const u8).add(y * map.RowPitch as usize), w as usize * 4);
+                for (x, px) in row.chunks_exact(4).enumerate() {
+                    let o = (y * w as usize + x) * 4;
+                    // BGRA -> RGBA, opaque.
+                    out[o] = px[2];
+                    out[o + 1] = px[1];
+                    out[o + 2] = px[0];
+                    out[o + 3] = 255;
+                }
+            }
+            ctx.Unmap(&staging, 0);
+            Ok((w, h, out))
+        }
+    }
+
     pub fn present(&self) -> Result<()> {
         unsafe { self.swap.Present(1, DXGI_PRESENT(0)).ok() }
     }

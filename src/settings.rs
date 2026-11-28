@@ -133,6 +133,13 @@ pub struct Settings {
     pub presets: Vec<Preset>,
     /// Pages tab shows a compact list instead of thumbnails.
     pub pages_list: bool,
+    /// Drawings open in tabs (the active one first), for reopening.
+    pub session: Vec<PathBuf>,
+    /// False while the app runs; true after a normal exit. Still false at
+    /// startup means the last run crashed or was killed.
+    pub clean_exit: bool,
+    /// Time of the newest crash report already mentioned to the user.
+    pub crash_seen: u64,
 }
 
 impl Default for Settings {
@@ -159,6 +166,9 @@ impl Default for Settings {
             markup_fill: None,
             presets: Vec::new(),
             pages_list: false,
+            session: Vec::new(),
+            clean_exit: true,
+            crash_seen: 0,
         }
     }
 }

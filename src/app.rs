@@ -22,6 +22,8 @@ mod find;
 mod format;
 mod markups;
 mod panel;
+mod session;
+mod smoke;
 mod tabs;
 mod tools;
 
@@ -330,6 +332,13 @@ pub struct App {
     sel_more: Vec<u64>,
     /// When the hovered button last changed (for tooltips).
     hover_since: std::time::Instant,
+    /// Drawings waiting to open (session restore), one after another.
+    open_queue: std::collections::VecDeque<PathBuf>,
+    /// Restoring a session: switch back to the first tab when done.
+    restoring: bool,
+    settings_saved: std::time::Instant,
+    /// CI smoke test driver (`--smoke`).
+    smoke: Option<smoke::Smoke>,
     mdraft: Option<markups::MDraft>,
     /// Where a stamp goes once picked from the menu.
     stamp_at: Option<[f32; 2]>,
@@ -434,7 +443,10 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.settings.save();
+        if self.smoke.is_none() {
+            self.settings.clean_exit = true;
+            self.settings.save();
+        }
     }
 }
 
@@ -444,7 +456,9 @@ impl App {
         if !self.settings.reopen_last {
             return;
         }
-        if let Some(r) = self.settings.recent.first().filter(|r| r.path.exists()) {
+        if self.settings.session.iter().any(|p| p.exists()) {
+            self.restore_session();
+        } else if let Some(r) = self.settings.recent.first().filter(|r| r.path.exists()) {
             let path = r.path.clone();
             self.open(path);
         }
@@ -681,6 +695,10 @@ impl App {
             selected_markup: None,
             sel_more: Vec::new(),
             hover_since: std::time::Instant::now(),
+            open_queue: std::collections::VecDeque::new(),
+            restoring: false,
+            settings_saved: std::time::Instant::now(),
+            smoke: None,
             mdraft: None,
             stamp_at: None,
             bg_tx,
@@ -1038,7 +1056,7 @@ impl App {
     /// Command-line arguments that reopen the current file and sheet.
     fn restart_args(&self) -> Vec<String> {
         match &self.doc {
-            Some(d) => vec![d.path.to_string_lossy().into_owned(), format!("--page={}", d.current + 1)],
+            Some(d) => vec!["--restore-session".into(), d.path.to_string_lossy().into_owned(), format!("--page={}", d.current + 1)],
             None => Vec::new(),
         }
     }
@@ -1107,6 +1125,7 @@ impl App {
         let old = doc.pages[doc.current as usize];
         let new = doc.pages[p as usize];
         doc.current = p;
+        self.note_page();
         self.posted.clear();
         self.anim = None;
         self.pending_pts.clear();
@@ -1383,6 +1402,8 @@ impl App {
                     self.ensure_thumb_visible();
                     self.sync_docs();
                     self.update_jobs(true);
+                    self.save_session();
+                    self.open_next_queued();
                 }
                 Msg::OpenFailed { doc_id, path, error } => {
                     if self.cmp.as_ref().and_then(|c| c.opening.as_ref()).map(|o| o.0) == Some(doc_id) {
@@ -1395,6 +1416,7 @@ impl App {
                         self.sync_docs();
                         self.opening = None;
                         self.restore = None;
+                        self.open_next_queued();
                         self.pending_error = Some(format!(
                             "Could not open {}\n\n{}\n\nPassword-protected PDFs are not supported yet.",
                             path.display(),
@@ -2048,6 +2070,9 @@ impl App {
             }
             let r = ctx.EndDraw(None, None);
             self.paint_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            if r.is_ok() {
+                self.smoke_capture();
+            }
             let r = r.and_then(|_| self.gfx.present());
             self.frames.push_back(Instant::now());
             while self.frames.len() > 240 {
@@ -2551,6 +2576,10 @@ impl App {
                 WM_KEYDOWN => self.on_key(wp.0 as u16).then_some(0),
                 WM_CHAR => {
                     self.on_char(wp.0 as u32);
+                    Some(0)
+                }
+                WM_TIMER if wp.0 == smoke::TIMER_SMOKE => {
+                    self.smoke_tick();
                     Some(0)
                 }
                 WM_TIMER if wp.0 == TIMER_TIP => {

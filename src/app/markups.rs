@@ -116,7 +116,7 @@ impl App {
         self.takeoff.markups.iter().filter(move |m| Some(m.sheet) == sheet)
     }
 
-    fn add_markup(&mut self, kind: MKind, points: Vec<[f32; 2]>, text: String) -> Option<u64> {
+    pub(super) fn add_markup(&mut self, kind: MKind, points: Vec<[f32; 2]>, text: String) -> Option<u64> {
         let sheet = self.takeoff_sheet()?;
         self.takeoff.next_id += 1;
         let id = self.takeoff.next_id;
