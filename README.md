@@ -112,6 +112,30 @@ Click **Markup** at the left of the toolbar, or press `M`, to switch to the mark
   * **Your original drawing is never modified.**
 * **Print** (`Ctrl+P`, or Save PDF ▾ → Print): the standard Windows print dialog, with page range and copies. Each sheet is fitted and auto-rotated to the paper, with markups and visible takeoffs drawn on.
 
+### Importing markups from Bluebeam, Acrobat and others
+
+When you open a drawing that already has markups or measurements made in another app (Bluebeam Revu, Acrobat, a consultant's tool), Red-Beam asks once whether to import them. You can also run **Save PDF ▾ → Import markups from this PDF** at any time; anything already imported is skipped.
+
+* **Markups:**
+
+  | Other app | Becomes in Red-Beam |
+  |---|---|
+  | Clouds | Clouds |
+  | Rectangles, ellipses, polygons | Rectangles, ellipses, polygons |
+  | Lines, arrows, polylines | Lines and arrows |
+  | Pen strokes | Pen |
+  | Text boxes and callouts | Text boxes and callouts, with their font size and colours |
+  | Sticky notes | Small yellow text boxes |
+  | Stamps | Stamps |
+  | Highlights | Highlights |
+
+  Imported markups are fully editable, and the format bar works on them.
+* **Measurements:** lengths, polylengths, areas and counts become Red-Beam measurements on an **Imported** layer, grouped by their subject (e.g. *Drywall Ceiling*), in their original colours. They're included in the quantities, costs and Excel export.
+* **Scale:** each measurement's scale comes from the PDF when it's stored readably. Otherwise it's worked out from the value the other app showed (e.g. `30'-0"` or `960.00 sf`) and the drawn size, then snapped to the nearest standard scale. A sheet without a scale takes the most common one. A measurement made at a different scale gets a detail-scale box, so its quantity stays right.
+* **No double display:** after importing, the PDF's own copies are hidden. Switch them back with **Save PDF ▾ → Show the PDF's original markups**. Saving or printing a copy then contains Red-Beam's version only.
+* **Undo and originals:** **Ctrl+Z** undoes an import. **The PDF itself is never changed.**
+* **Round trip:** PDFs saved from Red-Beam carry a copy of each markup and measurement. Opening that PDF in Red-Beam (for example on another computer) brings them back exactly.
+
 ### Takeoffs
 
 The takeoff toolbar sits at the top-left of the drawing.
@@ -258,6 +282,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/app/smoke.rs` | CI smoke test: steps through the screens and saves screenshots |
 | `src/crash.rs` | Panic and native crash reports (crash.log, crash.dmp) |
 | `src/png.rs` | Minimal PNG writer for smoke-test screenshots (unit-tested) |
+| `src/import.rs` | Turns PDF annotations into markups and measurements; scale from /Measure or from displayed values (unit-tested) |
+| `src/app/importer.rs` | Import flow: background read, one-time prompt, scales and detail boxes, hiding the PDF's own copies |
 | `src/app/tabs.rs` | Document tabs (park and restore per-document state), tab strip |
 | `src/app/find.rs` | Find / Go to sheet UI, highlighted hits, clickable sheet links |
 | `src/snap.rs` | Snap index over a sheet's line work: nearest corner, else nearest point on a line (unit-tested) |
@@ -274,7 +300,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 1. **Revision compare:** overlay, old/new toggle and sheet pairing are done. Next: point-based alignment, sheet-number matching, and a list of changed areas.
 2. **Takeoffs:** scales and calibration, length, polyline, area (with cut-outs), volume, count, snapping, groups, layers, editing, leaders, a quantities panel and CSV export are done. Next: per-viewport scales, intersection snapping, and a native Excel export.
-3. **Markups:** cloud, text, callout, arrow, line, rectangle, ellipse, highlight, pen and stamps are done, with status, a markups list and saving into a PDF copy. Next: importing markups that already exist in a PDF so they can be edited, and reply threads.
+3. **Markups:** cloud, text, callout, arrow, line, rectangle, ellipse, highlight, pen and stamps are done, with status, a markups list, a format bar, saving into a PDF copy, and importing markups and measurements from Bluebeam and Acrobat. Next: reply threads.
 4. **Navigation and UI:** the side panel, sheet names, text search, go-to-sheet, clickable sheet links, tabs and side-by-side split view are done. Next: UI polish.
 5. **Rollout:** installer, "Open with Red-Beam", sharing presets with a team.
 

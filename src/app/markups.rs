@@ -42,6 +42,8 @@ const CMD_SAVE_MARKUPS: usize = 25_003;
 const CMD_SAVE_ALL: usize = 25_004;
 const CMD_SAVE_FLAT: usize = 25_005;
 const CMD_PRINT: usize = 25_006;
+const CMD_IMPORT: usize = 25_007;
+const CMD_TOGGLE_ANNOTS: usize = 25_008;
 
 use super::format::WIDTHS;
 const FONTS: [(&str, f32); 5] = [("Small (10)", 10.0), ("Medium (14)", 14.0), ("Large (20)", 20.0), ("X-Large (28)", 28.0), ("Huge (40)", 40.0)];
@@ -138,6 +140,7 @@ impl App {
             italic: self.settings.markup_italic && kind.has_text(),
             text_color: self.settings.markup_text_color.filter(|_| kind.has_text()),
             fill: self.settings.markup_fill.filter(|_| matches!(kind, MKind::Text | MKind::Callout)),
+            source: None,
         });
         self.undo.push(Undo::MarkupAdded(id));
         self.set_sel_markup(Some(id));
@@ -313,7 +316,7 @@ impl App {
                     self.add_markup(MKind::Pen, d.pts, String::new());
                 }
             }
-            MKind::CloudPoly | MKind::Stamp => {}
+            MKind::CloudPoly | MKind::Stamp | MKind::Polygon => {}
         }
     }
 
@@ -433,6 +436,9 @@ impl App {
                 item(CMD_SAVE_FLAT, "Save a flattened copy (burned in, for issuing)\u{2026}", false),
                 sep(),
                 item(CMD_PRINT, "Print\u{2026}\tCtrl+P", false),
+                sep(),
+                item(CMD_IMPORT, "Import markups from this PDF (Bluebeam, Acrobat\u{2026})", false),
+                item(CMD_TOGGLE_ANNOTS, "Show the PDF's original markups", !self.takeoff.hide_pdf_annots),
             ],
             MenuKind::MarkupContext { id } => {
                 let m = self.markup(id)?;
@@ -486,6 +492,8 @@ impl App {
                 CMD_SAVE_ALL => self.pending_pdf_save = Some((true, false)),
                 CMD_SAVE_FLAT => self.pending_pdf_save = Some((true, true)),
                 CMD_PRINT => self.pending_print = true,
+                CMD_IMPORT => self.start_import_scan(false),
+                CMD_TOGGLE_ANNOTS => self.toggle_pdf_annots(),
                 _ => {}
             },
             MenuKind::MarkupContext { id } => {
@@ -649,6 +657,7 @@ impl App {
             italic: false,
             text_color: None,
             fill: None,
+            source: None,
         };
         if let Some(d) = &self.mdraft {
             let (a, b) = (d.start, d.cur);
@@ -819,6 +828,7 @@ impl App {
                 author: m.author.clone(),
                 name: format!("redbeam-markup-{}", m.id),
                 prims: m.prims(),
+                data: serde_json::to_string(m).ok(),
             })
             .collect();
         if with_takeoffs {
@@ -830,6 +840,7 @@ impl App {
                     author: author(),
                     name: format!("redbeam-takeoff-{}", m.id),
                     prims: self.measure_prims(m),
+                    data: serde_json::to_string(m).ok(),
                 });
             }
         }
@@ -851,7 +862,8 @@ impl App {
         }
         let src = doc.path.clone();
         self.status = Some(format!("Saving {} items\u{2026}", specs.len()));
-        self.run_bg(move || match crate::pdfium::export_annotated(&src, &dst, &specs, flatten) {
+        let drop = self.takeoff.hide_pdf_annots;
+        self.run_bg(move || match crate::pdfium::export_annotated(&src, &dst, &specs, flatten, drop) {
             Ok(n) if flatten => Ok(format!("Saved a flattened copy with {n} items burned in:\n{}\n\nYour original drawing was not changed.", dst.display())),
             Ok(n) => Ok(format!("Saved {n} annotations to\n{}\n\nThey show in Bluebeam, Acrobat and web browsers. Your original drawing was not changed.", dst.display())),
             Err(e) => Err(format!("Could not save {}:\n{e}", dst.display())),
@@ -886,12 +898,13 @@ impl App {
         let Some(doc) = &self.doc else { return };
         let src = doc.path.clone();
         let specs = self.export_specs(true);
+        let drop = self.takeoff.hide_pdf_annots;
         let job = doc.name.clone();
         self.status = Some(format!("Printing {} sheet(s)\u{2026}", pages.len()));
         self.run_bg(move || {
             let result = (|| {
                 let data = std::fs::read(&src).map_err(|e| e.to_string())?;
-                let data = if specs.is_empty() { data } else { crate::pdfium::build_pdf(&data, &specs, true)?.0 };
+                let data = if specs.is_empty() && !drop { data } else { crate::pdfium::build_pdf(&data, &specs, true, drop)?.0 };
                 crate::pdfium::print_pdf(&data, &pages, hdc, &job)
             })();
             unsafe {
@@ -910,6 +923,7 @@ impl App {
     }
 
     pub(super) fn on_bg_msgs(&mut self) {
+        self.on_import_msgs();
         while let Ok(m) = self.bg_rx.try_recv() {
             self.status = None;
             match m {

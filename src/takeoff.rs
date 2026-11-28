@@ -175,6 +175,9 @@ pub struct Measure {
     /// Wall height (real inches) for lengths: adds a wall area.
     #[serde(default)]
     pub height_in: Option<f64>,
+    /// Where an imported measurement came from (the PDF annotation's id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,6 +210,13 @@ pub struct Takeoff {
     /// Detail areas with their own scale (override the sheet scale).
     #[serde(default)]
     pub viewports: Vec<Viewport>,
+    /// The PDF's own markups were offered for import (asked once).
+    #[serde(default)]
+    pub annots_checked: bool,
+    /// Don't draw the PDF's own markups (they were imported, so they'd
+    /// show twice).
+    #[serde(default)]
+    pub hide_pdf_annots: bool,
 }
 
 /// A region of a sheet drawn at a different scale (e.g. a 1/4" detail on
@@ -780,6 +790,7 @@ impl Takeoff {
             depth_in: None,
             slope: None,
             height_in: None,
+            source: None,
         });
         id
     }
@@ -1040,6 +1051,7 @@ mod tests {
             depth_in: None,
             slope: None,
             height_in: None,
+            source: None,
         };
         let m = mk(Kind::Length, vec![[0.0, 0.0], [96.0, 0.0]]);
         assert_eq!(m.qty(Some(&s)), Qty::Length(96.0));

@@ -29,6 +29,26 @@ type Seg = *mut c_void;
 type Annot = *mut c_void;
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FsPointF {
+    x: f32,
+    y: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FsQuad {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    x3: f32,
+    y3: f32,
+    x4: f32,
+    y4: f32,
+}
+
+#[repr(C)]
 struct FsRectF {
     left: f32,
     top: f32,
@@ -197,6 +217,23 @@ pub struct Lib {
     import_pages: unsafe extern "system" fn(Doc, Doc, *const c_char, c_int) -> c_int,
     page_get_rotation: unsafe extern "system" fn(Page) -> c_int,
     page_set_rotation: unsafe extern "system" fn(Page, c_int),
+    // Reading annotations (import)
+    page_get_annot_count: unsafe extern "system" fn(Page) -> c_int,
+    page_get_annot: unsafe extern "system" fn(Page, c_int) -> Annot,
+    page_remove_annot: unsafe extern "system" fn(Page, c_int) -> c_int,
+    annot_get_subtype: unsafe extern "system" fn(Annot) -> c_int,
+    annot_get_rect: unsafe extern "system" fn(Annot, *mut FsRectF) -> c_int,
+    annot_get_vertices: unsafe extern "system" fn(Annot, *mut FsPointF, u32) -> u32,
+    annot_get_line: unsafe extern "system" fn(Annot, *mut FsPointF, *mut FsPointF) -> c_int,
+    annot_ink_count: unsafe extern "system" fn(Annot) -> u32,
+    annot_ink_path: unsafe extern "system" fn(Annot, u32, *mut FsPointF, u32) -> u32,
+    annot_get_color: unsafe extern "system" fn(Annot, c_int, *mut u32, *mut u32, *mut u32, *mut u32) -> c_int,
+    annot_get_string: unsafe extern "system" fn(Annot, *const c_char, *mut u16, u32) -> u32,
+    annot_get_number: unsafe extern "system" fn(Annot, *const c_char, *mut f32) -> c_int,
+    annot_has_key: unsafe extern "system" fn(Annot, *const c_char) -> c_int,
+    annot_set_ap: unsafe extern "system" fn(Annot, c_int, *const u16) -> c_int,
+    annot_count_attach: unsafe extern "system" fn(Annot) -> usize,
+    annot_get_attach: unsafe extern "system" fn(Annot, usize, *mut FsQuad) -> c_int,
 }
 unsafe impl Send for Lib {}
 unsafe impl Sync for Lib {}
@@ -317,6 +354,22 @@ fn load_lib() -> Result<Lib, String> {
             import_pages: sym!("FPDF_ImportPages"),
             page_get_rotation: sym!("FPDFPage_GetRotation"),
             page_set_rotation: sym!("FPDFPage_SetRotation"),
+            page_get_annot_count: sym!("FPDFPage_GetAnnotCount"),
+            page_get_annot: sym!("FPDFPage_GetAnnot"),
+            page_remove_annot: sym!("FPDFPage_RemoveAnnot"),
+            annot_get_subtype: sym!("FPDFAnnot_GetSubtype"),
+            annot_get_rect: sym!("FPDFAnnot_GetRect"),
+            annot_get_vertices: sym!("FPDFAnnot_GetVertices"),
+            annot_get_line: sym!("FPDFAnnot_GetLine"),
+            annot_ink_count: sym!("FPDFAnnot_GetInkListCount"),
+            annot_ink_path: sym!("FPDFAnnot_GetInkListPath"),
+            annot_get_color: sym!("FPDFAnnot_GetColor"),
+            annot_get_string: sym!("FPDFAnnot_GetStringValue"),
+            annot_get_number: sym!("FPDFAnnot_GetNumberValue"),
+            annot_has_key: sym!("FPDFAnnot_HasKey"),
+            annot_set_ap: sym!("FPDFAnnot_SetAP"),
+            annot_count_attach: sym!("FPDFAnnot_CountAttachmentPoints"),
+            annot_get_attach: sym!("FPDFAnnot_GetAttachmentPoints"),
         };
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (lib.init_library)();
@@ -351,6 +404,8 @@ pub struct Document {
     _data: Vec<u8>,
     /// Loaded (parsed) pages, most recently used first.
     pages: Vec<(u32, Page)>,
+    /// Draw the PDF's own annotations (off once they've been imported).
+    pub show_annots: bool,
 }
 unsafe impl Send for Document {}
 
@@ -374,7 +429,7 @@ impl Document {
                 (lib.get_page_size_by_index_f)(doc, i, &mut s);
                 sizes.push(((s.width * PT_TO_DIP).max(1.0), (s.height * PT_TO_DIP).max(1.0)));
             }
-            Ok((Document { lib, doc, _data: data, pages: Vec::new() }, sizes))
+            Ok((Document { lib, doc, _data: data, pages: Vec::new(), show_annots: true }, sizes))
         }
     }
 
@@ -415,7 +470,8 @@ impl Document {
             let start_y = (-src.t * scale).round() as c_int;
             let size_x = (page_size.0 * scale).round().max(1.0) as c_int;
             let size_y = (page_size.1 * scale).round().max(1.0) as c_int;
-            let mut status = (self.lib.render_start)(bmp, p, start_x, start_y, size_x, size_y, 0, FPDF_ANNOT | FPDF_NO_NATIVETEXT, &mut pause);
+            let flags = if self.show_annots { FPDF_ANNOT } else { 0 } | FPDF_NO_NATIVETEXT;
+            let mut status = (self.lib.render_start)(bmp, p, start_x, start_y, size_x, size_y, 0, flags, &mut pause);
             let mut cancelled = false;
             while status == RENDER_TOBECONTINUED {
                 if cancel.load(Ordering::Relaxed) {
@@ -470,6 +526,135 @@ pub struct AnnotSpec {
     /// Unique name (/NM), e.g. `redbeam-markup-12`.
     pub name: String,
     pub prims: Vec<crate::markup::Prim>,
+    /// Red-Beam's own copy of the item (JSON), so importing the saved PDF
+    /// brings it back exactly.
+    pub data: Option<String>,
+}
+
+/// Read every markup annotation of the PDF at `path` (from a separate,
+/// throwaway copy of the document, so the open one is untouched), with
+/// geometry in page DIPs, for importing.
+pub fn read_annots(path: &Path) -> Result<Vec<crate::import::RawAnnot>, String> {
+    use crate::import::{is_structural, parse_ratio, raw_extra, RawAnnot};
+    let lib = lib()?;
+    let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    unsafe {
+        let doc = (lib.load_mem_document64)(data.as_ptr() as *const c_void, data.len(), std::ptr::null());
+        if doc.is_null() {
+            return Err(error_text((lib.get_last_error)()).to_string());
+        }
+        let key = |k: &str| std::ffi::CString::new(k).unwrap();
+        let get_str = |a: Annot, k: &str| -> String {
+            let k = key(k);
+            let n = (lib.annot_get_string)(a, k.as_ptr(), std::ptr::null_mut(), 0);
+            if n <= 2 {
+                return String::new();
+            }
+            let mut buf = vec![0u16; (n as usize).div_ceil(2)];
+            (lib.annot_get_string)(a, k.as_ptr(), buf.as_mut_ptr(), n);
+            String::from_utf16_lossy(&buf[..buf.len().saturating_sub(1)])
+        };
+        let get_color = |a: Annot, t: c_int| -> Option<u32> {
+            let (mut r, mut g, mut b, mut al) = (0u32, 0u32, 0u32, 0u32);
+            ((lib.annot_get_color)(a, t, &mut r, &mut g, &mut b, &mut al) != 0).then_some(((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff))
+        };
+        let n_pages = (lib.get_page_count)(doc).max(0);
+        for pi in 0..n_pages {
+            let mut sz = FsSizeF { width: 612.0, height: 792.0 };
+            (lib.get_page_size_by_index_f)(doc, pi, &mut sz);
+            let page_size = (sz.width * PT_TO_DIP, sz.height * PT_TO_DIP);
+            let p = (lib.load_page)(doc, pi);
+            if p.is_null() {
+                continue;
+            }
+            let to_dip = page_to_dip(lib, p, page_size);
+            let pts = |v: &[FsPointF]| v.iter().map(|q| to_dip.apply(q.x, q.y)).collect::<Vec<[f32; 2]>>();
+            let n = (lib.page_get_annot_count)(p).max(0);
+            for ai in 0..n {
+                let a = (lib.page_get_annot)(p, ai);
+                if a.is_null() {
+                    continue;
+                }
+                let subtype = (lib.annot_get_subtype)(a);
+                if is_structural(subtype) {
+                    (lib.close_annot)(a);
+                    continue;
+                }
+                let mut r = RawAnnot { page: pi as u32, index: ai as usize, subtype, ..Default::default() };
+                let mut rc = FsRectF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+                if (lib.annot_get_rect)(a, &mut rc) != 0 {
+                    let (c1, c2) = (to_dip.apply(rc.left, rc.top), to_dip.apply(rc.right, rc.bottom));
+                    r.rect = [c1[0].min(c2[0]), c1[1].min(c2[1]), c1[0].max(c2[0]), c1[1].max(c2[1])];
+                }
+                let nv = (lib.annot_get_vertices)(a, std::ptr::null_mut(), 0);
+                if nv > 0 {
+                    let mut v = vec![FsPointF::default(); nv as usize];
+                    (lib.annot_get_vertices)(a, v.as_mut_ptr(), nv);
+                    r.verts = pts(&v);
+                }
+                let (mut l0, mut l1) = (FsPointF::default(), FsPointF::default());
+                if subtype == crate::import::LINE && (lib.annot_get_line)(a, &mut l0, &mut l1) != 0 {
+                    let v = pts(&[l0, l1]);
+                    r.line = Some([v[0], v[1]]);
+                }
+                for k in 0..(lib.annot_ink_count)(a) {
+                    let m = (lib.annot_ink_path)(a, k, std::ptr::null_mut(), 0);
+                    if m > 0 {
+                        let mut v = vec![FsPointF::default(); m as usize];
+                        (lib.annot_ink_path)(a, k, v.as_mut_ptr(), m);
+                        r.ink.push(pts(&v));
+                    }
+                }
+                for k in 0..(lib.annot_count_attach)(a) {
+                    let mut q = FsQuad::default();
+                    if (lib.annot_get_attach)(a, k, &mut q) != 0 {
+                        let v = pts(&[FsPointF { x: q.x1, y: q.y1 }, FsPointF { x: q.x4, y: q.y4 }, FsPointF { x: q.x2, y: q.y2 }, FsPointF { x: q.x3, y: q.y3 }]);
+                        let xs = v.iter().map(|p| p[0]);
+                        let ys = v.iter().map(|p| p[1]);
+                        r.quads.push([xs.clone().fold(f32::MAX, f32::min), ys.clone().fold(f32::MAX, f32::min), xs.fold(f32::MIN, f32::max), ys.fold(f32::MIN, f32::max)]);
+                    }
+                }
+                r.contents = get_str(a, "Contents");
+                r.subject = get_str(a, "Subj");
+                r.it = get_str(a, "IT");
+                r.author = get_str(a, "T");
+                r.nm = get_str(a, "NM");
+                r.da = get_str(a, "DA");
+                r.name = get_str(a, "Name");
+                let d = get_str(a, "RedBeamData");
+                r.data = (!d.is_empty()).then_some(d);
+                r.has_measure = (lib.annot_has_key)(a, key("Measure").as_ptr()) != 0;
+                let mut ca = 1.0f32;
+                if (lib.annot_get_number)(a, key("CA").as_ptr(), &mut ca) != 0 {
+                    r.opacity = Some(ca);
+                }
+                let has_ic = (lib.annot_has_key)(a, key("IC").as_ptr()) != 0;
+                let has_c = (lib.annot_has_key)(a, key("C").as_ptr()) != 0;
+                // Colours can only be read once the appearance stream is
+                // gone (this copy of the document is thrown away).
+                (lib.annot_set_ap)(a, 0, std::ptr::null());
+                if has_c {
+                    r.color = get_color(a, 0);
+                }
+                if has_ic {
+                    r.fill = get_color(a, 1);
+                }
+                let extra = raw_extra(&data, &r.nm);
+                if extra.cl.len() >= 4 {
+                    r.callout = extra.cl.chunks(2).filter(|c| c.len() == 2).map(|c| to_dip.apply(c[0], c[1])).collect();
+                }
+                r.width = extra.width.map(|w| w * PT_TO_DIP);
+                r.measure_ratio = extra.ratio.as_deref().and_then(parse_ratio);
+                (lib.close_annot)(a);
+                out.push(r);
+            }
+            (lib.close_page)(p);
+        }
+        (lib.close_document)(doc);
+    }
+    Ok(out)
 }
 
 fn utf16z(s: &str) -> Vec<u16> {
@@ -480,9 +665,9 @@ fn utf16z(s: &str) -> Vec<u16> {
 /// (stamp annotations carrying their own appearance, so Acrobat, Bluebeam
 /// and browsers all display them and they stay movable), or, with
 /// `flatten`, burned into the page content. Returns how many were written.
-pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec], flatten: bool) -> Result<usize, String> {
+pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec], flatten: bool, drop_originals: bool) -> Result<usize, String> {
     let data = std::fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-    let (out, written) = build_pdf(&data, annots, flatten)?;
+    let (out, written) = build_pdf(&data, annots, flatten, drop_originals)?;
     let tmp = dst.with_extension("pdf.tmp");
     std::fs::write(&tmp, &out).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, dst).map_err(|e| format!("cannot write {}: {e}", dst.display()))?;
@@ -490,7 +675,9 @@ pub fn export_annotated(src: &Path, dst: &Path, annots: &[AnnotSpec], flatten: b
 }
 
 /// The PDF bytes of `data` with `annots` added (see `export_annotated`).
-pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool) -> Result<(Vec<u8>, usize), String> {
+/// `drop_originals` removes the PDF's own markup annotations first (they
+/// were imported, so `annots` already holds them).
+pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool, drop_originals: bool) -> Result<(Vec<u8>, usize), String> {
     use crate::markup::{wrap, Prim};
     let lib = lib()?;
     let mut written = 0usize;
@@ -503,12 +690,27 @@ pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool) -> Result<(Ve
                 return Err(error_text((lib.get_last_error)()).to_string());
             }
             let mut pages: Vec<u32> = annots.iter().map(|a| a.page).collect();
+            if drop_originals {
+                pages.extend(0..(lib.get_page_count)(doc).max(0) as u32);
+            }
             pages.sort_unstable();
             pages.dedup();
             for pg in pages {
                 let p = (lib.load_page)(doc, pg as c_int);
                 if p.is_null() {
                     continue;
+                }
+                if drop_originals {
+                    for i in (0..(lib.page_get_annot_count)(p)).rev() {
+                        let a = (lib.page_get_annot)(p, i);
+                        let keep = a.is_null() || crate::import::is_structural((lib.annot_get_subtype)(a));
+                        if !a.is_null() {
+                            (lib.close_annot)(a);
+                        }
+                        if !keep {
+                            (lib.page_remove_annot)(p, i);
+                        }
+                    }
                 }
                 let mut sz = FsSizeF { width: 612.0, height: 792.0 };
                 (lib.get_page_size_by_index_f)(doc, pg as c_int, &mut sz);
@@ -629,6 +831,11 @@ pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool) -> Result<(Ve
                         for (key, val) in [("Contents", &a.contents), ("T", &a.author), ("Subj", &a.subject), ("NM", &a.name)] {
                             let k = std::ffi::CString::new(key).unwrap();
                             let v = utf16z(val);
+                            (lib.annot_set_string)(annot, k.as_ptr(), v.as_ptr());
+                        }
+                        if let Some(d) = &a.data {
+                            let k = std::ffi::CString::new("RedBeamData").unwrap();
+                            let v = utf16z(d);
                             (lib.annot_set_string)(annot, k.as_ptr(), v.as_ptr());
                         }
                         (lib.annot_set_flags)(annot, ANNOT_FLAG_PRINT);

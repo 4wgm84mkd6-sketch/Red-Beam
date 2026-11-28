@@ -21,6 +21,8 @@ pub enum MKind {
     Highlight,
     Pen,
     Stamp,
+    /// Closed outline (imported from other apps).
+    Polygon,
 }
 
 impl MKind {
@@ -36,6 +38,7 @@ impl MKind {
             MKind::Highlight => "Highlight",
             MKind::Pen => "Pen",
             MKind::Stamp => "Stamp",
+            MKind::Polygon => "Polygon",
         }
     }
     /// Defined by two corner points (drag to create).
@@ -122,6 +125,10 @@ pub struct Markup {
     /// Box fill of text boxes and callouts; `None` = white, `NO_FILL` = clear.
     #[serde(default)]
     pub fill: Option<u32>,
+    /// Where an imported markup came from (the PDF annotation's id), so
+    /// importing again doesn't duplicate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// `Markup::fill` value for a see-through box.
@@ -295,6 +302,7 @@ impl Markup {
                 let ring = cloud_ring(&self.points, (self.width * 7.0).max(10.0));
                 vec![Prim::Path { rings: vec![ring], closed: true, stroke, fill: None }]
             }
+            MKind::Polygon => vec![Prim::Path { rings: vec![self.points.clone()], closed: true, stroke, fill: None }],
             MKind::Line | MKind::Pen => vec![Prim::Path { rings: vec![self.points.clone()], closed: false, stroke, fill: None }],
             MKind::Arrow => {
                 let n = self.points.len();
@@ -362,6 +370,7 @@ impl Markup {
         match self.kind {
             MKind::Line | MKind::Arrow | MKind::Pen => near(&self.points, false),
             MKind::CloudPoly => crate::takeoff::point_in_polygon(p, &self.points) || near(&self.points, true),
+            MKind::Polygon => near(&self.points, true),
             MKind::Callout => self.points.len() >= 3 && (inside(self.callout_box()) || near(&[self.points[0], self.callout_anchor()], false)),
             _ => inside(self.bounds()),
         }
@@ -473,6 +482,7 @@ mod tests {
             italic: false,
             text_color: None,
             fill: None,
+            source: None,
         }
     }
 

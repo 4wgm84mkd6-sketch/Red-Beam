@@ -194,6 +194,8 @@ pub enum Undo {
     MarkupModified(Markup),
     /// Several markups before a format change.
     MarkupsModified(Vec<Markup>),
+    /// The whole takeoff before a bulk change (import).
+    Whole(Box<Takeoff>),
 }
 
 /// A drag in progress with the Select tool.
@@ -1693,6 +1695,10 @@ impl App {
                     *cur = m;
                 }
             }
+            Undo::Whole(t) => {
+                self.takeoff = *t;
+                self.refresh_annot_visibility();
+            }
             Undo::MarkupsModified(list) => {
                 for m in list {
                     if let Some(cur) = self.takeoff.markups.iter_mut().find(|x| x.id == m.id) {
@@ -2308,6 +2314,7 @@ impl App {
             depth_in: None,
             slope: None,
             height_in: None,
+            source: None,
         };
         let mut readout = takeoff::fmt_qty(tmp.qty(scale), units);
         if let Qty::Area { perimeter, .. } = tmp.qty(scale) {

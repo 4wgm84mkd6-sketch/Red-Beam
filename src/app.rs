@@ -20,6 +20,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 mod extras;
 mod find;
 mod format;
+mod importer;
 mod markups;
 mod panel;
 mod session;
@@ -341,6 +342,13 @@ pub struct App {
     settings_saved: std::time::Instant,
     /// CI smoke test driver (`--smoke`).
     smoke: Option<smoke::Smoke>,
+    /// Background reads of the PDF's own annotations (import).
+    import: importer::ImportChannel,
+    /// Annotations waiting for the user's yes/no to importing them.
+    pending_import: Option<Vec<crate::import::RawAnnot>>,
+    pub pending_import_prompt: Option<String>,
+    /// Annotation scans still running.
+    import_pending: usize,
     mdraft: Option<markups::MDraft>,
     /// Where a stamp goes once picked from the menu.
     stamp_at: Option<[f32; 2]>,
@@ -702,6 +710,10 @@ impl App {
             restoring: false,
             settings_saved: std::time::Instant::now(),
             smoke: None,
+            import: importer::ImportChannel::new(),
+            pending_import: None,
+            pending_import_prompt: None,
+            import_pending: 0,
             mdraft: None,
             stamp_at: None,
             bg_tx,
@@ -907,6 +919,7 @@ impl App {
             }
         }
         self.worker.set_docs(docs);
+        self.sync_hidden_annots();
     }
 
     // --------------------------------------------------------------- compare
@@ -1397,6 +1410,10 @@ impl App {
                         self.status = Some("Document has no pages".into());
                     }
                     self.load_takeoff();
+                    self.sync_hidden_annots();
+                    if !self.takeoff.annots_checked {
+                        self.start_import_scan(true);
+                    }
                     if let Some(d) = &self.doc {
                         let (p, c) = (d.path.clone(), d.current);
                         self.settings.touch_recent(&p, c);

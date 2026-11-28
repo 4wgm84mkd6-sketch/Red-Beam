@@ -158,6 +158,8 @@ struct State {
     bg_running: usize,
     bg_limit: usize,
     fg_running: usize,
+    /// Documents whose own PDF annotations are not drawn (imported).
+    hide_annots: HashSet<u64>,
     quit: bool,
 }
 
@@ -226,6 +228,11 @@ impl Pool {
         }
         s.jobs = jobs;
         self.shared.cv.notify_all();
+    }
+
+    /// Documents whose PDF annotations should not be drawn.
+    pub fn set_hidden_annots(&self, ids: HashSet<u64>) {
+        self.shared.m.lock().unwrap().hide_annots = ids;
     }
 
     pub fn ack(&self, key: &JobKey) {
@@ -590,6 +597,12 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
             }
             Task::Render(job, parallel, cancel) => {
                 let t0 = Instant::now();
+                let hidden = shared.m.lock().unwrap().hide_annots.clone();
+                for (id, d) in docs.iter_mut() {
+                    if let DocHandle::Pdfium { doc, .. } = d {
+                        doc.show_annots = !hidden.contains(id);
+                    }
+                }
                 // Line-work extraction for snapping (PDFium only).
                 let mut snap: Option<std::result::Result<SnapIndex, String>> = None;
                 let mut diff: Option<std::result::Result<Vec<Change>, String>> = None;

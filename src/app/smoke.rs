@@ -18,7 +18,7 @@ use crate::takeoff::{Kind, Scale};
 
 pub const TIMER_SMOKE: usize = 3;
 
-const STEPS: [&str; 9] = [
+const STEPS: [&str; 11] = [
     "01-open",
     "02-pages-list",
     "03-thumbs-discipline",
@@ -28,6 +28,8 @@ const STEPS: [&str; 9] = [
     "07-help",
     "08-compare-overlay",
     "09-compare-side",
+    "10-import-bluebeam",
+    "11-imported-quantities",
 ];
 
 pub struct Smoke {
@@ -113,7 +115,11 @@ impl App {
     }
 
     pub(super) fn smoke_tick(&mut self) {
-        let busy = self.opening.is_some() || self.cmp.as_ref().is_some_and(|c| c.opening.is_some()) || self.worker.busy() > 0 || self.anim.is_some();
+        let busy = self.opening.is_some()
+            || self.cmp.as_ref().is_some_and(|c| c.opening.is_some())
+            || self.worker.busy() > 0
+            || self.anim.is_some()
+            || self.import_pending > 0;
         let Some(sm) = self.smoke.as_mut() else { return };
         if sm.started.elapsed() > Duration::from_secs(240) {
             sm.note(format!("FAIL: timed out at step {}", STEPS.get(sm.step).unwrap_or(&"end")));
@@ -249,6 +255,38 @@ impl App {
                 }
             }
             "09-compare-side" => self.set_cmp_mode(super::CmpMode::Side),
+            "10-import-bluebeam" => {
+                // tests/sample-bluebeam.pdf: annotations written the way
+                // Bluebeam writes them; opening it imports them (no prompt
+                // in smoke mode).
+                let pdf = self.smoke.as_ref().map(|s| s.pdf.with_file_name("sample-bluebeam.pdf"));
+                if let Some(p) = pdf.filter(|p| p.exists()) {
+                    // Start clean: a sidecar from an earlier run would skip the import.
+                    let _ = std::fs::remove_file(crate::takeoff::Takeoff::sidecar_path(&p));
+                    self.markup_mode = true;
+                    self.open(p);
+                } else if let Some(sm) = self.smoke.as_mut() {
+                    sm.note("ERROR: tests/sample-bluebeam.pdf not found");
+                }
+            }
+            "11-imported-quantities" => {
+                self.markup_mode = false;
+                self.show_qty = true;
+                let units = self.takeoff.units;
+                let lines: Vec<String> = self
+                    .takeoff
+                    .items
+                    .iter()
+                    .map(|m| format!("{:?} {} = {} (scale {})", m.kind, m.group, crate::takeoff::fmt_qty(m.qty(self.takeoff.scale_of(m)), units), self.takeoff.scale_of(m).map(|s| s.label.clone()).unwrap_or_default()))
+                    .collect();
+                let n_markups = self.takeoff.markups.len();
+                if let Some(sm) = self.smoke.as_mut() {
+                    sm.note(format!("imported markups on the sheet: {n_markups}"));
+                    for l in lines {
+                        sm.note(format!("measure: {l}"));
+                    }
+                }
+            }
             _ => {}
         }
     }

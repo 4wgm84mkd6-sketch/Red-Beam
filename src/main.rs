@@ -8,6 +8,7 @@ mod app;
 mod crash;
 mod diff;
 mod gfx;
+mod import;
 mod markup;
 mod pdfium;
 mod png;
@@ -333,6 +334,11 @@ fn after(hwnd: HWND) {
         unsafe {
             MessageBoxW(Some(hwnd), &HSTRING::from(i), w!("Red-Beam"), MB_OK | MB_ICONINFORMATION);
         }
+    }
+    if let Some(q) = with_app(|a| a.pending_import_prompt.take()).flatten() {
+        let r = unsafe { MessageBoxW(Some(hwnd), &HSTRING::from(q), w!("Import markups"), MB_YESNO | MB_ICONQUESTION) };
+        with_app(|a| if r == IDYES { a.accept_import() } else { a.decline_import() });
+        repaint(hwnd);
     }
     if let Some(b) = prompt {
         let text = format!(

@@ -174,3 +174,117 @@ def build(rev):
 
 for r in (2, 1):
     build(r)
+
+
+def build_marked_up():
+    """tests/sample-bluebeam.pdf: sheet A-101 with annotations written the
+    way Bluebeam Revu writes them (measurements with /IT and /Measure,
+    clouds with a border effect, appearance streams), for the importer."""
+    objs = []
+
+    def add(body):
+        objs.append(body if isinstance(body, bytes) else body.encode("latin-1"))
+        return len(objs)
+
+    def ap(stream):
+        data = stream.encode("latin-1")
+        return add(b"<< /Type /XObject /Subtype /Form /BBox [0 0 2592 1728] /Length %d >>\nstream\n" % len(data) + data + b"\nendstream")
+
+    font1 = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    font2 = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>")
+    data = zlib.compress(sheet("A-101", "FIRST FLOOR PLAN", 1, 2).encode("latin-1"))
+    content = add(b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(data) + data + b"\nendstream")
+    # 1/8" = 1'-0": 1 pt of paper = 1/72 in = 96/72 in real.
+    k = 96.0 / 72.0  # real inches per point
+    annots = []
+
+    def poly(pts):
+        return " ".join(f"{x:.1f} {y:.1f}" for x, y in pts)
+
+    def bbox(pts, pad=4):
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return f"[{min(xs) - pad:.1f} {min(ys) - pad:.1f} {max(xs) + pad:.1f} {max(ys) + pad:.1f}]"
+
+    measure = "<< /Type /Measure /Subtype /RL /R (1 in = 8 ft) /X [<< /U (ft) /C 0.1111 >>] /A [<< /U (sf) /C 1 >>] >>"
+    # Area measurement: a 360 x 216 pt rectangle -> 40' x 24' = 960 sf.
+    area = [(400, 400), (760, 400), (760, 616), (400, 616)]
+    a = ap(f"1 0 0 RG 1 0 0 rg /GS0 gs {poly(area[:1])} m " + " ".join(f"{x} {y} l" for x, y in area[1:]) + " h B")
+    annots.append(add(f"<< /Type /Annot /Subtype /Polygon /IT /PolygonDimension /Subj (Drywall Ceiling) /T (estimator) "
+                      f"/NM (bb-area-1) /Contents (960.00 sf) /Rect {bbox(area)} /Vertices [{poly(area)}] "
+                      f"/C [1 0 0] /IC [1 0 0] /CA 0.5 /BS << /W 2 >> /Measure {measure} /AP << /N {a} 0 R >> >>"))
+    # Length measurement: 270 pt -> 30'-0".
+    ln = [(400, 300), (670, 300)]
+    a = ap("0 0 1 RG 400 300 m 670 300 l S")
+    annots.append(add(f"<< /Type /Annot /Subtype /Line /IT /LineDimension /Subj (Length Measurement) /T (estimator) "
+                      f"/NM (bb-len-1) /Contents (30'-0\") /Rect {bbox(ln, 10)} /L [{poly(ln)}] /C [0 0 1] "
+                      f"/BS << /W 1.5 >> /Measure {measure} /AP << /N {a} 0 R >> >>"))
+    # Polylength: 180 + 90 pt -> 20' + 10' = 30'-0".
+    pl = [(900, 300), (1080, 300), (1080, 390)]
+    a = ap("0 0.5 0 RG 900 300 m 1080 300 l 1080 390 l S")
+    annots.append(add(f"<< /Type /Annot /Subtype /PolyLine /IT /PolyLineDimension /Subj (Base Trim) /T (estimator) "
+                      f"/NM (bb-poly-1) /Contents (30'-0\") /Rect {bbox(pl)} /Vertices [{poly(pl)}] /C [0 0.5 0] "
+                      f"/Measure {measure} /AP << /N {a} 0 R >> >>"))
+    # Three count markers.
+    for i, (x, y) in enumerate([(900, 700), (960, 700), (1020, 700)]):
+        a = ap(f"1 0.5 0 rg {x - 8} {y - 8} 16 16 re f")
+        annots.append(add(f"<< /Type /Annot /Subtype /Circle /Subj (Count Measurement) /T (estimator) /NM (bb-count-{i}) "
+                          f"/Contents (1) /Rect [{x - 8} {y - 8} {x + 8} {y + 8}] /C [1 0.5 0] /IC [1 0.5 0] /AP << /N {a} 0 R >> >>"))
+    # Revision cloud (polygon with a cloudy border effect).
+    cl = [(1300, 900), (1600, 900), (1600, 1100), (1300, 1100)]
+    a = ap("1 0 0 RG 1300 900 300 200 re S")
+    annots.append(add(f"<< /Type /Annot /Subtype /Polygon /IT /PolygonCloud /Subj (Cloud) /T (architect) /NM (bb-cloud-1) "
+                      f"/Contents (Revised layout) /Rect {bbox(cl, 20)} /Vertices [{poly(cl)}] /C [1 0 0] /BE << /S /C /I 1 >> "
+                      f"/BS << /W 2 >> /AP << /N {a} 0 R >> >>"))
+    # Rectangle and ellipse markups.
+    a = ap("0.85 0.1 0.38 RG 1300 400 200 120 re S")
+    annots.append(add(f"<< /Type /Annot /Subtype /Square /Subj (Rectangle) /T (architect) /NM (bb-rect-1) "
+                      f"/Rect [1300 400 1500 520] /C [0.85 0.1 0.38] /BS << /W 3 >> /AP << /N {a} 0 R >> >>"))
+    a = ap("0 0 1 RG 1550 400 m 1700 400 l S")
+    annots.append(add(f"<< /Type /Annot /Subtype /Circle /Subj (Ellipse) /T (architect) /NM (bb-ell-1) "
+                      f"/Rect [1550 400 1700 520] /C [0 0 1] /AP << /N {a} 0 R >> >>"))
+    # Text box.
+    a = ap("0 0 1 RG 1300 600 260 60 re S")
+    annots.append(add(f"<< /Type /Annot /Subtype /FreeText /Subj (Text Box) /T (architect) /NM (bb-text-1) "
+                      f"/Contents (VERIFY ALL DIMENSIONS IN FIELD) /DA (0 0 1 rg /Helv 14 Tf) "
+                      f"/Rect [1300 600 1560 660] /C [1 1 1] /AP << /N {a} 0 R >> >>"))
+    # Callout.
+    a = ap("1 0 0 RG 1650 700 200 50 re S 1600 620 m 1650 725 l S")
+    annots.append(add(f"<< /Type /Annot /Subtype /FreeText /IT /FreeTextCallout /Subj (Callout) /T (architect) /NM (bb-callout-1) "
+                      f"/Contents (PROVIDE BLOCKING) /DA (1 0 0 rg /Helv 12 Tf) /CL [1600 620 1650 725] "
+                      f"/RD [0 0 0 0] /Rect [1590 610 1850 750] /AP << /N {a} 0 R >> >>"))
+    # Pen (ink).
+    ink = [(400, 900), (450, 940), (500, 910), (560, 960)]
+    a = ap("0 0 0 RG 400 900 m 450 940 l 500 910 l 560 960 l S")
+    annots.append(add(f"<< /Type /Annot /Subtype /Ink /Subj (Pen) /T (architect) /NM (bb-ink-1) "
+                      f"/Rect {bbox(ink)} /InkList [[{poly(ink)}]] /C [0 0 0] /AP << /N {a} 0 R >> >>"))
+    # Stamp.
+    a = ap("0 0.5 0 RG 1700 1200 240 70 re S")
+    annots.append(add(f"<< /Type /Annot /Subtype /Stamp /Name /Approved /Subj (Approved) /T (architect) /NM (bb-stamp-1) "
+                      f"/Contents (APPROVED) /Rect [1700 1200 1940 1270] /C [0 0.5 0] /AP << /N {a} 0 R >> >>"))
+    # Text highlight over "CORRIDOR"-ish area.
+    a = ap("1 1 0 rg 1000 1180 200 30 re f")
+    annots.append(add(f"<< /Type /Annot /Subtype /Highlight /Subj (Highlight) /T (architect) /NM (bb-hl-1) "
+                      f"/Rect [1000 1180 1200 1210] /QuadPoints [1000 1210 1200 1210 1000 1180 1200 1180] /C [1 1 0] "
+                      f"/CA 0.4 /AP << /N {a} 0 R >> >>"))
+
+    page = add(f"<< /Type /Page /Parent {len(objs) + 2} 0 R /MediaBox [0 0 {W} {H}] "
+               f"/Resources << /Font << /F1 {font1} 0 R /F2 {font2} 0 R >> >> /Contents {content} 0 R "
+               f"/Annots [{' '.join(f'{x} 0 R' for x in annots)}] >>")
+    pages = add(f"<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>")
+    catalog = add(f"<< /Type /Catalog /Pages {pages} 0 R >>")
+    out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, body in enumerate(objs):
+        offsets.append(len(out))
+        out += f"{i + 1} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for o in offsets:
+        out += f"{o:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root {catalog} 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    open(__file__.rsplit("/", 1)[0] + "/sample-bluebeam.pdf", "wb").write(out)
+    print(f"wrote sample-bluebeam.pdf: {len(annots)} annotations, {len(out)} bytes")
+
+
+build_marked_up()
