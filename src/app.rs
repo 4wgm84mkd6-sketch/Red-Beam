@@ -19,6 +19,7 @@ use windows_numerics::Matrix3x2;
 
 mod extras;
 mod find;
+mod format;
 mod markups;
 mod panel;
 mod tabs;
@@ -41,6 +42,9 @@ pub const WM_APP_COMPARE: u32 = WM_APP + 4;
 /// A background task (e.g. PDF export) finished.
 pub const WM_APP_BG: u32 = WM_APP + 5;
 const TIMER_SETTLE: usize = 1;
+const TIMER_TIP: usize = 2;
+/// Hover this long before a tooltip shows.
+const TIP_MS: u32 = 550;
 /// How long the view must be still before a pixel-exact detail render is requested.
 const SETTLE_MS: u32 = 140;
 /// Longest edge (px) of the whole-page "base" bitmap kept on the GPU per page,
@@ -99,6 +103,8 @@ V  or  Esc\tSelect: drag to move, drag handles to reshape\n\
 Ctrl+C / V / D\tCopy, paste at cursor, duplicate\n\
 M\tToolbar: Takeoff \u{2194} Markup tools\n\
 C T K A L R E H\tMarkup: cloud, text, callout, arrow, line, rect, ellipse, highlight\n\
+Ctrl+click / Ctrl+A\tSelect several markups / all on this sheet (format bar applies to all)\n\
+Ctrl+B / I, Ctrl+[ ]\tSelected text: bold / italic, smaller / bigger\n\
 Enter / dbl-click\tFinish polyline, area or count\n\
 Shift (while measuring)\tStraight lines (0\u{00B0}/45\u{00B0}/90\u{00B0})\n\
 Ctrl+Z\tUndo \u{00B7}  Q  quantities panel\n\
@@ -106,6 +112,7 @@ Ctrl+B\tSide panel: pages, files, markups, find, settings\n\
 Ctrl+Tab / Ctrl+W\tNext tab / close tab\n\
 Ctrl+F  /  F3\tFind text in the set / next result (Shift+F3 previous)\n\
 Ctrl+G\tGo to sheet by number or name\n\
+Ctrl+Shift+PgDn / PgUp\tNext / previous discipline (A, S, M, E, P\u{2026})\n\
 Ctrl+P\tPrint (with markups and takeoffs)\n\
 Ctrl+K\tCompare with an earlier revision\n\
 Ctrl+Shift+K\tSplit view: two sheets of this set side by side\n\
@@ -319,6 +326,10 @@ pub struct App {
     /// A drag started in the right pane (keeps the mapping until release).
     right_pane: Option<bool>,
     selected_markup: Option<u64>,
+    /// Further selected markups (Ctrl+click); formatting applies to all.
+    sel_more: Vec<u64>,
+    /// When the hovered button last changed (for tooltips).
+    hover_since: std::time::Instant,
     mdraft: Option<markups::MDraft>,
     /// Where a stamp goes once picked from the menu.
     stamp_at: Option<[f32; 2]>,
@@ -498,6 +509,33 @@ fn make_tint(ctx: &ID2D1DeviceContext, tint: Tint) -> Result<ID2D1Effect> {
     }
 }
 
+/// Text on the Windows clipboard, if any.
+pub(crate) fn clipboard_text() -> Option<String> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let out = (|| {
+            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
+            let hg = windows::Win32::Foundation::HGLOBAL(h.0);
+            let p = GlobalLock(hg) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut n = 0usize;
+            while *p.add(n) != 0 && n < 1_000_000 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        out
+    }
+}
+
 fn make_fonts(dw: &IDWriteFactory, s: f32) -> Result<Fonts> {
     unsafe {
         let mk = |size: f32, weight: DWRITE_FONT_WEIGHT| -> Result<IDWriteTextFormat> {
@@ -641,6 +679,8 @@ impl App {
             view_shift: 0.0,
             right_pane: None,
             selected_markup: None,
+            sel_more: Vec::new(),
+            hover_since: std::time::Instant::now(),
             mdraft: None,
             stamp_at: None,
             bg_tx,
@@ -1766,6 +1806,61 @@ impl App {
         self.button_layout().into_iter().find(|(_, r, _)| r.contains_pt(x, y)).map(|(b, _, _)| b)
     }
 
+    /// What a status-bar button does, with its shortcut.
+    fn btn_tip(&self, b: Btn) -> &'static str {
+        match b {
+            Btn::Open => "Open a PDF  (Ctrl+O)",
+            Btn::Prev => "Previous sheet  (Ctrl+\u{2190}, PgUp)",
+            Btn::Next => "Next sheet  (Ctrl+\u{2192}, PgDn)",
+            Btn::ZoomOut => "Zoom out  (\u{2212})",
+            Btn::ZoomIn => "Zoom in  (+)",
+            Btn::FitPage => "Fit the whole sheet  (F)",
+            Btn::FitWidth => "Fit the sheet's width  (W)",
+            Btn::Help => "Shortcuts and help  (F1)",
+            Btn::Update => "Check for a newer build and update",
+            Btn::Compare => "Compare with an earlier revision  (Ctrl+K)",
+            Btn::Panel => "Side panel: pages, files, markups, find, settings  (Ctrl+B)",
+            Btn::Sheets => "Combine, extract, remove or rotate sheets (always a new PDF)",
+            Btn::CmpOverlay => "Overlay: old in red, new in blue  (Tab cycles)",
+            Btn::CmpOld => "Show the old revision only",
+            Btn::CmpNew => "Show the new revision only",
+            Btn::CmpSide => "Old and new side by side, zoom locked together",
+            Btn::ChgPrev => "Previous detected change  (,)",
+            Btn::ChgNext => "Next detected change  (.)",
+        }
+    }
+
+    /// Tooltip for the hovered button, once the mouse has rested on it.
+    fn paint_tooltip(&self) {
+        if self.hover_since.elapsed().as_millis() < TIP_MS as u128 || self.drag.is_some() || self.prompt.is_some() {
+            return;
+        }
+        let tip: String = if let Some(b) = self.tool_hover {
+            self.tbtn_tip(b)
+        } else if let Some(b) = self.hover {
+            self.btn_tip(b).to_string()
+        } else {
+            return;
+        };
+        if tip.is_empty() {
+            return;
+        }
+        let s = self.s();
+        let (cw, _) = self.canvas();
+        let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
+        let w = (tip.chars().count() as f32 * 6.9 + 22.0) * s;
+        let h = 26.0 * s;
+        let x = (mx - w / 2.0).clamp(4.0 * s, (cw - w - 4.0 * s).max(4.0 * s));
+        let y = if self.in_bar(my) { my - h - 14.0 * s } else { my + 22.0 * s };
+        let r = RectF::new(x.round(), y.round(), (x + w).round(), (y + h).round());
+        self.fill(&r, 0x0e0f11, 0.96);
+        unsafe {
+            self.brush.SetColor(&rgb(0x5a5f66, 1.0));
+            self.gfx.ctx.DrawRectangle(&d2r(&r), &self.brush, 1.0, None);
+        }
+        self.text(&tip, &self.fonts.ui_center, &r, TEXT);
+    }
+
     fn paint_bar(&self) {
         let s = self.s();
         let (w, h) = self.client;
@@ -1849,8 +1944,9 @@ impl App {
     fn paint_help(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
-        let (pw, ph) = (680.0 * s, 820.0 * s);
-        let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round(), 0.0, 0.0);
+        let lines = HELP.lines().count() as f32 + 2.0;
+        let (pw, ph) = (720.0 * s, ((lines * 19.5 + 46.0) * s).min(ch - 8.0 * s));
+        let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round().max(4.0 * s), 0.0, 0.0);
         let panel = RectF::new(panel.l, panel.t, panel.l + pw, panel.t + ph);
         self.fill(&panel, 0x141518, 0.94);
         self.fill(&RectF::new(panel.l, panel.t, panel.r, panel.t + 3.0 * s), ACCENT, 1.0);
@@ -1943,6 +2039,7 @@ impl App {
             self.paint_tabs();
             self.paint_panel();
             self.paint_bar();
+            self.paint_tooltip();
             if self.show_help {
                 self.paint_help();
             }
@@ -1999,6 +2096,8 @@ impl App {
             self.zoom_center(self.s() / from);
         } else if !ctrl && ch_(b'W') {
             self.apply_fit(FitMode::Width);
+        } else if ctrl && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 && (k == VK_NEXT || k == VK_PRIOR) {
+            self.step_discipline(if k == VK_NEXT { 1 } else { -1 });
         } else if k == VK_NEXT || (ctrl && k == VK_RIGHT) || (!ctrl && ch_(b'N')) {
             self.go_to_page(cur + 1);
         } else if k == VK_PRIOR || (ctrl && k == VK_LEFT) || (!ctrl && ch_(b'P')) {
@@ -2402,6 +2501,10 @@ impl App {
                         if h != self.hover || th != self.tool_hover {
                             self.hover = h;
                             self.tool_hover = th;
+                            self.hover_since = std::time::Instant::now();
+                            if h.is_some() || th.is_some() {
+                                SetTimer(Some(hwnd), TIMER_TIP, TIP_MS + 20, None);
+                            }
                             self.invalidate();
                         }
                         if !self.pending_pts.is_empty()
@@ -2448,6 +2551,11 @@ impl App {
                 WM_KEYDOWN => self.on_key(wp.0 as u16).then_some(0),
                 WM_CHAR => {
                     self.on_char(wp.0 as u32);
+                    Some(0)
+                }
+                WM_TIMER if wp.0 == TIMER_TIP => {
+                    let _ = KillTimer(Some(hwnd), TIMER_TIP);
+                    self.invalidate();
                     Some(0)
                 }
                 WM_TIMER if wp.0 == TIMER_SETTLE => {

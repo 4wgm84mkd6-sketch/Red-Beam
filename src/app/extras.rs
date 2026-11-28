@@ -196,7 +196,25 @@ impl App {
             color: self.settings.markup_color,
             width: self.settings.markup_width,
             font: self.settings.markup_font,
+            bold: self.settings.markup_bold,
+            italic: self.settings.markup_italic,
+            text_color: self.settings.markup_text_color,
+            fill: self.settings.markup_fill,
         };
+        if let Some(m) = self.selected_markup.and_then(|id| self.takeoff.markups.iter().find(|m| m.id == id)) {
+            let kind = if m.kind == MKind::CloudPoly { MKind::Cloud } else { m.kind };
+            return Some(Preset {
+                tool: PresetTool::Markup(kind),
+                color: m.color,
+                width: m.width,
+                font: m.font,
+                bold: m.bold,
+                italic: m.italic,
+                text_color: m.text_color,
+                fill: m.fill,
+                ..base
+            });
+        }
         if let Some(m) = self.selected.and_then(|id| self.takeoff.items.iter().find(|m| m.id == id)) {
             let tool = if m.kind == Kind::Area && m.depth_in.is_some() { PresetTool::Volume } else { PresetTool::Measure(m.kind) };
             return Some(Preset {
@@ -241,6 +259,10 @@ impl App {
                 self.settings.markup_color = p.color;
                 self.settings.markup_width = p.width;
                 self.settings.markup_font = p.font;
+                self.settings.markup_bold = p.bold;
+                self.settings.markup_italic = p.italic;
+                self.settings.markup_text_color = p.text_color;
+                self.settings.markup_fill = p.fill;
                 self.set_tool(Tool::Markup(k));
             }
             PresetTool::Measure(k) => {

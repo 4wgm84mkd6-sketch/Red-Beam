@@ -51,7 +51,7 @@ impl App {
         self.mdraft = None;
         self.pending_pts.clear();
         self.selected = None;
-        self.selected_markup = None;
+        self.set_sel_markup(None);
         self.tool = Tool::Select;
         TabState {
             doc: self.doc.take(),

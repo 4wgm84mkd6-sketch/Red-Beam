@@ -41,6 +41,14 @@ pub struct Preset {
     pub width: f32,
     #[serde(default)]
     pub font: f32,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub text_color: Option<u32>,
+    #[serde(default)]
+    pub fill: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -116,7 +124,15 @@ pub struct Settings {
     pub markup_color: u32,
     pub markup_width: f32,
     pub markup_font: f32,
+    pub markup_bold: bool,
+    pub markup_italic: bool,
+    /// Text colour of new text markups (`None` = same as the line colour).
+    pub markup_text_color: Option<u32>,
+    /// Box fill of new text boxes and callouts (`None` = white).
+    pub markup_fill: Option<u32>,
     pub presets: Vec<Preset>,
+    /// Pages tab shows a compact list instead of thumbnails.
+    pub pages_list: bool,
 }
 
 impl Default for Settings {
@@ -137,7 +153,12 @@ impl Default for Settings {
             markup_color: 0xe53935,
             markup_width: 2.0,
             markup_font: 14.0,
+            markup_bold: false,
+            markup_italic: false,
+            markup_text_color: None,
+            markup_fill: None,
             presets: Vec::new(),
+            pages_list: false,
         }
     }
 }

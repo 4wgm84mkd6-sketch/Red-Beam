@@ -105,6 +105,20 @@ pub enum TBtn {
     Units,
     Quantities,
     Export,
+    // Format bar (selected markups).
+    FmtInfo,
+    FontDown,
+    FontSize,
+    FontUp,
+    Bold,
+    Italic,
+    TextColor,
+    LineColor,
+    FillColor,
+    FmtWidth,
+    FmtStatus,
+    SelectSame,
+    MakeDefault,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -123,6 +137,12 @@ pub enum MenuKind {
     ViewportScale,
     Presets,
     Sheets,
+    FmtSize,
+    FmtText,
+    FmtLine,
+    FmtFill,
+    FmtWidth,
+    FmtStatus,
     /// Right-click on a measurement: maybe on one of its points
     /// (ring 0 = outline, ring k = cut-out k-1) or inside a cut-out.
     Context { id: u64, vertex: Option<(usize, usize)>, hole: Option<usize> },
@@ -172,6 +192,8 @@ pub enum Undo {
     MarkupAdded(u64),
     MarkupRemoved(Markup),
     MarkupModified(Markup),
+    /// Several markups before a format change.
+    MarkupsModified(Vec<Markup>),
 }
 
 /// A drag in progress with the Select tool.
@@ -347,7 +369,7 @@ impl App {
         self.pending_pts.clear();
         if !matches!(tool, Tool::Select | Tool::Cutout(_)) {
             self.selected = None;
-            self.selected_markup = None;
+            self.set_sel_markup(None);
         }
         self.mdraft = None;
         self.active_preset = None;
@@ -468,22 +490,31 @@ impl App {
             (TBtn::Presets, self.presets_label(), 130.0, 0.0),
         ]
         };
-        let mut x = self.left_inset() + 8.0 * s;
-        specs
-            .into_iter()
-            .map(|(b, label, w, gap)| {
+        let mut out = Vec::new();
+        let rows = [(specs, top, bot), (self.format_specs(), bot + 8.0 * s, bot + 8.0 * s + (bot - top))];
+        for (specs, top, bot) in rows {
+            let mut x = self.left_inset() + 8.0 * s;
+            for (b, label, w, gap) in specs {
                 let r = RectF::new(x, top, x + w * s, bot);
                 x += (w + 2.0 + gap) * s;
-                (b, r, label)
-            })
-            .collect()
+                out.push((b, r, label));
+            }
+        }
+        out
     }
 
-    fn toolbar_rect(&self) -> Option<RectF> {
-        let l = self.toolbar_layout();
-        let (first, last) = (l.first()?, l.last()?);
+    /// Background of each toolbar row.
+    fn toolbar_rects(&self) -> Vec<RectF> {
         let s = self.s();
-        Some(RectF::new(first.1.l - 4.0 * s, first.1.t - 4.0 * s, last.1.r + 4.0 * s, last.1.b + 4.0 * s))
+        let mut rows: Vec<RectF> = Vec::new();
+        for (_, r, _) in self.toolbar_layout() {
+            let t = r.t - 4.0 * s;
+            match rows.iter_mut().find(|q| (q.t - t).abs() < 0.5) {
+                Some(q) => q.r = q.r.max(r.r + 4.0 * s),
+                None => rows.push(RectF::new(r.l - 4.0 * s, t, r.r + 4.0 * s, r.b + 4.0 * s)),
+            }
+        }
+        rows
     }
 
     fn qty_panel_rect(&self) -> Option<RectF> {
@@ -500,8 +531,49 @@ impl App {
         self.prompt.is_some()
             || self.over_panel(x, y)
             || (y < self.tabbar_h() && x >= self.left_inset())
-            || self.toolbar_rect().is_some_and(|r| r.contains_pt(x, y))
+            || self.toolbar_rects().iter().any(|r| r.contains_pt(x, y))
             || self.qty_panel_rect().is_some_and(|r| r.contains_pt(x, y))
+    }
+
+    /// What a toolbar button does, with its shortcut.
+    pub(super) fn tbtn_tip(&self, b: TBtn) -> String {
+        if let Some(t) = self.format_tip(b) {
+            return t.into();
+        }
+        let t = match b {
+            TBtn::Mode(false) => "Takeoff tools: measure lengths, areas, volumes, counts  (M switches)",
+            TBtn::Mode(true) => "Markup tools: clouds, text, callouts, stamps  (M switches)",
+            TBtn::Select => "Select, move and edit; Ctrl+click to select several  (V)",
+            TBtn::MTool(MKind::Cloud) | TBtn::MTool(MKind::CloudPoly) => "Revision cloud: drag a box, or click points and press Enter  (C)",
+            TBtn::MTool(MKind::Text) => "Text box: drag a box, then type  (T)",
+            TBtn::MTool(MKind::Callout) => "Callout: press on the point, drag to where the text goes  (K)",
+            TBtn::MTool(MKind::Arrow) => "Arrow  (A)",
+            TBtn::MTool(MKind::Line) => "Line  (L)",
+            TBtn::MTool(MKind::Rect) => "Rectangle  (R)",
+            TBtn::MTool(MKind::Ellipse) => "Ellipse  (E)",
+            TBtn::MTool(MKind::Highlight) => "Highlighter box  (H)",
+            TBtn::MTool(MKind::Pen) => "Freehand pen",
+            TBtn::MTool(MKind::Stamp) | TBtn::Stamp => "Stamp: APPROVED, REVIEWED, REVISE & RESUBMIT\u{2026}",
+            TBtn::MColor => "Colour for new markups",
+            TBtn::MWidth => "Line width for new markups",
+            TBtn::MFont => "Text size for new markups",
+            TBtn::SavePdf => "Save a PDF copy with markups, a flattened copy, or print  (Ctrl+P)",
+            TBtn::Presets => "Saved tool presets (Tool Chest)",
+            TBtn::Scale => "This sheet's scale, calibration and detail scales",
+            TBtn::Tool(Kind::Length) => "Length: two clicks  (L)",
+            TBtn::Tool(Kind::Polyline) => "Polyline: click points, Enter to finish  (Y)",
+            TBtn::Tool(Kind::Area) => "Area: click corners, Enter to finish  (A)",
+            TBtn::Tool(Kind::Count) => "Count: click each item, Enter to finish  (C)",
+            TBtn::Volume => "Volume: draw an area, then type the depth  (U)",
+            TBtn::Snap => "Snap to the drawing's line work  (S; hold Alt to place freely)",
+            TBtn::Group => "Group (trade) for new measurements, and its prices",
+            TBtn::Layer => "Layer for new measurements; show, hide or lock layers",
+            TBtn::Units => "Units: feet-inches, decimal feet or metric",
+            TBtn::Quantities => "Quantities panel: totals and costs  (Q)",
+            TBtn::Export => "Export quantities to Excel or CSV",
+            _ => "",
+        };
+        t.into()
     }
 
     pub(super) fn toolbar_hit(&self, x: f32, y: f32) -> Option<TBtn> {
@@ -509,6 +581,10 @@ impl App {
     }
 
     pub(super) fn press_tool(&mut self, b: TBtn) {
+        if self.format_press(b) {
+            self.invalidate();
+            return;
+        }
         match b {
             TBtn::Mode(m) => {
                 self.markup_mode = m;
@@ -543,6 +619,7 @@ impl App {
                     self.pending_menu = Some(MenuKind::Export);
                 }
             }
+            _ => {}
         }
     }
 
@@ -554,6 +631,9 @@ impl App {
 
     pub fn menu_items(&self, kind: MenuKind) -> Vec<MenuItem> {
         if let Some(v) = self.markup_menu_items(kind) {
+            return v;
+        }
+        if let Some(v) = self.format_menu_items(kind) {
             return v;
         }
         match kind {
@@ -655,7 +735,18 @@ impl App {
             MenuKind::Presets => self.preset_menu_items(),
             MenuKind::Sheets => self.sheets_menu_items(),
             // Markup menus are handled in markups.rs.
-            MenuKind::Stamp | MenuKind::MColor | MenuKind::MWidth | MenuKind::MFont | MenuKind::SavePdf | MenuKind::MarkupContext { .. } => {
+            MenuKind::Stamp
+            | MenuKind::MColor
+            | MenuKind::MWidth
+            | MenuKind::MFont
+            | MenuKind::SavePdf
+            | MenuKind::MarkupContext { .. }
+            | MenuKind::FmtSize
+            | MenuKind::FmtText
+            | MenuKind::FmtLine
+            | MenuKind::FmtFill
+            | MenuKind::FmtWidth
+            | MenuKind::FmtStatus => {
                 Vec::new()
             }
             MenuKind::Context { id, vertex, hole } => {
@@ -742,6 +833,10 @@ impl App {
             self.stamp_at = None;
             return;
         }
+        if self.format_menu_result(kind, cmd) {
+            self.invalidate();
+            return;
+        }
         if self.markup_menu_result(kind, cmd) {
             self.invalidate();
             return;
@@ -797,7 +892,18 @@ impl App {
             MenuKind::ViewportScale => self.viewport_menu_result(cmd),
             MenuKind::Presets => self.preset_menu_result(cmd),
             MenuKind::Sheets => self.sheets_menu_result(cmd),
-            MenuKind::Stamp | MenuKind::MColor | MenuKind::MWidth | MenuKind::MFont | MenuKind::SavePdf | MenuKind::MarkupContext { .. } => {}
+            MenuKind::Stamp
+            | MenuKind::MColor
+            | MenuKind::MWidth
+            | MenuKind::MFont
+            | MenuKind::SavePdf
+            | MenuKind::MarkupContext { .. }
+            | MenuKind::FmtSize
+            | MenuKind::FmtText
+            | MenuKind::FmtLine
+            | MenuKind::FmtFill
+            | MenuKind::FmtWidth
+            | MenuKind::FmtStatus => {}
         }
         self.invalidate();
     }
@@ -1309,7 +1415,7 @@ impl App {
         if self.markup_select_down(x, y, start) {
             return true;
         }
-        self.selected_markup = None;
+        self.set_sel_markup(None);
         if let (Some((ring, index)), Some(m)) = (self.handle_at(x, y), self.selected_measure()) {
             self.edit = Some(EditDrag::Vertex { orig: m.clone(), ring, index, moved: false });
             return true;
@@ -1420,7 +1526,7 @@ impl App {
             return false;
         }
         if let Some(id) = self.markup_at(x, y) {
-            self.selected_markup = Some(id);
+            self.set_sel_markup(Some(id));
             self.selected = None;
             self.pending_menu = Some(MenuKind::MarkupContext { id });
             self.invalidate();
@@ -1465,7 +1571,7 @@ impl App {
         if self.takeoff_sheet().is_none() {
             return;
         }
-        self.selected_markup = self.markup_at(x, y);
+        self.set_sel_markup(self.markup_at(x, y));
         if self.selected_markup.is_some() {
             self.selected = None;
             self.invalidate();
@@ -1479,12 +1585,16 @@ impl App {
     }
 
     fn delete_selected(&mut self) {
-        if let Some(id) = self.selected_markup.take() {
-            if let Some(ix) = self.takeoff.markups.iter().position(|m| m.id == id) {
-                let m = self.takeoff.markups.remove(ix);
-                self.undo.push(Undo::MarkupRemoved(m));
-                self.save_takeoff();
+        let ids = self.markup_selection();
+        if !ids.is_empty() {
+            for id in ids {
+                if let Some(ix) = self.takeoff.markups.iter().position(|m| m.id == id) {
+                    let m = self.takeoff.markups.remove(ix);
+                    self.undo.push(Undo::MarkupRemoved(m));
+                }
             }
+            self.set_sel_markup(None);
+            self.save_takeoff();
             self.invalidate();
             return;
         }
@@ -1558,6 +1668,13 @@ impl App {
                     *cur = m;
                 }
             }
+            Undo::MarkupsModified(list) => {
+                for m in list {
+                    if let Some(cur) = self.takeoff.markups.iter_mut().find(|x| x.id == m.id) {
+                        *cur = m;
+                    }
+                }
+            }
             Undo::Groups(items, groups) => {
                 self.takeoff.items = items;
                 self.takeoff.groups = groups;
@@ -1574,7 +1691,7 @@ impl App {
             }
         }
         self.selected = None;
-        self.selected_markup = None;
+        self.set_sel_markup(None);
         self.save_takeoff();
         self.invalidate();
     }
@@ -1582,7 +1699,25 @@ impl App {
     /// Keyboard for takeoffs. Returns true if handled.
     pub(super) fn tools_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool) -> bool {
         if self.prompt.is_some() {
+            let multiline = matches!(self.prompt.as_ref().map(|p| &p.purpose), Some(PromptFor::MarkupText { .. }));
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             match vk {
+                VK_RETURN if multiline && shift => {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.text.push('\n');
+                    }
+                    self.invalidate();
+                }
+                _ if multiline && ctrl && vk.0 == b'V' as u16 => {
+                    if let Some(t) = super::clipboard_text() {
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.text.push_str(&t.replace("\r\n", "\n").replace('\r', "\n"));
+                            let keep: String = p.text.chars().take(4000).collect();
+                            p.text = keep;
+                        }
+                        self.invalidate();
+                    }
+                }
                 VK_RETURN => self.prompt_confirm(),
                 VK_ESCAPE => {
                     self.prompt = None;
@@ -1602,6 +1737,9 @@ impl App {
         }
         if self.doc.is_none() {
             return false;
+        }
+        if self.format_key(vk, ctrl) {
+            return true;
         }
         let letter = |c: u8| vk.0 == c as u16 && !ctrl;
         let ctrl_key = |c: u8| vk.0 == c as u16 && ctrl;
@@ -1631,7 +1769,7 @@ impl App {
             }
             VK_ESCAPE if self.selected.is_some() || self.selected_markup.is_some() || self.mdraft.is_some() => {
                 self.selected = None;
-                self.selected_markup = None;
+                self.set_sel_markup(None);
                 self.mdraft = None;
                 self.invalidate();
             }
@@ -1656,7 +1794,8 @@ impl App {
     /// Typed characters while a prompt is open. Returns true if consumed.
     pub(super) fn tools_char(&mut self, c: char) -> bool {
         let Some(p) = self.prompt.as_mut() else { return false };
-        if !c.is_control() && p.text.chars().count() < 40 {
+        let max = if matches!(p.purpose, PromptFor::MarkupText { .. }) { 4000 } else { 40 };
+        if !c.is_control() && p.text.chars().count() < max {
             p.text.push(c);
             self.invalidate();
         }
@@ -2191,9 +2330,16 @@ impl App {
     /// Tool palette, quantities panel and prompt (screen-space UI).
     pub(super) fn paint_tools_ui(&self) {
         let s = self.s();
-        if let Some(r) = self.toolbar_rect() {
-            self.fill(&r, 0x1e2023, 0.92);
+        let rows = self.toolbar_rects();
+        if !rows.is_empty() {
+            for r in &rows {
+                self.fill(r, 0x1e2023, 0.92);
+            }
             for (b, r, label) in self.toolbar_layout() {
+                if b == TBtn::FmtInfo {
+                    self.text(&label, &self.fonts.ui_center, &r, TEXT_DIM);
+                    continue;
+                }
                 let active = match b {
                     TBtn::Mode(m) => self.markup_mode == m,
                     TBtn::MTool(k) => self.tool == Tool::Markup(k) || (k == MKind::Cloud && self.tool == Tool::Markup(MKind::CloudPoly)),
@@ -2204,6 +2350,7 @@ impl App {
                     TBtn::Snap => self.snap_on,
                     TBtn::Scale => self.tool == Tool::Calibrate,
                     TBtn::Quantities => self.show_qty,
+                    TBtn::Bold | TBtn::Italic => self.format_active(b),
                     _ => false,
                 };
                 let hover = self.tool_hover == Some(b);
@@ -2220,6 +2367,25 @@ impl App {
                     self.fill(&sw, self.takeoff.group_color(&self.group), 1.0);
                     let tr = RectF::new(r.l + 14.0 * s, r.t, r.r, r.b);
                     self.text(&label, &self.fonts.ui_center, &tr, TEXT);
+                } else if let Some(c) = self.format_swatch(b) {
+                    let sw = RectF::new(r.l + 8.0 * s, r.t + 8.0 * s, r.l + 22.0 * s, r.b - 8.0 * s);
+                    self.fill(&sw, 0x000000, 0.6);
+                    let inner = RectF::new(sw.l + 1.0, sw.t + 1.0, sw.r - 1.0, sw.b - 1.0);
+                    if c == crate::markup::NO_FILL {
+                        self.fill(&inner, 0xffffff, 1.0);
+                        self.line([inner.l, inner.b], [inner.r, inner.t], 0xe53935, 1.5 * s);
+                    } else {
+                        self.fill(&inner, c, 1.0);
+                    }
+                    let tr = RectF::new(r.l + 18.0 * s, r.t, r.r, r.b);
+                    self.text(&label, &self.fonts.ui_center, &tr, TEXT);
+                } else if matches!(b, TBtn::Bold | TBtn::Italic) {
+                    let f = if b == TBtn::Bold { &self.fonts.label } else { &self.fonts.ui_center };
+                    self.text(&label, f, &r, TEXT);
+                    if b == TBtn::Italic {
+                        // Slant hint: an underline-free italic cue.
+                        self.line([r.l + 12.0 * s, r.b - 7.0 * s], [r.r - 12.0 * s, r.b - 7.0 * s], TEXT_DIM, 1.0);
+                    }
                 } else {
                     self.text(&label, &self.fonts.ui_center, &r, if warn && !active && !hover { 0xffb74d } else { TEXT });
                 }
@@ -2230,17 +2396,30 @@ impl App {
         }
         if let Some(p) = &self.prompt {
             let (cw, ch) = self.canvas();
-            let (w, h) = (460.0 * s, 130.0 * s);
+            let multiline = matches!(p.purpose, PromptFor::MarkupText { .. });
+            let field_h = if multiline { 150.0 } else { 34.0 };
+            let (w, h) = (if multiline { 600.0 } else { 460.0 } * s, (96.0 + field_h) * s);
             let r = RectF::new(((cw - w) / 2.0).round(), ((ch - h) / 2.0).round(), ((cw + w) / 2.0).round(), ((ch + h) / 2.0).round());
             self.fill(&r, 0x141518, 0.96);
             self.fill(&RectF::new(r.l, r.t, r.r, r.t + 3.0 * s), ACCENT, 1.0);
             self.text(&p.title, &self.fonts.ui, &RectF::new(r.l + 16.0 * s, r.t + 8.0 * s, r.r - 16.0 * s, r.t + 34.0 * s), TEXT);
-            let field = RectF::new(r.l + 16.0 * s, r.t + 42.0 * s, r.r - 16.0 * s, r.t + 76.0 * s);
+            let field = RectF::new(r.l + 16.0 * s, r.t + 42.0 * s, r.r - 16.0 * s, r.t + (42.0 + field_h) * s);
             self.fill(&field, 0xffffff, 1.0);
-            let inner = RectF::new(field.l + 8.0 * s, field.t, field.r - 8.0 * s, field.b);
-            self.text(&format!("{}\u{258F}", p.text), &self.fonts.ui, &inner, 0x111111);
-            self.text(&p.hint, &self.fonts.ui, &RectF::new(r.l + 16.0 * s, r.t + 82.0 * s, r.r - 16.0 * s, r.t + 104.0 * s), TEXT_DIM);
-            self.text("Enter to confirm \u{00B7} Esc to cancel", &self.fonts.ui, &RectF::new(r.l + 16.0 * s, r.t + 102.0 * s, r.r - 16.0 * s, r.b - 4.0 * s), TEXT_DIM);
+            if multiline {
+                let inner = RectF::new(field.l + 8.0 * s, field.t + 6.0 * s, field.r - 8.0 * s, field.b - 4.0 * s);
+                self.text(&format!("{}\u{258F}", p.text), &self.fonts.body, &inner, 0x111111);
+            } else {
+                let inner = RectF::new(field.l + 8.0 * s, field.t, field.r - 8.0 * s, field.b);
+                self.text(&format!("{}\u{258F}", p.text), &self.fonts.ui, &inner, 0x111111);
+            }
+            let y = field.b + 6.0 * s;
+            self.text(&p.hint, &self.fonts.ui, &RectF::new(r.l + 16.0 * s, y, r.r - 16.0 * s, y + 22.0 * s), TEXT_DIM);
+            let keys = if multiline {
+                "Enter to finish \u{00B7} Shift+Enter for a new line \u{00B7} Ctrl+V to paste \u{00B7} Esc to cancel"
+            } else {
+                "Enter to confirm \u{00B7} Esc to cancel"
+            };
+            self.text(keys, &self.fonts.ui, &RectF::new(r.l + 16.0 * s, y + 20.0 * s, r.r - 16.0 * s, r.b - 4.0 * s), TEXT_DIM);
         }
     }
 

@@ -164,6 +164,55 @@ pub fn search_page(page: u32, words: &[Word], query: &str) -> Vec<Hit> {
     hits
 }
 
+/// Discipline letter of a sheet number (US National CAD Standard): the
+/// first letter, so "FP-101" is F (fire protection), "AD-101" is A.
+pub fn discipline(number: &str) -> Option<char> {
+    number.trim().chars().next().filter(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_uppercase())
+}
+
+/// Name of a discipline letter.
+pub fn discipline_name(c: char) -> &'static str {
+    match c {
+        'G' => "General",
+        'H' => "Hazardous materials",
+        'V' => "Survey",
+        'B' => "Geotechnical",
+        'W' => "Civil works",
+        'C' => "Civil",
+        'L' => "Landscape",
+        'S' => "Structural",
+        'A' => "Architectural",
+        'I' => "Interiors",
+        'Q' => "Equipment",
+        'F' => "Fire protection",
+        'P' => "Plumbing",
+        'D' => "Process",
+        'M' => "Mechanical",
+        'E' => "Electrical",
+        'T' => "Telecom",
+        'R' => "Resource",
+        'X' => "Other disciplines",
+        'Z' => "Contractor / shop",
+        'O' => "Operations",
+        'K' => "Food service",
+        _ => "Other",
+    }
+}
+
+/// Disciplines of a set in order of first appearance:
+/// (letter, first sheet, sheet count). Sheets without a number are skipped.
+pub fn discipline_groups(numbers: &[Option<&str>]) -> Vec<(char, u32, usize)> {
+    let mut out: Vec<(char, u32, usize)> = Vec::new();
+    for (i, n) in numbers.iter().enumerate() {
+        let Some(d) = n.and_then(discipline) else { continue };
+        match out.iter_mut().find(|g| g.0 == d) {
+            Some(g) => g.2 += 1,
+            None => out.push((d, i as u32, 1)),
+        }
+    }
+    out
+}
+
 /// Parse "1, 3-5, 8" (1-based, as typed) into sorted 0-based sheets.
 pub fn parse_range(s: &str, count: u32) -> Option<Vec<u32>> {
     let mut out = Vec::new();
@@ -212,6 +261,16 @@ pub fn natural_key(s: &str) -> Vec<(u8, u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disciplines() {
+        assert_eq!(discipline("FP-101"), Some('F'));
+        assert_eq!(discipline("a-101"), Some('A'));
+        assert_eq!(discipline("101"), None);
+        let nums = [Some("G-001"), Some("A-101"), Some("A-102"), None, Some("S-201"), Some("A-501")];
+        assert_eq!(discipline_groups(&nums), vec![('G', 0, 1), ('A', 1, 3), ('S', 4, 1)]);
+        assert_eq!(discipline_name('M'), "Mechanical");
+    }
 
     #[test]
     fn ranges_and_order() {

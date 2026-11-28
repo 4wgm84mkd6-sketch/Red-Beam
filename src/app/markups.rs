@@ -43,7 +43,7 @@ const CMD_SAVE_ALL: usize = 25_004;
 const CMD_SAVE_FLAT: usize = 25_005;
 const CMD_PRINT: usize = 25_006;
 
-const WIDTHS: [(&str, f32); 4] = [("Thin", 1.0), ("Medium", 2.0), ("Thick", 3.5), ("Heavy", 6.0)];
+use super::format::WIDTHS;
 const FONTS: [(&str, f32); 5] = [("Small (10)", 10.0), ("Medium (14)", 14.0), ("Large (20)", 20.0), ("X-Large (28)", 28.0), ("Huge (40)", 40.0)];
 
 fn now() -> u64 {
@@ -134,9 +134,13 @@ impl App {
             status: crate::markup::Status::None,
             author: author(),
             created: now(),
+            bold: self.settings.markup_bold && kind.has_text(),
+            italic: self.settings.markup_italic && kind.has_text(),
+            text_color: self.settings.markup_text_color.filter(|_| kind.has_text()),
+            fill: self.settings.markup_fill.filter(|_| matches!(kind, MKind::Text | MKind::Callout)),
         });
         self.undo.push(Undo::MarkupAdded(id));
-        self.selected_markup = Some(id);
+        self.set_sel_markup(Some(id));
         self.selected = None;
         self.save_takeoff();
         self.invalidate();
@@ -147,7 +151,7 @@ impl App {
         let text = self.markup(id).map(|m| m.text.clone()).unwrap_or_default();
         self.prompt = Some(Prompt {
             title: "Markup text".into(),
-            hint: "Type the text (it wraps to the box). Enter to finish.".into(),
+            hint: "Type the text. It wraps to the box; drag the box's corners to resize it.".into(),
             text,
             purpose: PromptFor::MarkupText { id },
         });
@@ -176,7 +180,7 @@ impl App {
         let id = c.id;
         self.takeoff.markups.push(c);
         self.undo.push(Undo::MarkupAdded(id));
-        self.selected_markup = Some(id);
+        self.set_sel_markup(Some(id));
         self.save_takeoff();
         self.invalidate();
     }
@@ -358,7 +362,11 @@ impl App {
         }
         let Some(id) = self.markup_at(x, y) else { return false };
         let Some(m) = self.markup(id).cloned() else { return false };
-        self.selected_markup = Some(id);
+        if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
+            self.toggle_markup_selection(id);
+            return true;
+        }
+        self.set_sel_markup(Some(id));
         self.selected = None;
         self.edit = Some(EditDrag::MarkupMove { orig: m, start, moved: false });
         self.invalidate();
@@ -400,7 +408,7 @@ impl App {
         match self.markup_at(x, y).and_then(|id| self.markup(id)).filter(|m| m.kind.has_text()) {
             Some(m) => {
                 let id = m.id;
-                self.selected_markup = Some(id);
+                self.set_sel_markup(Some(id));
                 self.ask_markup_text(id);
                 true
             }
@@ -485,15 +493,15 @@ impl App {
                 match cmd {
                     CMD_EDIT_TEXT => self.ask_markup_text(id),
                     CMD_M_DUPLICATE => {
-                        self.selected_markup = Some(id);
+                        self.set_sel_markup(Some(id));
                         self.duplicate_markup();
                     }
                     CMD_M_DELETE => {
-                        self.selected_markup = Some(id);
+                        self.set_sel_markup(Some(id));
                         if let Some(ix) = self.takeoff.markups.iter().position(|m| m.id == id) {
                             let m = self.takeoff.markups.remove(ix);
                             self.undo.push(Undo::MarkupRemoved(m));
-                            self.selected_markup = None;
+                            self.set_sel_markup(None);
                             self.save_takeoff();
                         }
                     }
@@ -541,7 +549,7 @@ impl App {
                         }
                     }
                 }
-                Prim::Text { rect, text, size, color, bold, center } => {
+                Prim::Text { rect, text, size, color, bold, italic, center } => {
                     let tl = self.to_screen([rect[0], rect[1]]);
                     let br = self.to_screen([rect[2], rect[3]]);
                     let px = size * z;
@@ -557,6 +565,9 @@ impl App {
                         let _ = layout.SetFontSize(px, all);
                         if *bold {
                             let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, all);
+                        }
+                        if *italic {
+                            let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, all);
                         }
                         if *center {
                             let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -592,6 +603,16 @@ impl App {
                 self.text(m.status.name(), &self.fonts.label, &r, 0xffffff);
             }
         }
+        // Other selected markups: outline only.
+        for id in self.markup_selection().into_iter().skip(1) {
+            let Some(m) = self.markup(id).filter(|m| Some(m.sheet) == self.takeoff_sheet()) else { continue };
+            let b = m.bounds();
+            let (tl, br) = (self.to_screen([b[0], b[1]]), self.to_screen([b[2], b[3]]));
+            unsafe {
+                self.brush.SetColor(&rgb(0x1e88e5, 0.9));
+                self.gfx.ctx.DrawRectangle(&d2r(&RectF::new(tl[0] - 4.0 * s, tl[1] - 4.0 * s, br[0] + 4.0 * s, br[1] + 4.0 * s)), &self.brush, 1.5 * s, None);
+            }
+        }
         // Selection handles.
         if let Some(m) = self.selected_markup.and_then(|id| self.markup(id)) {
             let b = m.bounds();
@@ -624,6 +645,10 @@ impl App {
             status: Status::None,
             author: String::new(),
             created: 0,
+            bold: false,
+            italic: false,
+            text_color: None,
+            fill: None,
         };
         if let Some(d) = &self.mdraft {
             let (a, b) = (d.start, d.cur);
@@ -721,7 +746,7 @@ impl App {
         };
         self.go_to_page(sheet as i64);
         let Some(b) = self.markup(id).map(|m| m.bounds()) else { return };
-        self.selected_markup = Some(id);
+        self.set_sel_markup(Some(id));
         self.selected = None;
         // Centre the markup without changing the zoom (unless it's off-screen-large).
         let (cw, ch) = self.canvas();
@@ -777,7 +802,7 @@ impl App {
             stroke: Some((color, 0.75)),
             fill: Some((0xffffff, 0.9)),
         });
-        v.push(Prim::Text { rect: [p[0] - w / 2.0, p[1] - 6.5, p[0] + w / 2.0, p[1] + 7.0], text: label, size, color, bold: false, center: true });
+        v.push(Prim::Text { rect: [p[0] - w / 2.0, p[1] - 6.5, p[0] + w / 2.0, p[1] + 7.0], text: label, size, color, bold: false, italic: false, center: true });
         v
     }
 

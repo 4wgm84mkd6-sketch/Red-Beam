@@ -592,8 +592,13 @@ pub fn build_pdf(data: &[u8], annots: &[AnnotSpec], flatten: bool) -> Result<(Ve
                                 (lib.path_set_draw_mode)(obj, if fill.is_some() { 1 } else { 0 }, stroke.is_some() as c_int);
                                 add(obj);
                             }
-                            Prim::Text { rect, text, size, color, bold, center } => {
-                                let font: &[u8] = if *bold { b"Helvetica-Bold\0" } else { b"Helvetica\0" };
+                            Prim::Text { rect, text, size, color, bold, italic, center } => {
+                                let font: &[u8] = match (*bold, *italic) {
+                                    (true, true) => b"Helvetica-BoldOblique\0",
+                                    (true, false) => b"Helvetica-Bold\0",
+                                    (false, true) => b"Helvetica-Oblique\0",
+                                    (false, false) => b"Helvetica\0",
+                                };
                                 let width = rect[2] - rect[0];
                                 for (i, line) in wrap(text, *size, width).iter().enumerate() {
                                     if line.is_empty() {

@@ -112,6 +112,37 @@ pub struct Markup {
     /// Seconds since 1970.
     #[serde(default)]
     pub created: u64,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    /// Text colour; `None` = the same as `color` (line/border).
+    #[serde(default)]
+    pub text_color: Option<u32>,
+    /// Box fill of text boxes and callouts; `None` = white, `NO_FILL` = clear.
+    #[serde(default)]
+    pub fill: Option<u32>,
+}
+
+/// `Markup::fill` value for a see-through box.
+pub const NO_FILL: u32 = u32::MAX;
+
+/// Box fills offered in the format bar.
+pub const FILLS: [(&str, u32); 6] =
+    [("White", 0xffffff), ("None (see-through)", NO_FILL), ("Yellow", 0xfff59d), ("Light blue", 0xbbdefb), ("Light green", 0xc8e6c9), ("Light red", 0xffcdd2)];
+
+/// Font sizes (points) that A+ / A- step through.
+pub const FONT_STEPS_PT: [f32; 17] = [6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0, 48.0, 72.0];
+
+/// Next font size (paper DIPs) up (`up`) or down from `font` (DIPs).
+pub fn step_font(font: f32, up: bool) -> f32 {
+    let pt = font * 0.75;
+    let next = if up {
+        FONT_STEPS_PT.iter().copied().find(|s| *s > pt + 0.01).unwrap_or(FONT_STEPS_PT[FONT_STEPS_PT.len() - 1])
+    } else {
+        FONT_STEPS_PT.iter().rev().copied().find(|s| *s < pt - 0.01).unwrap_or(FONT_STEPS_PT[0])
+    };
+    next / 0.75
 }
 
 /// A drawing primitive in page DIPs.
@@ -121,7 +152,7 @@ pub enum Prim {
     /// filled).
     Path { rings: Vec<Vec<[f32; 2]>>, closed: bool, stroke: Option<(u32, f32)>, fill: Option<(u32, f32)> },
     /// Text laid out in a box (top-left origin), wrapped to its width.
-    Text { rect: [f32; 4], text: String, size: f32, color: u32, bold: bool, center: bool },
+    Text { rect: [f32; 4], text: String, size: f32, color: u32, bold: bool, italic: bool, center: bool },
 }
 
 fn bbox(pts: &[[f32; 2]]) -> [f32; 4] {
@@ -206,6 +237,24 @@ fn arrow_head(tip: [f32; 2], from: [f32; 2], size: f32) -> Vec<[f32; 2]> {
 }
 
 impl Markup {
+    /// Colour of the markup's text.
+    pub fn text_rgb(&self) -> u32 {
+        self.text_color.unwrap_or(self.color)
+    }
+
+    /// Fill of a text box / callout box.
+    fn box_fill(&self, alpha: f32) -> Option<(u32, f32)> {
+        match self.fill {
+            None => Some((0xffffff, alpha)),
+            Some(NO_FILL) => None,
+            Some(c) => Some((c, alpha)),
+        }
+    }
+
+    fn text_prim(&self, rect: [f32; 4]) -> Prim {
+        Prim::Text { rect, text: self.text.clone(), size: self.font, color: self.text_rgb(), bold: self.bold, italic: self.italic, center: false }
+    }
+
     /// Bounding box of the markup (page DIPs).
     pub fn bounds(&self) -> [f32; 4] {
         bbox(&self.points)
@@ -260,8 +309,8 @@ impl Markup {
             MKind::Text => {
                 let b = self.bounds();
                 vec![
-                    Prim::Path { rings: vec![rect_ring(b)], closed: true, stroke: Some((self.color, (self.width * 0.5).max(0.75))), fill: Some((0xffffff, 0.85)) },
-                    Prim::Text { rect: [b[0] + pad, b[1] + pad, b[2] - pad, b[3] - pad], text: self.text.clone(), size: self.font, color: self.color, bold: false, center: false },
+                    Prim::Path { rings: vec![rect_ring(b)], closed: true, stroke: Some((self.color, (self.width * 0.5).max(0.75))), fill: self.box_fill(0.85) },
+                    self.text_prim([b[0] + pad, b[1] + pad, b[2] - pad, b[3] - pad]),
                 ]
             }
             MKind::Callout => {
@@ -274,8 +323,8 @@ impl Markup {
                 vec![
                     Prim::Path { rings: vec![vec![a, tip]], closed: false, stroke, fill: None },
                     Prim::Path { rings: vec![arrow_head(tip, a, (self.width * 5.0).max(8.0))], closed: true, stroke: None, fill: Some((self.color, 1.0)) },
-                    Prim::Path { rings: vec![rect_ring(b)], closed: true, stroke, fill: Some((0xffffff, 0.9)) },
-                    Prim::Text { rect: [b[0] + pad, b[1] + pad, b[2] - pad, b[3] - pad], text: self.text.clone(), size: self.font, color: self.color, bold: false, center: false },
+                    Prim::Path { rings: vec![rect_ring(b)], closed: true, stroke, fill: self.box_fill(0.9) },
+                    self.text_prim([b[0] + pad, b[1] + pad, b[2] - pad, b[3] - pad]),
                 ]
             }
             MKind::Stamp => {
@@ -292,8 +341,9 @@ impl Markup {
                         rect: [b[0], (b[1] + b[3]) / 2.0 - size * 0.62, b[2], (b[1] + b[3]) / 2.0 + size * 0.62],
                         text: self.text.clone(),
                         size,
-                        color: self.color,
+                        color: self.text_rgb(),
                         bold: true,
+                        italic: self.italic,
                         center: true,
                     },
                 ]
@@ -419,7 +469,32 @@ mod tests {
             status: Status::Open,
             author: "x".into(),
             created: 0,
+            bold: false,
+            italic: false,
+            text_color: None,
+            fill: None,
         }
+    }
+
+    #[test]
+    fn formatting() {
+        // Font steps: 12pt (16 DIP) -> 14pt; 6pt floor; 72pt ceiling.
+        assert!((step_font(16.0, true) * 0.75 - 14.0).abs() < 0.01);
+        assert!((step_font(16.0, false) * 0.75 - 11.0).abs() < 0.01);
+        assert!((step_font(8.0, false) * 0.75 - 6.0).abs() < 0.01);
+        assert!((step_font(96.0, true) * 0.75 - 72.0).abs() < 0.01);
+        let mut m = mk(MKind::Text, vec![[0.0, 0.0], [100.0, 40.0]]);
+        m.bold = true;
+        m.italic = true;
+        m.text_color = Some(0x1e88e5);
+        m.fill = Some(NO_FILL);
+        let p = m.prims();
+        assert!(matches!(&p[0], Prim::Path { fill: None, stroke: Some((0xe53935, _)), .. }));
+        assert!(matches!(&p[1], Prim::Text { color: 0x1e88e5, bold: true, italic: true, .. }));
+        // Old files without the new fields still load.
+        let json = r#"{"id":1,"sheet":0,"kind":"Text","points":[[0,0],[1,1]],"color":0,"width":1,"font":12}"#;
+        let old: Markup = serde_json::from_str(json).unwrap();
+        assert!(!old.bold && old.fill.is_none() && old.text_rgb() == 0);
     }
 
     #[test]

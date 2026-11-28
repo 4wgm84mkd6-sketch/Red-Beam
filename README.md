@@ -44,7 +44,8 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 | Print with markups and takeoffs | `Ctrl+P` |
 | Performance readout | `F2` |
 | Switch PDF engine (PDFium / Windows built-in) | `F4` |
-| Help | `F1` or `?` |
+| Next / previous discipline (A, S, M, E, P…) | `Ctrl+Shift+PgDn` / `Ctrl+Shift+PgUp` |
+| Help | `F1` or `?`; hover any button for a tooltip |
 
 When you flip between sheets of the same size, Red-Beam keeps your zoom and position. You can compare the same detail across a drawing set by holding `PgDn`.
 
@@ -61,6 +62,8 @@ When you flip between sheets of the same size, Red-Beam keeps your zoom and posi
 Press **Ctrl+B** or click **☰** in the status bar to open the panel on the left. It has three tabs:
 
 * **Pages:** a scrolling strip of thumbnails. Click one to jump to that sheet. The current sheet is highlighted, and sheets with takeoffs show how many. Thumbnails render in the background, and sheets already cached show instantly.
+  * **Discipline jump bar** at the top: one chip per discipline found in the sheet numbers (**G**, **A**, **S**, **M**, **E**, **P**…) with its sheet count. Click a chip to jump to that discipline's first sheet. **Ctrl+Shift+PgDn / PgUp** steps to the next or previous discipline.
+  * **List / Thumbs:** the **List** chip switches to a compact list with one row per sheet and a discipline badge, so a 140-sheet set fits in a few screens.
 * **Files:** **Pinned** files, then **Recent** files, each with its folder. Click ☆ to pin a file. Clicking a file opens it on the sheet you were last viewing. Files that have moved or been deleted are greyed out.
 * **Settings:** click a setting to change it:
   * mouse wheel zooms (default) or scrolls (Ctrl+wheel then zooms)
@@ -90,6 +93,16 @@ Click **Markup** at the left of the toolbar, or press `M`, to switch to the mark
 | **Stamp ▾** | Click where it goes and pick APPROVED, REVIEWED, REVISE & RESUBMIT, REJECTED, FOR CONSTRUCTION, … | |
 
 * **Color ▾ / Width ▾ / Font ▾** set the style for new markups. These settings are remembered.
+* **Format bar:** select a markup and a second toolbar row appears:
+  * **A− / size ▾ / A+** for text size, **B** and **I** for bold and italic
+  * **Text ▾**, **Border ▾** and **Fill ▾** colours (fill can be see-through)
+  * **Width ▾** and **Status ▾**
+
+  Changes apply to every selected markup at once and undo in one step.
+  * **Select several:** Ctrl+click markups, or **Ctrl+A** for all markups on the sheet. **Select same** picks every markup of the same kind on the sheet, e.g. all callouts.
+  * **Make default:** new markups look like the selected one.
+  * **Shortcuts** with text selected: **Ctrl+B** bold, **Ctrl+I** italic, **Ctrl+[** / **Ctrl+]** smaller / bigger.
+* **Text:** text boxes and callouts take long text (up to 4,000 characters). **Shift+Enter** starts a new line and **Ctrl+V** pastes. The box wraps the text; drag its corners to resize it.
 * With **Select**, you can drag markups to move them and drag their handles to resize. Double-click a text markup to edit it. Right-click a markup for its **status** (Open / Accepted / Rejected / Completed), colour, width, font size, duplicate and delete. **Ctrl+D** duplicates, **Del** deletes, and **Ctrl+Z** undoes.
 * The **Markups** tab in the side panel lists every markup by sheet, with author and status. Click one to jump to it.
 * Markups save automatically with the takeoff file next to the PDF.
@@ -233,6 +246,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/app/markups.rs` | Markup tools, editing, menus, Markups list, Save a copy with markups |
 | `src/sheets.rs` | Sheet numbers and titles, sheet links, phrase search (unit-tested) |
 | `src/app/extras.rs` | Detail viewport scales, tool presets, sheet tools (combine, folder as set, extract, rotate) |
+| `src/app/format.rs` | Format bar for selected markups, multi-selection, text shortcuts |
 | `src/app/tabs.rs` | Document tabs (park and restore per-document state), tab strip |
 | `src/app/find.rs` | Find / Go to sheet UI, highlighted hits, clickable sheet links |
 | `src/snap.rs` | Snap index over a sheet's line work: nearest corner, else nearest point on a line (unit-tested) |
@@ -242,7 +256,6 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Known limitations
 
-* Viewing only for now: no markups, measurements or text search yet.
 * Password-protected PDFs aren't supported.
 * Opening a file reads every page size up front. Sets with several thousand sheets take a moment to open.
 

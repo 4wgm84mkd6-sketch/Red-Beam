@@ -10,6 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use super::{d2r, App, Cached, FitMode, ACCENT, BTN_BG, TEXT, TEXT_DIM, WM_APP_OPEN};
 use crate::settings::{same_path, PanelTab};
+use crate::sheets;
 use crate::takeoff::Units;
 use crate::view::RectF;
 use crate::worker::{Engine, Job, JobKind};
@@ -19,6 +20,19 @@ const TAB_H: f32 = 38.0;
 /// Thumbnails render at this long-edge size (crisp up to ~150% UI scale).
 const THUMB_PX: f32 = 360.0;
 const PANEL_BG: u32 = 0x24272b;
+/// Height of a chip in the Pages tab's discipline jump bar.
+const CHIP_H: f32 = 28.0;
+/// Row height of the Pages tab's list view.
+const LIST_ROW: f32 = 26.0;
+
+/// A chip in the Pages tab's jump bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Chip {
+    /// Discipline letter and its first sheet.
+    Disc(char, u32),
+    /// Switch between thumbnails and the compact list.
+    ViewToggle,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SetId {
@@ -86,12 +100,95 @@ impl App {
         self.panel_scroll[Self::tab_index(self.settings.panel_tab)]
     }
 
-    /// Thumbnail slots for every sheet of the open set (screen coords,
-    /// scroll applied), plus the total content height.
+    /// Disciplines of the open set: (letter, first sheet, sheet count).
+    pub(super) fn disc_groups(&self) -> Vec<(char, u32, usize)> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let nums: Vec<Option<&str>> = doc.names.iter().map(|n| n.number.as_deref()).collect();
+        sheets::discipline_groups(&nums)
+    }
+
+    /// Discipline letter of sheet `p`, if its number is known.
+    pub(super) fn disc_of(&self, p: u32) -> Option<char> {
+        self.doc.as_ref().and_then(|d| d.names.get(p as usize)).and_then(|n| n.number.as_deref()).and_then(sheets::discipline)
+    }
+
+    /// The jump bar's chips, and where the sheet list starts below them.
+    pub(super) fn chip_layout(&self) -> (Vec<(Chip, RectF, String)>, f32) {
+        let c = self.content_rect();
+        if self.doc.is_none() {
+            return (Vec::new(), c.t);
+        }
+        let s = self.s();
+        let h = CHIP_H * s;
+        let toggle_w = 62.0 * s;
+        let mut y = c.t + 6.0 * s;
+        let toggle = RectF::new(c.r - 10.0 * s - toggle_w, y, c.r - 10.0 * s, y + h);
+        let mut chips = vec![(Chip::ViewToggle, toggle, if self.settings.pages_list { "Thumbs".to_string() } else { "List".to_string() })];
+        let right = toggle.l - 6.0 * s;
+        let mut x = c.l + 8.0 * s;
+        for (d, first, n) in self.disc_groups() {
+            let label = format!("{d} {n}");
+            let w = (16.0 + label.chars().count() as f32 * 7.5) * s;
+            if x + w > right && x > c.l + 8.0 * s {
+                x = c.l + 8.0 * s;
+                y += h + 4.0 * s;
+            }
+            chips.push((Chip::Disc(d, first), RectF::new(x, y, x + w, y + h), label));
+            x += w + 4.0 * s;
+        }
+        (chips, y + h + 8.0 * s)
+    }
+
+    /// Where the sheet thumbnails / list scroll (below the jump bar).
+    fn pages_rect(&self) -> RectF {
+        let c = self.content_rect();
+        RectF::new(c.l, self.chip_layout().1, c.r, c.b)
+    }
+
+    /// Jump to the first sheet of a discipline and scroll it to the top.
+    pub(super) fn jump_discipline(&mut self, first: u32) {
+        self.go_to_page(first as i64);
+        let area = self.pages_rect();
+        if let Some((_, r)) = self.thumb_rects().0.into_iter().find(|(p, _)| *p == first) {
+            let i = Self::tab_index(PanelTab::Pages);
+            self.panel_scroll[i] = (self.panel_scroll[i] + r.t - area.t - 6.0 * self.s()).max(0.0);
+        }
+        self.update_jobs(false);
+        self.invalidate();
+    }
+
+    /// Ctrl+Shift+PgDn / PgUp: next or previous discipline.
+    pub(super) fn step_discipline(&mut self, step: i32) {
+        let groups = self.disc_groups();
+        if groups.is_empty() {
+            self.status = Some("No sheet numbers found to group by discipline".into());
+            return;
+        }
+        let cur = self.doc.as_ref().map(|d| d.current).unwrap_or(0);
+        let ix = match self.disc_of(cur).and_then(|d| groups.iter().position(|g| g.0 == d)) {
+            Some(i) => (i as i32 + step).rem_euclid(groups.len() as i32) as usize,
+            None => 0,
+        };
+        let (d, first, n) = groups[ix];
+        self.status = Some(format!("{} ({d}), {n} sheets", sheets::discipline_name(d)));
+        self.jump_discipline(first);
+    }
+
+    /// Thumbnail (or list row) slots for every sheet of the open set
+    /// (screen coords, scroll applied), plus the total content height.
     pub(super) fn thumb_rects(&self) -> (Vec<(u32, RectF)>, f32) {
         let Some(doc) = &self.doc else { return (Vec::new(), 0.0) };
         let s = self.s();
-        let c = self.content_rect();
+        let c = self.pages_rect();
+        if self.settings.pages_list {
+            let mut y = c.t + 4.0 * s - self.scroll();
+            let mut out = Vec::with_capacity(doc.pages.len());
+            for i in 0..doc.pages.len() {
+                out.push((i as u32, RectF::new(c.l + 6.0 * s, y.round(), c.r - 10.0 * s, (y + LIST_ROW * s - 2.0 * s).round())));
+                y += LIST_ROW * s;
+            }
+            return (out, y + self.scroll() - c.t);
+        }
         let tw = c.w() - 40.0 * s;
         let mut y = c.t + 10.0 * s - self.scroll();
         let mut out = Vec::with_capacity(doc.pages.len());
@@ -179,7 +276,7 @@ impl App {
 
     fn content_height(&self) -> f32 {
         match self.settings.panel_tab {
-            PanelTab::Pages => self.thumb_rects().1,
+            PanelTab::Pages => self.thumb_rects().1 + (self.pages_rect().t - self.content_rect().t),
             PanelTab::Files => self.file_rows().2,
             PanelTab::Markups => self.markup_rows(&self.content_rect(), self.scroll()).1,
             PanelTab::Find => self.find_content_height(&self.content_rect(), self.scroll()),
@@ -213,10 +310,10 @@ impl App {
     pub(super) fn ensure_thumb_visible(&mut self) {
         let Some(cur) = self.doc.as_ref().map(|d| d.current) else { return };
         let (rects, _) = self.thumb_rects();
-        let c = self.content_rect();
+        let c = self.pages_rect();
         if let Some((_, r)) = rects.iter().find(|(p, _)| *p == cur) {
             let i = Self::tab_index(PanelTab::Pages);
-            let pad = 30.0 * self.s();
+            let pad = if self.settings.pages_list { 4.0 } else { 30.0 } * self.s();
             if r.t < c.t {
                 self.panel_scroll[i] -= c.t - r.t + pad;
             } else if r.b > c.b {
@@ -242,9 +339,31 @@ impl App {
         }
         match self.settings.panel_tab {
             PanelTab::Pages => {
+                if let Some((chip, ..)) = self.chip_layout().0.into_iter().find(|(_, r, _)| r.contains_pt(x, y)) {
+                    match chip {
+                        Chip::Disc(_, first) => self.jump_discipline(first),
+                        Chip::ViewToggle => {
+                            self.settings.pages_list = !self.settings.pages_list;
+                            self.settings.save();
+                            self.panel_scroll[Self::tab_index(PanelTab::Pages)] = 0.0;
+                            self.ensure_thumb_visible();
+                            self.update_jobs(false);
+                        }
+                    }
+                    self.invalidate();
+                    return;
+                }
+                if !self.pages_rect().contains_pt(x, y) {
+                    return;
+                }
+                let list = self.settings.pages_list;
                 let hit = self.thumb_rects().0.into_iter().find(|(_, r)| {
                     let s = self.s();
-                    RectF::new(r.l - 8.0 * s, r.t - 4.0 * s, r.r + 8.0 * s, r.b + 24.0 * s).contains_pt(x, y)
+                    if list {
+                        r.contains_pt(x, y)
+                    } else {
+                        RectF::new(r.l - 8.0 * s, r.t - 4.0 * s, r.r + 8.0 * s, r.b + 24.0 * s).contains_pt(x, y)
+                    }
                 });
                 if let Some((p, _)) = hit {
                     self.go_to_page(p as i64);
@@ -325,7 +444,7 @@ impl App {
 
     /// Thumbnail renders wanted for the visible part of the Pages tab.
     pub(super) fn thumb_jobs(&self) -> Vec<Job> {
-        if !self.settings.panel_open || self.settings.panel_tab != PanelTab::Pages {
+        if !self.settings.panel_open || self.settings.panel_tab != PanelTab::Pages || self.settings.pages_list {
             return Vec::new();
         }
         let Some(doc) = &self.doc else { return Vec::new() };
@@ -404,6 +523,80 @@ impl App {
             self.text("No drawing open \u{2014} recent files are in the Files tab", &self.fonts.ui_center, &RectF::new(c.l, c.t + 20.0 * s, c.r, c.t + 50.0 * s), TEXT_DIM);
             return;
         };
+        let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
+        // Discipline jump bar.
+        let cur_disc = self.disc_of(doc.current);
+        let (chips, list_top) = self.chip_layout();
+        for (chip, r, label) in &chips {
+            let hover = self.over_panel(mx, my) && r.contains_pt(mx, my);
+            let on = matches!(chip, Chip::Disc(d, _) if Some(*d) == cur_disc);
+            self.fill(r, if hover { ACCENT } else if on { 0x4a3030 } else { BTN_BG }, 1.0);
+            if on && !hover {
+                self.fill(&RectF::new(r.l, r.b - 2.0 * s, r.r, r.b), ACCENT, 1.0);
+            }
+            self.text(label, &self.fonts.ui_center, r, TEXT);
+        }
+        self.fill(&RectF::new(c.l + 8.0 * s, list_top - 4.0 * s, c.r - 8.0 * s, list_top - 3.0 * s), 0x000000, 0.5);
+        let area = RectF::new(c.l, list_top, c.r, c.b);
+        unsafe {
+            self.gfx.ctx.PushAxisAlignedClip(&d2r(&area), D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        if self.settings.pages_list {
+            self.paint_pages_list(&area);
+        } else {
+            self.paint_thumbs(&area);
+        }
+        unsafe {
+            self.gfx.ctx.PopAxisAlignedClip();
+        }
+    }
+
+    /// Compact list: one row per sheet, discipline headers between groups.
+    fn paint_pages_list(&self, c: &RectF) {
+        let s = self.s();
+        let Some(doc) = &self.doc else { return };
+        let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
+        let mut last: Option<char> = None;
+        for (p, r) in self.thumb_rects().0 {
+            let d = self.disc_of(p);
+            let new_group = d.is_some() && d != last;
+            last = d.or(last);
+            if r.b < c.t || r.t > c.b {
+                continue;
+            }
+            let current = p == doc.current;
+            let hover = self.over_panel(mx, my) && r.contains_pt(mx, my);
+            if current || hover {
+                self.fill(&r, if current { 0x3d2a2a } else { 0x33373d }, 1.0);
+            }
+            if current {
+                self.fill(&RectF::new(r.l, r.t, r.l + 3.0 * s, r.b), ACCENT, 1.0);
+            }
+            if new_group {
+                self.fill(&RectF::new(r.l, r.t, r.r, r.t + 1.0), 0x5a5f66, 1.0);
+            }
+            // Discipline badge.
+            let badge = RectF::new(r.l + 8.0 * s, r.t + 4.0 * s, r.l + 26.0 * s, r.b - 4.0 * s);
+            if let Some(d) = d {
+                self.fill(&badge, if new_group { 0x50555c } else { 0x3a3e44 }, 1.0);
+                self.text(&d.to_string(), &self.fonts.label, &badge, TEXT);
+            }
+            let name = self.sheet_label(p);
+            let n_items = self.takeoff.items.iter().filter(|m| m.sheet == p).count();
+            let mut text = if name.is_empty() { format!("Sheet {}", p + 1) } else { name };
+            if n_items > 0 {
+                text.push_str(&format!("  \u{00B7} {n_items}"));
+            }
+            let tr = RectF::new(badge.r + 8.0 * s, r.t, r.r - 34.0 * s, r.b);
+            self.text(&text, &self.fonts.ui, &tr, if current { TEXT } else { 0xc8ccd1 });
+            let nr = RectF::new(r.r - 40.0 * s, r.t, r.r - 6.0 * s, r.b);
+            self.text(&format!("{}", p + 1), &self.fonts.ui_right, &nr, TEXT_DIM);
+        }
+    }
+
+    fn paint_thumbs(&self, c: &RectF) {
+        let s = self.s();
+        let Some(doc) = &self.doc else { return };
         let (mx, my) = (self.mouse.0 as f32, self.mouse.1 as f32);
         for (p, r) in self.thumb_rects().0 {
             if r.b < c.t - 30.0 * s || r.t > c.b {
