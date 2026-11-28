@@ -490,17 +490,41 @@ impl App {
             (TBtn::Presets, self.presets_label(), 130.0, 0.0),
         ]
         };
+        // Buttons wrap onto another row when the window is too narrow; the
+        // format bar (selected markups) always starts on a row of its own.
+        let (cw, _) = self.canvas();
+        let (start, max_x) = (self.left_inset() + 8.0 * s, cw - 8.0 * s);
+        let row_h = bot - top + 8.0 * s;
         let mut out = Vec::new();
-        let rows = [(specs, top, bot), (self.format_specs(), bot + 8.0 * s, bot + 8.0 * s + (bot - top))];
-        for (specs, top, bot) in rows {
-            let mut x = self.left_inset() + 8.0 * s;
-            for (b, label, w, gap) in specs {
-                let r = RectF::new(x, top, x + w * s, bot);
-                x += (w + 2.0 + gap) * s;
-                out.push((b, r, label));
+        let mut y = top;
+        for specs in [specs, self.format_specs()] {
+            if specs.is_empty() {
+                continue;
             }
+            let mut x = start;
+            for (b, label, w, gap) in specs {
+                if x + w * s > max_x && x > start {
+                    x = start;
+                    y += row_h;
+                }
+                out.push((b, RectF::new(x, y, x + w * s, y + (bot - top)), label));
+                x += (w + 2.0 + gap) * s;
+            }
+            y += row_h;
         }
         out
+    }
+
+    /// Rows the main toolbar (not the format bar) takes at this width.
+    pub(super) fn toolbar_main_rows(&self) -> usize {
+        let fmt: Vec<TBtn> = self.format_specs().into_iter().map(|f| f.0).collect();
+        let mut tops: Vec<f32> = Vec::new();
+        for (b, r, _) in self.toolbar_layout() {
+            if !fmt.contains(&b) && !tops.iter().any(|t| (t - r.t).abs() < 0.5) {
+                tops.push(r.t);
+            }
+        }
+        tops.len().max(1)
     }
 
     /// Background of each toolbar row.
@@ -523,7 +547,8 @@ impl App {
         }
         let s = self.s();
         let (cw, ch) = self.canvas();
-        Some(RectF::new(cw - 360.0 * s, self.tabbar_h() + 52.0 * s, cw - 8.0 * s, ch - 8.0 * s))
+        let top = self.toolbar_rects().iter().map(|r| r.b).fold(self.tabbar_h() + 44.0 * s, f32::max) + 8.0 * s;
+        Some(RectF::new(cw - 360.0 * s, top, cw - 8.0 * s, ch - 8.0 * s))
     }
 
     /// Is (x, y) over takeoff UI (so canvas tools should ignore it)?
@@ -2379,13 +2404,10 @@ impl App {
                     }
                     let tr = RectF::new(r.l + 18.0 * s, r.t, r.r, r.b);
                     self.text(&label, &self.fonts.ui_center, &tr, TEXT);
-                } else if matches!(b, TBtn::Bold | TBtn::Italic) {
-                    let f = if b == TBtn::Bold { &self.fonts.label } else { &self.fonts.ui_center };
-                    self.text(&label, f, &r, TEXT);
-                    if b == TBtn::Italic {
-                        // Slant hint: an underline-free italic cue.
-                        self.line([r.l + 12.0 * s, r.b - 7.0 * s], [r.r - 12.0 * s, r.b - 7.0 * s], TEXT_DIM, 1.0);
-                    }
+                } else if b == TBtn::Bold {
+                    self.text(&label, &self.fonts.label, &r, TEXT);
+                } else if b == TBtn::Italic {
+                    self.text_italic(&label, &self.fonts.ui_center, &r, TEXT);
                 } else {
                     self.text(&label, &self.fonts.ui_center, &r, if warn && !active && !hover { 0xffb74d } else { TEXT });
                 }
@@ -2394,13 +2416,22 @@ impl App {
         if let Some(panel) = self.qty_panel_rect() {
             self.paint_qty_panel(&panel);
         }
+    }
+
+    /// The text prompt, centred over the drawing area (drawn on top of
+    /// the side panel and toolbars).
+    pub(super) fn paint_prompt(&self) {
+        let s = self.s();
         if let Some(p) = &self.prompt {
             let (cw, ch) = self.canvas();
+            // Centre in the area right of the side panel.
+            let (l0, cw) = (self.left_inset(), cw - self.left_inset());
             let multiline = matches!(p.purpose, PromptFor::MarkupText { .. });
             let field_h = if multiline { 150.0 } else { 34.0 };
             let (w, h) = (if multiline { 600.0 } else { 460.0 } * s, (96.0 + field_h) * s);
-            let r = RectF::new(((cw - w) / 2.0).round(), ((ch - h) / 2.0).round(), ((cw + w) / 2.0).round(), ((ch + h) / 2.0).round());
-            self.fill(&r, 0x141518, 0.96);
+            let w = w.min(cw - 16.0 * s);
+            let r = RectF::new((l0 + (cw - w) / 2.0).round(), ((ch - h) / 2.0).round(), (l0 + (cw + w) / 2.0).round(), ((ch + h) / 2.0).round());
+            self.fill(&r, 0x141518, 0.97);
             self.fill(&RectF::new(r.l, r.t, r.r, r.t + 3.0 * s), ACCENT, 1.0);
             self.text(&p.title, &self.fonts.ui, &RectF::new(r.l + 16.0 * s, r.t + 8.0 * s, r.r - 16.0 * s, r.t + 34.0 * s), TEXT);
             let field = RectF::new(r.l + 16.0 * s, r.t + 42.0 * s, r.r - 16.0 * s, r.t + (42.0 + field_h) * s);

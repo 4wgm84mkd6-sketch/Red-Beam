@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient, ValidateRect
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows_numerics::Matrix3x2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 mod extras;
 mod find;
@@ -282,6 +282,8 @@ pub struct App {
     hover: Option<Btn>,
     goto_buf: String,
     show_help: bool,
+    /// Scroll offset of the help overlay (small screens).
+    help_scroll: f32,
     show_perf: bool,
     frames: VecDeque<Instant>,
     paint_ms: f32,
@@ -663,6 +665,7 @@ impl App {
             hover: None,
             goto_buf: String::new(),
             show_help: false,
+            help_scroll: 0.0,
             show_perf: false,
             frames: VecDeque::new(),
             paint_ms: 0.0,
@@ -748,7 +751,7 @@ impl App {
     }
     /// Space reserved at the top of the canvas for the takeoff toolbar.
     fn top_inset(&self) -> f32 {
-        self.tabbar_h() + if self.doc.is_some() { (44.0 * self.s()).round() } else { 0.0 }
+        self.tabbar_h() + if self.doc.is_some() { (44.0 * self.s() * self.toolbar_main_rows() as f32).round() } else { 0.0 }
     }
 
     fn fit_zoom(&self) -> f32 {
@@ -1584,6 +1587,20 @@ impl App {
         }
     }
 
+    /// Text with an italic style (e.g. the format bar's I button).
+    fn text_italic(&self, s: &str, fmt: &IDWriteTextFormat, r: &RectF, c: u32) {
+        let w: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            if let Ok(layout) = self.dwrite.CreateTextLayout(&w, fmt, r.w().max(1.0), r.h().max(1.0)) {
+                let all = DWRITE_TEXT_RANGE { startPosition: 0, length: w.len() as u32 };
+                let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, all);
+                let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, all);
+                self.brush.SetColor(&rgb(c, 1.0));
+                self.gfx.ctx.DrawTextLayout(Vector2 { X: r.l, Y: r.t }, &layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+        }
+    }
+
     fn draw_cached(&self, c: &Cached) {
         let dest = self.view.page_to_screen(&c.job.src);
         let ratio = self.view.zoom / c.job.scale;
@@ -1793,12 +1810,24 @@ impl App {
             (Btn::Compare, if self.cmp.is_some() { "End compare" } else { "Compare" }, if self.cmp.is_some() { 96.0 } else { 76.0 }, 4.0),
         ];
         if self.cmp.as_ref().is_some_and(|c| c.doc.is_some()) {
+            // Narrow windows get short labels so every button fits.
+            let compact = self.client.0 < 1500.0 * s;
             specs.push((Btn::CmpOverlay, "Overlay", 66.0, 4.0));
             specs.push((Btn::CmpOld, "Old", 44.0, 4.0));
             specs.push((Btn::CmpNew, "New", 44.0, 4.0));
-            specs.push((Btn::CmpSide, "Side by side", 96.0, 8.0));
-            specs.push((Btn::ChgPrev, "\u{25C0} Change", 76.0, 4.0));
-            specs.push((Btn::ChgNext, "Change \u{25B6}", 76.0, 4.0));
+            if compact {
+                specs.push((Btn::CmpSide, "Side", 50.0, 8.0));
+                specs.push((Btn::ChgPrev, "\u{25C0}", 32.0, 4.0));
+                specs.push((Btn::ChgNext, "\u{25B6}", 32.0, 4.0));
+                if let Some(c) = specs.iter_mut().find(|sp| sp.0 == Btn::Compare) {
+                    c.1 = "End";
+                    c.2 = 48.0;
+                }
+            } else {
+                specs.push((Btn::CmpSide, "Side by side", 96.0, 8.0));
+                specs.push((Btn::ChgPrev, "\u{25C0} Change", 76.0, 4.0));
+                specs.push((Btn::ChgNext, "Change \u{25B6}", 76.0, 4.0));
+            }
         }
         specs.last_mut().unwrap().3 = 12.0;
         specs.push((Btn::Help, "?", 30.0, 12.0));
@@ -1904,7 +1933,8 @@ impl App {
             self.text(label, &self.fonts.ui_center, r, TEXT);
         }
         let mut x = buttons.last().map(|b| b.1.r).unwrap_or(0.0) + 14.0 * s;
-        let right_w = (560.0 * s).min(w * 0.42);
+        // The right-hand info never overlaps the buttons; it shrinks first.
+        let right_w = (560.0 * s).min(w * 0.42).min((w - x - 10.0 * s).max(0.0));
         let mut seg = |txt: &str, width: f32, color: u32| {
             let r = RectF::new(x, bar.t, (x + width).min(w - right_w), bar.b);
             if r.w() > 4.0 {
@@ -1960,20 +1990,36 @@ impl App {
             right.push_str(&format!("last render {ms:.0} ms ({rw}\u{00D7}{rh})   "));
         }
         right.push_str(&format!("{}  \u{00B7}  GPU: {}", self.worker.engine.name(), self.gfx.adapter_name));
-        self.text(&right, &self.fonts.ui_right, &RectF::new(w - right_w, bar.t, w - 10.0 * s, bar.b), TEXT_DIM);
+        if right_w > 60.0 * s {
+            self.text(&right, &self.fonts.ui_right, &RectF::new(w - right_w, bar.t, w - 10.0 * s, bar.b), TEXT_DIM);
+        }
     }
 
     fn paint_help(&self) {
         let s = self.s();
         let (cw, ch) = self.canvas();
         let lines = HELP.lines().count() as f32 + 2.0;
-        let (pw, ph) = (720.0 * s, ((lines * 19.5 + 46.0) * s).min(ch - 8.0 * s));
+        let full = (lines * 19.5 + 46.0) * s;
+        let (pw, ph) = ((760.0 * s).min(cw - 16.0 * s), full.min(ch - 8.0 * s));
         let panel = RectF::new(((cw - pw) * 0.5).round(), ((ch - ph) * 0.5).round().max(4.0 * s), 0.0, 0.0);
         let panel = RectF::new(panel.l, panel.t, panel.l + pw, panel.t + ph);
-        self.fill(&panel, 0x141518, 0.94);
+        self.fill(&panel, 0x141518, 0.96);
         self.fill(&RectF::new(panel.l, panel.t, panel.r, panel.t + 3.0 * s), ACCENT, 1.0);
-        let inner = RectF::new(panel.l + 28.0 * s, panel.t + 22.0 * s, panel.r - 20.0 * s, panel.b - 16.0 * s);
+        let overflow = (full - ph).max(0.0);
+        let scroll = self.help_scroll.min(overflow);
+        let inner = RectF::new(panel.l + 28.0 * s, panel.t + 22.0 * s - scroll, panel.r - 20.0 * s, panel.t + full - scroll);
+        unsafe {
+            self.gfx.ctx.PushAxisAlignedClip(&d2r(&RectF::new(panel.l, panel.t + 4.0 * s, panel.r, panel.b - 2.0 * s)), D2D1_ANTIALIAS_MODE_ALIASED);
+        }
         self.text(&format!("Keyboard & mouse\n\n{HELP}"), &self.fonts.body, &inner, TEXT);
+        unsafe {
+            self.gfx.ctx.PopAxisAlignedClip();
+        }
+        if overflow > 0.0 && scroll < overflow - 1.0 {
+            let r = RectF::new(panel.r - 190.0 * s, panel.b - 28.0 * s, panel.r - 8.0 * s, panel.b - 6.0 * s);
+            self.fill(&r, ACCENT, 1.0);
+            self.text("Scroll for more \u{25BE}", &self.fonts.ui_center, &r, TEXT);
+        }
     }
 
     fn paint_perf(&self) {
@@ -2061,6 +2107,7 @@ impl App {
             self.paint_tabs();
             self.paint_panel();
             self.paint_bar();
+            self.paint_prompt();
             self.paint_tooltip();
             if self.show_help {
                 self.paint_help();
@@ -2426,7 +2473,10 @@ impl App {
                     // Settings: wheel zooms (Ctrl+wheel scrolls), or wheel
                     // scrolls (Ctrl+wheel zooms).
                     let zoom = self.settings.wheel_zooms != ctrl;
-                    if self.over_panel(pt.x as f32, pt.y as f32) {
+                    if self.show_help {
+                        self.help_scroll = (self.help_scroll - delta * step).max(0.0);
+                        self.invalidate();
+                    } else if self.over_panel(pt.x as f32, pt.y as f32) {
                         self.panel_wheel(delta);
                     } else if msg == WM_MOUSEHWHEEL {
                         self.pan_by(-delta * step, 0.0);
