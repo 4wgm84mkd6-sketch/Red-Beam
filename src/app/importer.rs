@@ -239,6 +239,14 @@ impl App {
         self.invalidate();
     }
 
+    /// Does document `id` hide the PDF's own annotations?
+    pub(super) fn annots_hidden(&self, id: u64) -> bool {
+        if self.doc.as_ref().is_some_and(|d| d.id == id) {
+            return self.takeoff.hide_pdf_annots;
+        }
+        self.tabs.iter().flatten().any(|t| t.doc.as_ref().is_some_and(|d| d.id == id) && t.takeoff.hide_pdf_annots)
+    }
+
     pub(super) fn sync_hidden_annots(&self) {
         let mut ids = HashSet::new();
         if let (Some(d), true) = (&self.doc, self.takeoff.hide_pdf_annots) {

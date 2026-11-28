@@ -129,7 +129,8 @@ pub enum Msg {
     OpenFailed { doc_id: u64, path: PathBuf, error: String },
     /// `texture` keeps the shared resource alive until the UI has opened it.
     /// `parallel` = renders running at the moment this one started (incl. itself).
-    Rendered { job: Job, handle: isize, texture: Sendable<ID3D11Texture2D>, ms: f32, parallel: usize },
+    /// `annots`: whether the PDF's own annotations were drawn.
+    Rendered { job: Job, handle: isize, texture: Sendable<ID3D11Texture2D>, ms: f32, parallel: usize, annots: bool },
     RenderFailed { job: Job, error: String },
     /// Abandoned because it was no longer wanted (PDFium only).
     Cancelled { job: Job, ms: f32 },
@@ -598,6 +599,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
             Task::Render(job, parallel, cancel) => {
                 let t0 = Instant::now();
                 let hidden = shared.m.lock().unwrap().hide_annots.clone();
+                let annots_drawn = !hidden.contains(&job.doc_id);
                 for (id, d) in docs.iter_mut() {
                     if let DocHandle::Pdfium { doc, .. } = d {
                         doc.show_annots = !hidden.contains(id);
@@ -689,7 +691,7 @@ fn run(index: usize, shared: Arc<Shared>, gpu: GpuChoice, tx: Sender<Msg>, hwnd:
                     _ if text.is_some() => Msg::Text { job, words: text.unwrap_or(Ok(Vec::new())) },
                     (_, Some(index)) => Msg::Snap { job, index: index.map(Sendable), ms },
                     (result, None) => match result {
-                    Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel },
+                    Ok(Some((tex, handle))) => Msg::Rendered { job, handle, texture: Sendable(tex), ms, parallel, annots: annots_drawn },
                     Ok(None) => Msg::Cancelled { job, ms },
                     Err(e) => Msg::RenderFailed { job, error: e.message().to_string() },
                     },

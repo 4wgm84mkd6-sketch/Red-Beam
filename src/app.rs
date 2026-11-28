@@ -1444,8 +1444,14 @@ impl App {
                         ));
                     }
                 }
-                Msg::Rendered { job, handle, texture, ms, parallel } => {
+                Msg::Rendered { job, handle, texture, ms, parallel, annots } => {
                     self.worker.ack(&job.key());
+                    // Rendered before the PDF's own markups were hidden (or
+                    // shown again): stale, render it again.
+                    if annots == self.annots_hidden(job.doc_id) {
+                        self.update_jobs(true);
+                        continue;
+                    }
                     let what = match (job.kind, job.prefetch) {
                         (JobKind::Geometry, _) => "line work",
                         (JobKind::Thumb, _) => "thumbnail",
