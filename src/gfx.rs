@@ -213,7 +213,7 @@ impl Gfx {
             let mut out = vec![0u8; (w * h * 4) as usize];
             for y in 0..h as usize {
                 let row = std::slice::from_raw_parts((map.pData as *const u8).add(y * map.RowPitch as usize), w as usize * 4);
-                for (x, px) in row.chunks_exact(4).enumerate() {
+                for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
                     let o = (y * w as usize + x) * 4;
                     // BGRA -> RGBA, opaque.
                     out[o] = px[2];
