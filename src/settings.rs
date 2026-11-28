@@ -140,6 +140,8 @@ pub struct Settings {
     pub clean_exit: bool,
     /// Time of the newest crash report already mentioned to the user.
     pub crash_seen: u64,
+    /// Asked once whether to install Red-Beam on this PC.
+    pub install_asked: bool,
 }
 
 impl Default for Settings {
@@ -169,6 +171,7 @@ impl Default for Settings {
             session: Vec::new(),
             clean_exit: true,
             crash_seen: 0,
+            install_asked: false,
         }
     }
 }

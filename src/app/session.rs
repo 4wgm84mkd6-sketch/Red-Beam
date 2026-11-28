@@ -43,6 +43,21 @@ impl App {
         self.settings_saved = Instant::now();
     }
 
+    /// True the first time only: should we offer to install?
+    pub fn first_install_offer(&mut self) -> bool {
+        if self.settings.install_asked {
+            return false;
+        }
+        self.settings.install_asked = true;
+        self.settings.save();
+        true
+    }
+
+    /// Save the open tabs now (before handing over to another copy).
+    pub fn save_session_now(&mut self) {
+        self.save_session();
+    }
+
     /// The sheet changed: remember it (saved at most every few seconds).
     pub(super) fn note_page(&mut self) {
         if let Some(d) = &self.doc {

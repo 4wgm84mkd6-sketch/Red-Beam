@@ -45,6 +45,8 @@ pub enum SetId {
     Updates,
     Engine,
     Perf,
+    Install,
+    DefaultApp,
 }
 
 pub struct FileRow {
@@ -260,6 +262,18 @@ impl App {
             (SetId::Updates, "Check for updates", on(st.check_updates)),
             (SetId::Engine, "PDF engine", self.worker.engine.name().into()),
             (SetId::Perf, "Performance readout", on(self.show_perf)),
+            (
+                SetId::Install,
+                "Install on this PC",
+                if crate::install::running_installed() {
+                    "Installed".into()
+                } else if crate::install::is_installed() {
+                    "Update copy".into()
+                } else {
+                    "Install".into()
+                },
+            ),
+            (SetId::DefaultApp, "Default PDF app", "Choose\u{2026}".into()),
         ];
         let row_h = 40.0 * s;
         let mut y = c.t + 8.0 * s - self.scroll();
@@ -436,6 +450,23 @@ impl App {
             SetId::Updates => self.settings.check_updates = !self.settings.check_updates,
             SetId::Engine => self.toggle_engine(),
             SetId::Perf => self.show_perf = !self.show_perf,
+            SetId::Install => {
+                if crate::install::running_installed() {
+                    self.pending_info = Some(format!(
+                        "Red-Beam is installed in\n{}\n\nTo remove it, use Settings \u{2192} Apps \u{2192} Installed apps in Windows.",
+                        crate::install::install_dir().display()
+                    ));
+                } else {
+                    self.pending_install = true;
+                }
+            }
+            SetId::DefaultApp => {
+                if !crate::install::is_installed() {
+                    self.pending_info = Some("Install Red-Beam first (the row above), then choose it as the default PDF app.".into());
+                } else {
+                    crate::install::open_default_apps();
+                }
+            }
         }
         self.settings.use_pdfium = self.worker.engine == Engine::Pdfium;
         self.settings.save();

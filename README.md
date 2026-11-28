@@ -8,7 +8,14 @@ Red-Beam is a fast Windows PDF viewer for large construction drawing sets. Pages
 
 ## Download and updates
 
-* **First install:** open the [latest release](https://github.com/4wgm84mkd6-sketch/Red-Beam/releases/latest) and download `RedBeam.exe`. It's a single file with no installer, and it only uses DLLs built into Windows 10 and 11. Put it in a folder you can write to, such as Documents or Desktop, not Program Files.
+* **First install:** open the [latest release](https://github.com/4wgm84mkd6-sketch/Red-Beam/releases/latest), download `RedBeam.exe` and run it. It's a single file that only uses DLLs built into Windows 10 and 11.
+* **Install on this PC:** the first run offers to install Red-Beam for your Windows account, with no administrator rights needed. You can also do it later from the side panel: **Settings → Install on this PC**. Installing:
+  * copies Red-Beam to `%LOCALAPPDATA%\Programs\Red-Beam`
+  * adds a Start menu shortcut
+  * puts Red-Beam in **Open with** for PDFs
+  * lists it under **Settings → Apps → Installed apps**, with an uninstaller (your settings and takeoffs are kept when you uninstall)
+* **Default PDF app:** Windows doesn't let apps make themselves the default, so **Settings → Default PDF app** opens Windows' Default apps page at Red-Beam's entry.
+* **From the command line:** `RedBeam.exe --install` and `RedBeam.exe --uninstall`; add `--quiet` for no dialogs.
 * **Updates:** every push to `main` is built on GitHub Actions and published as a release named `build-<n>`. Red-Beam checks for a newer build at startup. When there is one, the **Update ●** button in the status bar turns red. Click it, confirm, and the app downloads the new version, replaces itself and reopens your drawing on the same sheet. Clicking **Update** at any other time checks again.
 
 ## Using it
@@ -291,6 +298,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/import.rs` | Turns PDF annotations into markups and measurements; scale from /Measure or from displayed values (unit-tested) |
 | `src/app/importer.rs` | Import flow: background read, one-time prompt, scales and detail boxes, hiding the PDF's own copies |
 | `src/ocr.rs` | Text recognition for scanned sheets (Windows.Media.Ocr) |
+| `src/install.rs` | Per-user install: copy, Start menu shortcut, PDF Open-with and default-app registration, uninstaller |
 | `src/app/tabs.rs` | Document tabs (park and restore per-document state), tab strip |
 | `src/app/find.rs` | Find / Go to sheet UI, highlighted hits, clickable sheet links |
 | `src/snap.rs` | Snap index over a sheet's line work: nearest corner, else nearest point on a line (unit-tested) |
@@ -308,7 +316,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 2. **Takeoffs:** scales and calibration, length, polyline, area (with cut-outs), volume, count, snapping, groups, layers, editing, leaders, a quantities panel and CSV export are done. Next: per-viewport scales, intersection snapping, and a native Excel export.
 3. **Markups:** cloud, text, callout, arrow, line, rectangle, ellipse, highlight, pen and stamps are done, with status, a markups list, a format bar, saving into a PDF copy, and importing markups and measurements from Bluebeam and Acrobat. Next: reply threads.
 4. **Navigation and UI:** the side panel, sheet names, text search, go-to-sheet, clickable sheet links, tabs and side-by-side split view are done. Next: UI polish.
-5. **Rollout:** installer, "Open with Red-Beam", sharing presets with a team.
+5. **Rollout:** per-user installer, "Open with Red-Beam" and the default-app entry are done. Next: sharing presets with a team.
 
 ## Third-party software
 

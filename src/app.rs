@@ -356,6 +356,8 @@ pub struct App {
     import_pending: usize,
     /// A password was just tried for this file (a new failure = wrong).
     pw_retry: Option<PathBuf>,
+    /// Settings > Install was clicked (handled outside the App borrow).
+    pub pending_install: bool,
     mdraft: Option<markups::MDraft>,
     /// Where a stamp goes once picked from the menu.
     stamp_at: Option<[f32; 2]>,
@@ -722,6 +724,7 @@ impl App {
             pending_import_prompt: None,
             import_pending: 0,
             pw_retry: None,
+            pending_install: false,
             mdraft: None,
             stamp_at: None,
             bg_tx,

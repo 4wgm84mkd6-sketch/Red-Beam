@@ -51,6 +51,32 @@ jobs:
           $crash = Join-Path $env:LOCALAPPDATA "Red-Beam/crash.log"
           if (Test-Path $crash) { Get-Content $crash; Copy-Item $crash smoke-out/ }
           if ($p.ExitCode -ne 0) { throw "Smoke test failed with exit code $($p.ExitCode)" }
+      # Per-user install and uninstall (no admin): files, Start menu,
+      # "Open with" registration and the Settings > Apps entry.
+      - name: Install test
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $p = Start-Process -FilePath target/release/RedBeam.exe -ArgumentList "--install","--quiet" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "install failed: $($p.ExitCode)" }
+          $exe = Join-Path $env:LOCALAPPDATA "Programs/Red-Beam/RedBeam.exe"
+          $lnk = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs/Red-Beam.lnk"
+          if (!(Test-Path $exe)) { throw "installed exe missing" }
+          if (!(Test-Path $lnk)) { throw "Start menu shortcut missing" }
+          $cmd = (Get-ItemProperty "HKCU:/Software/Classes/RedBeam.PDF/shell/open/command")."(default)"
+          Write-Host "open command: $cmd"
+          if ($cmd -notlike "*RedBeam.exe*%1*") { throw "PDF open command not registered" }
+          $un = Get-ItemProperty "HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/Red-Beam"
+          Write-Host "uninstall entry: $($un.DisplayName) $($un.DisplayVersion) -> $($un.UninstallString)"
+          Get-ItemProperty "HKCU:/Software/Classes/.pdf/OpenWithProgids" | Out-String | Write-Host
+          $p = Start-Process -FilePath $exe -ArgumentList "--uninstall","--quiet" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
+          Start-Sleep -Seconds 8
+          if (Test-Path $exe) { throw "installed exe still there after uninstall" }
+          if (Test-Path $lnk) { throw "shortcut still there after uninstall" }
+          if (Test-Path "HKCU:/Software/Classes/RedBeam.PDF") { throw "ProgID still registered" }
+          if (Test-Path "HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/Red-Beam") { throw "uninstall entry still there" }
+          Write-Host "install and uninstall OK"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

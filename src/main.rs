@@ -9,6 +9,7 @@ mod crash;
 mod diff;
 mod gfx;
 mod import;
+mod install;
 mod markup;
 mod ocr;
 mod pdfium;
@@ -261,6 +262,38 @@ fn save_new_pdf(hwnd: HWND, name: &str, dir: Option<&std::path::Path>, title: &s
     }
 }
 
+/// Install for this user, then continue in the installed copy (same tabs).
+fn do_install(hwnd: HWND) {
+    match install::install() {
+        Ok(exe) => {
+            if install::running_installed() {
+                info_box(hwnd, "Red-Beam is installed and registered for PDFs.");
+                return;
+            }
+            with_app(|a| a.save_session_now());
+            let started = std::process::Command::new(&exe).arg("--restore-session").spawn().is_ok();
+            let msg = format!(
+                "Red-Beam is installed in\n{}\n\nIt's in the Start menu and in \u{201C}Open with\u{201D} for PDFs. To make it the default PDF app, use Settings \u{2192} Default PDF app in the side panel.{}",
+                exe.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                if started { "\n\nRed-Beam now restarts from its installed copy." } else { "" }
+            );
+            info_box(hwnd, &msg);
+            if started {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+        }
+        Err(e) => error_box(hwnd, &format!("Could not install Red-Beam:\n{e}")),
+    }
+}
+
+fn info_box(hwnd: HWND, text: &str) {
+    unsafe {
+        MessageBoxW(Some(hwnd), &HSTRING::from(text), w!("Red-Beam"), MB_OK | MB_ICONINFORMATION);
+    }
+}
+
 fn after(hwnd: HWND) {
     // Smoke test: no dialogs or menus (they would block the run).
     if with_app(|a| a.smoke_absorb()).unwrap_or(false) {
@@ -335,6 +368,10 @@ fn after(hwnd: HWND) {
         unsafe {
             MessageBoxW(Some(hwnd), &HSTRING::from(i), w!("Red-Beam"), MB_OK | MB_ICONINFORMATION);
         }
+    }
+    if with_app(|a| std::mem::take(&mut a.pending_install)).unwrap_or(false) {
+        do_install(hwnd);
+        return;
     }
     if let Some(q) = with_app(|a| a.pending_import_prompt.take()).flatten() {
         let r = unsafe { MessageBoxW(Some(hwnd), &HSTRING::from(q), w!("Import markups"), MB_YESNO | MB_ICONQUESTION) };
@@ -424,6 +461,38 @@ fn main() -> Result<()> {
         return Ok(());
     }
     crash::install();
+    // RedBeam.exe --install / --uninstall [--quiet]: per-user setup.
+    let quiet = args.iter().any(|a| a == "--quiet");
+    if let Some(cmd) = args.first().and_then(|a| a.to_str()).filter(|a| *a == "--install" || *a == "--uninstall") {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let result = if cmd == "--install" {
+            install::install().map(|p| format!("Red-Beam is installed:\n{}\n\nIt's in the Start menu and in \u{201C}Open with\u{201D} for PDFs.", p.display()))
+        } else {
+            let go = quiet
+                || unsafe {
+                    MessageBoxW(None, w!("Remove Red-Beam from this PC?\n\nYour settings and takeoff files are kept."), w!("Uninstall Red-Beam"), MB_YESNO | MB_ICONQUESTION)
+                } == IDYES;
+            if !go {
+                return Ok(());
+            }
+            install::uninstall().map(|_| "Red-Beam was removed. Your drawings, takeoffs and settings were not touched.".to_string())
+        };
+        match result {
+            Ok(msg) if !quiet => unsafe {
+                MessageBoxW(None, &HSTRING::from(msg), w!("Red-Beam"), MB_OK | MB_ICONINFORMATION);
+            },
+            Ok(_) => {}
+            Err(e) => {
+                if !quiet {
+                    error_box(HWND::default(), &e);
+                }
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     // RedBeam.exe --smoke <pdf> <out dir>: CI screenshot run.
     let smoke = match (args.first().and_then(|a| a.to_str()), args.get(1), args.get(2)) {
         (Some("--smoke"), Some(pdf), Some(out)) => Some((PathBuf::from(pdf), PathBuf::from(out))),
@@ -516,6 +585,14 @@ fn main() -> Result<()> {
                 }
             } else {
                 with_app(|a| a.reopen_last());
+            }
+            // Running a downloaded copy: offer, once, to install it.
+            let ask = !install::is_installed() && with_app(|a| a.first_install_offer()).unwrap_or(false);
+            if ask {
+                let q = "Install Red-Beam on this PC?\n\n\u{2022} Start menu shortcut\n\u{2022} \u{201C}Open with Red-Beam\u{201D} for PDFs\n\u{2022} Listed in Settings \u{2192} Apps, with an uninstaller\n\nNo administrator rights needed. Updates keep coming through the Update button. You can also do this later in the side panel\u{2019}s Settings tab.";
+                if MessageBoxW(Some(hwnd), &HSTRING::from(q), w!("Install Red-Beam"), MB_YESNO | MB_ICONQUESTION) == IDYES {
+                    do_install(hwnd);
+                }
             }
         }
 
